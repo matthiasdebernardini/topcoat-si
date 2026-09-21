@@ -97,7 +97,8 @@ mod tests {
         };
 
         let json = serde_json::to_string(&error).unwrap();
-        let expected = r#"{"type":"web_search_tool_result_error","error_code":"invalid_tool_input"}"#;
+        let expected =
+            r#"{"type":"web_search_tool_result_error","error_code":"invalid_tool_input"}"#;
 
         assert_eq!(json, expected);
     }

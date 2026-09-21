@@ -32,7 +32,6 @@ pub enum ContentBlockDelta {
     /// A value introduced by a newer API version.
     #[serde(other)]
     Unknown,
-
 }
 
 impl<'de> Deserialize<'de> for ContentBlockDelta {

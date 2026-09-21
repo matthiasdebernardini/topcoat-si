@@ -208,7 +208,9 @@ fn parse_stop_command(argument: Option<&str>) -> ChatCommand {
     };
 
     let mut parts = arg.splitn(2, ' ');
-    let action = parts.next().unwrap();
+    let Some(action) = parts.next() else {
+        return ChatCommand::Invalid("/stop requires an action".into());
+    };
     match action.to_lowercase().as_str() {
         "add" => {
             let Some(sequence) = parts.next().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
@@ -240,7 +242,7 @@ where
 fn parse_f32_in_range(value: &str, min: f32, max: f32) -> Result<f32, String> {
     let parsed: f32 = value
         .parse()
-        .map_err(|_| format!("expects a value between {min} and {max}"))?;
+        .map_err(|error| format!("expects a value between {min} and {max}: {error}"))?;
     if parsed.is_finite() && parsed >= min && parsed <= max {
         Ok(parsed)
     } else {

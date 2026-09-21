@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 //! Command-line tool for running Anthropic API prompt tests.
 //!
 //! This binary provides a convenient way to test prompts against the Anthropic API

@@ -51,11 +51,7 @@ impl TextBlock {
 
     /// Add a single citation to this text block.
     pub fn with_citation(mut self, citation: TextCitation) -> Self {
-        if let Some(citations) = &mut self.citations {
-            citations.push(citation);
-        } else {
-            self.citations = Some(vec![citation]);
-        }
+        self.citations.get_or_insert_with(Vec::new).push(citation);
         self
     }
 

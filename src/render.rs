@@ -256,7 +256,13 @@ impl PlainTextRenderer {
 
     /// Flushes stdout to ensure immediate display of streamed content.
     fn flush(&mut self) {
-        let _ = self.stdout.flush();
+        if let Err(error) = self.stdout.flush() {
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                operation = "flush_stdout",
+                "Could not flush streamed output"
+            );
+        }
     }
 
     fn reset_thinking(&mut self) {

@@ -60,7 +60,6 @@ pub enum MessageStreamEvent {
     /// An event introduced by a newer API version.
     #[serde(other)]
     Unknown,
-
 }
 
 #[cfg(test)]

@@ -72,10 +72,7 @@ impl ModelListParams {
 
     /// Add a single beta version to use for this request.
     pub fn with_beta(mut self, beta: String) -> Self {
-        match &mut self.betas {
-            Some(betas) => betas.push(beta),
-            None => self.betas = Some(vec![beta]),
-        }
+        self.betas.get_or_insert_with(Vec::new).push(beta);
         self
     }
 }

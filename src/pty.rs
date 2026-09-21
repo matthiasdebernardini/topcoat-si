@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
-use std::fmt::Write as _;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
@@ -39,7 +38,7 @@ pub struct BashPtyConfig {
 impl Default for BashPtyConfig {
     fn default() -> Self {
         Self {
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            cwd: PathBuf::from("."),
             env: BTreeMap::new(),
             shell: PathBuf::from("/bin/bash"),
             shell_wrapper: None,
@@ -202,7 +201,11 @@ fn shell_environment(env: &BTreeMap<String, String>) -> std::io::Result<Vec<CStr
     let mut effective_env = BTreeMap::new();
     effective_env.insert(
         "HOME".to_string(),
-        std::env::var("HOME").unwrap_or_else(|_| "/".into()),
+        match std::env::var("HOME") {
+            Ok(home) => home,
+            Err(std::env::VarError::NotPresent) => "/".into(),
+            Err(error) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, error)),
+        },
     );
     effective_env.insert(
         "PATH".to_string(),
@@ -357,7 +360,13 @@ fn bash_ansi_c_quote(s: &str) -> String {
             '\u{1b}' => quoted.push_str("\\e"),
             '\u{7}' => quoted.push_str("\\a"),
             c if c.is_ascii() && !c.is_ascii_control() => quoted.push(c),
-            c if c.is_ascii() => write!(quoted, "\\x{:02x}", c as u8).expect("write ascii escape"),
+            c if c.is_ascii() => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let byte = c as u8;
+                quoted.push_str("\\x");
+                quoted.push(HEX[usize::from(byte >> 4)] as char);
+                quoted.push(HEX[usize::from(byte & 0x0f)] as char);
+            }
             c => quoted.push(c),
         }
     }
@@ -386,6 +395,7 @@ impl BashPtyLineStreamer {
     fn emit_available(&mut self, raw_output: &str, final_output: bool) {
         let lines = clean_output_lines_for_streaming(raw_output, final_output);
         for line in lines.iter().skip(self.sent_lines) {
+            // Broadcast delivery has no recipient when the caller does not subscribe to live output.
             let _ = self.output_tx.send(line.clone());
         }
         self.sent_lines = lines.len();
@@ -564,10 +574,10 @@ impl BashPtySession {
         let prompt = prompt_string(&prompt_prefix);
         let shell_c = cstring_from_path(&shell_path, "shell path")?;
         let cwd_c = cstring_from_path(&cwd, "working directory")?;
-        let arg_noprofile = CString::new("--noprofile").unwrap();
-        let arg_norc = CString::new("--norc").unwrap();
-        let arg_noediting = CString::new("--noediting").unwrap();
-        let arg_i = CString::new("-i").unwrap();
+        let arg_noprofile = c"--noprofile".to_owned();
+        let arg_norc = c"--norc".to_owned();
+        let arg_noediting = c"--noediting".to_owned();
+        let arg_i = c"-i".to_owned();
         let envp_storage = shell_environment(&env)?;
 
         // If a wrapper is configured, the spawned binary is wrapper[0] and
@@ -575,12 +585,21 @@ impl BashPtySession {
         // [wrapper[0], wrapper[1..], shell, --noprofile, --norc, --noediting, -i].
         let (spawn_path, extra_args_storage);
         if let Some(ref wrapper) = self.config.shell_wrapper {
-            assert!(!wrapper.is_empty(), "shell_wrapper must not be empty");
+            if wrapper.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "shell_wrapper must not be empty",
+                ));
+            }
             spawn_path = PathBuf::from(&wrapper[0]);
             extra_args_storage = wrapper[1..]
                 .iter()
-                .map(|arg| CString::new(arg.as_bytes()).unwrap())
-                .collect::<Vec<_>>();
+                .map(|arg| {
+                    CString::new(arg.as_bytes()).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+                    })
+                })
+                .collect::<std::io::Result<Vec<_>>>()?;
         } else {
             spawn_path = shell_path.clone();
             extra_args_storage = vec![];
@@ -588,9 +607,7 @@ impl BashPtySession {
         let spawn_c = cstring_from_path(&spawn_path, "spawn path")?;
 
         let mut argv_storage = vec![spawn_c.clone()];
-        for arg in &extra_args_storage {
-            argv_storage.push(arg.clone());
-        }
+        argv_storage.extend(extra_args_storage.iter().cloned());
         if self.config.shell_wrapper.is_some() {
             argv_storage.push(shell_c.clone());
         }
@@ -1076,7 +1093,13 @@ fn rand_nonce() -> u64 {
     let pid = std::process::id() as u64;
     let ts = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                "System clock predates Unix epoch while generating shell nonce"
+            );
+            error.duration()
+        })
         .as_nanos() as u64;
     pid.wrapping_mul(6364136223846793005).wrapping_add(ts)
 }
@@ -1239,7 +1262,7 @@ mod tests {
     #[test]
     fn default_config_has_expected_defaults() {
         let config = BashPtyConfig::default();
-        let expected_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let expected_cwd = PathBuf::from(".");
         assert_eq!(config.cwd, expected_cwd);
         assert_eq!(config.env, BTreeMap::new());
         assert_eq!(config.shell, PathBuf::from("/bin/bash"));
@@ -2180,7 +2203,7 @@ HEREDOC"#;
             "timeout should include partial transcript; got {err_text:?}"
         );
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         let r = session
             .run("printf after", false)

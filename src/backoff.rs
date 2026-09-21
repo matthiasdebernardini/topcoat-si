@@ -18,7 +18,8 @@ mod tests {
     #[test]
     fn backoff_floor_and_cap_without_sleep() {
         for attempt in 0..20 {
-            let floor = Duration::from_secs_f64((0.5 * 2.0_f64.powi(attempt.min(4) as i32)).min(8.0));
+            let floor =
+                Duration::from_secs_f64((0.5 * 2.0_f64.powi(attempt.min(4) as i32)).min(8.0));
             assert_eq!(ExponentialBackoff::delay(attempt, 0.0), floor);
             assert!(ExponentialBackoff::delay(attempt, 1.0) >= floor);
             assert!(ExponentialBackoff::delay(attempt, 1.0) <= Duration::from_secs(8));

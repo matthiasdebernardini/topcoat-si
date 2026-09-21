@@ -605,13 +605,11 @@ mod tests {
     }
 
     #[test]
-    fn batch_create_params_reject_zero_max_tokens() {
+    fn batch_create_params_accept_cache_prewarm() {
         let mut request = valid_batch_request("zero-tokens");
         request.params.max_tokens = 0;
         let params = MessageBatchCreateParams::new(vec![request]);
-        let err = params.validate().unwrap_err();
-        assert!(err.is_validation());
-        assert!(err.to_string().contains("max_tokens"));
+        assert!(params.validate().is_ok());
     }
 
     #[test]

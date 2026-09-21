@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 //! Interactive chat application for conversing with Claude.
 //!
 //! This binary provides a streaming REPL interface for chatting with Claude
@@ -66,12 +68,18 @@ impl ChatTerminal {
             Ok(line) => Ok(OperatorLine::Line(line)),
             Err(ReadlineError::Interrupted) => Ok(OperatorLine::Interrupted),
             Err(ReadlineError::Eof) => Ok(OperatorLine::Eof),
-            Err(err) => Err(io::Error::other(err.to_string())),
+            Err(err) => Err(io::Error::other(err)),
         }
     }
 
     fn add_history_entry(&mut self, line: &str) {
-        let _ = self.editor.add_history_entry(line);
+        if let Err(error) = self.editor.add_history_entry(line) {
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                operation = "add_history_entry",
+                "Could not retain chat history entry"
+            );
+        }
     }
 }
 
@@ -296,14 +304,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             terminal.print_info(&context, "Effort level cleared.");
                         }
                         ChatCommand::Spend(dollars) => {
-                            session.set_session_spend(Some(dollars));
+                            if let Err(error) = session.set_session_spend(Some(dollars)) {
+                                eprintln!("Could not set session spend: {error}");
+                                continue;
+                            }
                             terminal.print_info(
                                 &context,
                                 &format!("Session spend limit set to ${dollars:.2}."),
                             );
                         }
                         ChatCommand::ClearSpend => {
-                            session.set_session_spend(None);
+                            if let Err(error) = session.set_session_spend(None) {
+                                eprintln!("Could not clear session spend: {error}");
+                                continue;
+                            }
                             terminal.print_info(&context, "Session spend limit cleared.");
                         }
                         ChatCommand::Caching(enabled) => {

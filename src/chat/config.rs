@@ -85,9 +85,9 @@ impl std::fmt::Display for ChatArgsError {
 impl std::error::Error for ChatArgsError {}
 
 fn parse_f32_arg(value: &str, name: &str) -> Result<f32, ChatArgsError> {
-    value.parse::<f32>().map_err(|_| ChatArgsError {
+    value.parse::<f32>().map_err(|error| ChatArgsError {
         message: format!(
-            "invalid value for --{}: '{}' is not a valid number",
+            "invalid value for --{}: '{}' is not a valid number: {error}",
             name, value
         ),
     })
@@ -123,9 +123,9 @@ fn parse_thinking_arg(s: &str) -> Result<ThinkingArg, ChatArgsError> {
         _ => s
             .parse::<u32>()
             .map(ThinkingArg::Budget)
-            .map_err(|_| ChatArgsError {
+            .map_err(|error| ChatArgsError {
                 message: format!(
-                    "invalid value for --thinking: '{}' (expected adaptive, on, off, or a token budget)",
+                    "invalid value for --thinking: '{}' (expected adaptive, on, off, or a token budget): {error}",
                     s
                 ),
             }),
@@ -306,9 +306,9 @@ impl ChatConfig {
     }
 
     /// Sets the session spend limit in dollars, using the configured model's token rates.
-    pub fn with_session_spend(mut self, dollars: Option<f64>) -> Self {
-        self.session_spend = dollars.map(|d| self.dollar_budget(d));
-        self
+    pub fn with_session_spend(mut self, dollars: Option<f64>) -> crate::Result<Self> {
+        self.set_session_spend(dollars)?;
+        Ok(self)
     }
 
     /// Sets the session spend budget object directly.
@@ -455,8 +455,9 @@ impl ChatConfig {
     }
 
     /// Sets the session spend limit in dollars, using the configured model's token rates.
-    pub fn set_session_spend(&mut self, dollars: Option<f64>) {
-        self.session_spend = dollars.map(|d| self.dollar_budget(d));
+    pub fn set_session_spend(&mut self, dollars: Option<f64>) -> crate::Result<()> {
+        self.session_spend = dollars.map(|d| self.dollar_budget(d)).transpose()?;
+        Ok(())
     }
 
     /// Sets the session spend budget object directly.
@@ -467,13 +468,15 @@ impl ChatConfig {
         self.session_spend = budget;
     }
 
-    fn dollar_budget(&self, dollars: f64) -> Budget {
+    fn dollar_budget(&self, dollars: f64) -> crate::Result<Budget> {
         match self.model() {
-            Model::Known(km) => Budget::from_dollars_with_model(dollars, km),
-            Model::Custom(_) => {
-                // Fall back to Sonnet 4.5 rates for custom/unknown models.
-                Budget::from_dollars_with_model(dollars, KnownModel::ClaudeSonnet45)
-            }
+            Model::Known(model) => Budget::from_dollars_with_model(dollars, model),
+            Model::Custom(model) => Err(crate::Error::validation(
+                format!(
+                    "No token pricing recorded for custom model {model}; provide an explicit budget"
+                ),
+                Some("model".into()),
+            )),
         }
     }
 
@@ -703,6 +706,7 @@ mod tests {
             .with_stop_sequences(vec!["END".to_string()])
             .with_thinking_budget(Some(2048))
             .with_session_spend(Some(1.25))
+            .unwrap()
             .with_transcript_path(Some(PathBuf::from("transcript.json")))
             .with_caching(false);
 

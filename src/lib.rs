@@ -1,4 +1,5 @@
 #![deny(missing_docs)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 //! Claudius: A Rust client for the Anthropic API.
 //!
@@ -13,7 +14,6 @@ mod agent;
 mod backoff;
 mod cache_control;
 mod client;
-mod client_logger;
 mod error;
 mod json_schema;
 mod observability;
@@ -29,8 +29,7 @@ pub use agent::{
     TokenKind, Tool, ToolCallback, ToolResult, ToolSearchFileSystem, TurnOutcome, TurnStep,
 };
 pub use chat::ThinkingMode;
-pub use client::{Anthropic, LoggingStream};
-pub use client_logger::ClientLogger;
+pub use client::Anthropic;
 pub use error::{Error, HttpMetadata, Result};
 pub use json_schema::JsonSchema;
 pub use observability::register_biometrics;

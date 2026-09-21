@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::types::Model;
+use serde::{Deserialize, Serialize};
 
 /// Token counts for an individual inference or compaction iteration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

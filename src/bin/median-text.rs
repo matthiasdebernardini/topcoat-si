@@ -1,18 +1,21 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use claudius::{
     Anthropic, ContentBlock, KnownModel, MessageCreateParams, MessageParam, MessageRole, Model,
     TextBlock, ThinkingConfig, push_or_merge_message,
 };
 
 #[tokio::main]
-async fn main() {
+async fn main() -> claudius::Result<()> {
     let files = std::env::args().skip(1).collect::<Vec<_>>();
-    let mut contents = Vec::with_capacity(files.len());
-    for file in files {
-        let content = std::fs::read_to_string(&file)
-            .inspect_err(|_| eprintln!("could not read {file}"))
-            .expect("should be able to read file");
-        contents.push(content);
-    }
+    let contents = files
+        .iter()
+        .map(|file| {
+            std::fs::read_to_string(file).map_err(|error| {
+                claudius::Error::io(format!("Failed to read transcription '{file}'"), error)
+            })
+        })
+        .collect::<claudius::Result<Vec<_>>>()?;
     let mut messages = vec![];
     for (id, content) in contents.into_iter().enumerate() {
         push_or_merge_message(
@@ -49,8 +52,8 @@ Output the corrected/unified document and only the corrected/unified document.
         fallback_credit_token: None,
         betas: None,
     };
-    let client = Anthropic::new(None).expect("could not create anthropic client");
-    let resp = client.send(create).await.expect("claude failed");
+    let client = Anthropic::new(None)?;
+    let resp = client.send(create).await?;
     let content = resp
         .content
         .into_iter()
@@ -63,4 +66,5 @@ Output the corrected/unified document and only the corrected/unified document.
         })
         .collect::<Vec<_>>();
     println!("{}", content.join("\n"));
+    Ok(())
 }

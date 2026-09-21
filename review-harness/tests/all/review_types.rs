@@ -1,5 +1,5 @@
-use claudius::*;
 use base64::Engine;
+use claudius::*;
 use serde_json::json;
 
 #[test]
@@ -17,16 +17,31 @@ fn web_search_request_too_large_is_valid_response() {
 
 #[test]
 fn cache_prewarm_allows_zero_output_tokens() {
-    let params = MessageCreateParams::new(0, vec![MessageParam::new_with_blocks(vec![TextBlock::new("warmup").with_cache_control(CacheControlEphemeral::new()).into()], MessageRole::User)], KnownModel::ClaudeOpus5.into());
+    let params = MessageCreateParams::new(
+        0,
+        vec![MessageParam::new_with_blocks(
+            vec![
+                TextBlock::new("warmup")
+                    .with_cache_control(CacheControlEphemeral::new())
+                    .into(),
+            ],
+            MessageRole::User,
+        )],
+        KnownModel::ClaudeOpus5.into(),
+    );
     assert!(params.validate().is_ok());
 }
 
 #[test]
 fn accepts_base64_image_below_anthropic_limit() {
     // Valid 640x640 RGB PNG: 1,229,883 raw bytes / 1,639,844 base64 bytes.
-    let data = base64::engine::general_purpose::STANDARD.encode(include_bytes!("../fixtures/review_valid_640px.png"));
+    let data = base64::engine::general_purpose::STANDARD
+        .encode(include_bytes!("../fixtures/review_valid_640px.png"));
     let source = Base64ImageSource::new(data, ImageMediaType::Png);
-    let message = MessageParam::new_with_blocks(vec![ContentBlock::Image(ImageBlock::new_with_base64(source))], MessageRole::User);
+    let message = MessageParam::new_with_blocks(
+        vec![ContentBlock::Image(ImageBlock::new_with_base64(source))],
+        MessageRole::User,
+    );
     let params = MessageCreateParams::new(100, vec![message], KnownModel::ClaudeOpus5.into());
     assert!(params.validate().is_ok());
 }
@@ -46,7 +61,8 @@ fn single_pdf_page_uses_exclusive_endpoint() {
 
 #[test]
 fn content_document_serializes_one_type_key() {
-    let document = DocumentBlock::new_with_content_block(ContentBlockSourceParam::from_string_ref("hello"));
+    let document =
+        DocumentBlock::new_with_content_block(ContentBlockSourceParam::from_string_ref("hello"));
     let json = serde_json::to_string(&document).unwrap();
     let parsed = serde_json::from_str::<DocumentBlock>(&json);
     assert!(parsed.is_ok(), "{json}: {parsed:?}");
@@ -54,31 +70,61 @@ fn content_document_serializes_one_type_key() {
 
 #[test]
 fn future_response_enums_do_not_discard_messages() {
-    assert_eq!(serde_json::from_value::<StopReason>(json!("future_stop")).unwrap(), StopReason::Unknown);
-    assert!(matches!(serde_json::from_value::<ContentBlockDelta>(json!({"type":"future_delta","value":1})).unwrap(), ContentBlockDelta::Unknown));
-    assert_eq!(serde_json::from_value::<WebSearchErrorCode>(json!("future_code")).unwrap(), WebSearchErrorCode::Unknown);
+    assert_eq!(
+        serde_json::from_value::<StopReason>(json!("future_stop")).unwrap(),
+        StopReason::Unknown
+    );
+    assert!(matches!(
+        serde_json::from_value::<ContentBlockDelta>(json!({"type":"future_delta","value":1}))
+            .unwrap(),
+        ContentBlockDelta::Unknown
+    ));
+    assert_eq!(
+        serde_json::from_value::<WebSearchErrorCode>(json!("future_code")).unwrap(),
+        WebSearchErrorCode::Unknown
+    );
 }
 
 #[test]
 fn all_usage_iteration_kinds_and_null_model_decode() {
-    for kind in ["message", "fallback_message", "compaction", "advisor_message", "future_kind"] {
+    for kind in [
+        "message",
+        "fallback_message",
+        "compaction",
+        "advisor_message",
+        "future_kind",
+    ] {
         let iteration = json!({"type":kind,"model":null,"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0});
-        assert!(serde_json::from_value::<UsageIteration>(iteration).is_ok(), "{kind}");
+        assert!(
+            serde_json::from_value::<UsageIteration>(iteration).is_ok(),
+            "{kind}"
+        );
     }
 }
 
 #[test]
 fn cache_prewarm_rejects_output_producing_options() {
-    let base = MessageCreateParams::new(0, vec![MessageParam::user("warmup")], KnownModel::ClaudeOpus5.into());
+    let base = MessageCreateParams::new(
+        0,
+        vec![MessageParam::user("warmup")],
+        KnownModel::ClaudeOpus5.into(),
+    );
     let mut params = base.clone();
     params.stream = true;
     assert!(params.validate().is_err());
-    params = base.clone(); params.thinking = Some(ThinkingConfig::Adaptive);
+    params = base.clone();
+    params.thinking = Some(ThinkingConfig::Adaptive);
     assert!(params.validate().is_err());
-    params = base.clone(); params.tool_choice = Some(ToolChoice::any());
+    params = base.clone();
+    params.tool_choice = Some(ToolChoice::any());
     assert!(params.validate().is_err());
-    params = base.clone(); params.tool_choice = Some(ToolChoice::tool("test"));
+    params = base.clone();
+    params.tool_choice = Some(ToolChoice::tool("test"));
     assert!(params.validate().is_err());
-    params = base; params.output_config = Some(serde_json::from_value(json!({"format":{"type":"json_schema","schema":{"type":"object"}}})).unwrap());
+    params = base;
+    params.output_config = Some(
+        serde_json::from_value(json!({"format":{"type":"json_schema","schema":{"type":"object"}}}))
+            .unwrap(),
+    );
     assert!(params.validate().is_err());
 }

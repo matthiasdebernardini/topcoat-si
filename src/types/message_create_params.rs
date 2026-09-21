@@ -449,14 +449,27 @@ impl MessageCreateParams {
     /// - Security checks on string inputs
     pub fn validate(&self) -> Result<(), crate::Error> {
         // Basic parameter validation
-        if self.max_tokens == 0 && (self.stream
-            || self.thinking.is_some_and(|thinking| thinking != ThinkingConfig::Disabled)
-            || self.output_config.as_ref().is_some_and(|config| config.format.is_some())
-            || matches!(self.tool_choice, Some(ToolChoice::Any { .. } | ToolChoice::Tool { .. }))) {
-            return Err(crate::Error::validation(
-                "max_tokens: 0 cannot request streaming, thinking, structured output, or forced tools",
-                Some("max_tokens".to_string()),
-            ));
+        if self.max_tokens == 0 {
+            let requires_output = [
+                self.stream,
+                self.thinking
+                    .is_some_and(|thinking| thinking != ThinkingConfig::Disabled),
+                self.output_config
+                    .as_ref()
+                    .is_some_and(|config| config.format.is_some()),
+                matches!(
+                    self.tool_choice,
+                    Some(ToolChoice::Any { .. } | ToolChoice::Tool { .. })
+                ),
+            ]
+            .into_iter()
+            .any(std::convert::identity);
+            if requires_output {
+                return Err(crate::Error::validation(
+                    "max_tokens: 0 cannot request streaming, thinking, structured output, or forced tools",
+                    Some("max_tokens".to_string()),
+                ));
+            }
         }
 
         // Security: Prevent excessive token requests that could be expensive

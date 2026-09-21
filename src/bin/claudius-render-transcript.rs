@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 //! Render claudius-chat saved transcripts as markdown.
 //!
 //! `claudius-chat` persists transcripts as JSON containing a version and a
@@ -348,7 +350,7 @@ fn image_media_type(media_type: &ImageMediaType) -> &'static str {
 }
 
 fn pretty_json(value: &serde_json::Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    format!("{value:#}")
 }
 
 #[cfg(test)]

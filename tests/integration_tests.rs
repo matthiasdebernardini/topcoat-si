@@ -133,8 +133,8 @@ mod tests {
         let _client = Anthropic::new(Some("test_key".to_string()))
             .expect("Should create client")
             .with_max_retries(5)
-            .with_backoff_params(1.0, 0.5)
-            .with_base_url("https://test.example.com/v1/".to_string());
+            .with_base_url("https://test.example.com/v1/".to_string())
+            .unwrap();
 
         // Note: Fields are private, so we can only test that construction succeeds
         // In a real application, we'd add getter methods if needed

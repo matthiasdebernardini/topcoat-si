@@ -60,7 +60,11 @@ where
     S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin + 'static,
 {
     // Convert reqwest errors to our error type
-    let stream = byte_stream.map(|result| result.map_err(|error| crate::error::map_reqwest_error(error, crate::error::RequestPhase::Body)));
+    let stream = byte_stream.map(|result| {
+        result.map_err(|error| {
+            crate::error::map_reqwest_error(error, crate::error::RequestPhase::Body)
+        })
+    });
 
     // Initialize state with production hardening
     let state = SseState {
@@ -74,7 +78,9 @@ where
 
     stream::unfold((stream, state), move |(mut stream, mut state)| async move {
         loop {
-            if state.finished { return None; }
+            if state.finished {
+                return None;
+            }
             // Check if we have a complete event in the buffer
             match extract_event(&state.buffer) {
                 Ok(Some((event, remaining))) => {
@@ -131,8 +137,19 @@ where
                             let bytes = e.into_bytes();
 
                             if valid_up_to > 0 {
-                                let partial = std::str::from_utf8(&bytes[..valid_up_to])
-                                    .expect("utf8_error::valid_up_to returned invalid prefix");
+                                let partial = match std::str::from_utf8(&bytes[..valid_up_to]) {
+                                    Ok(partial) => partial,
+                                    Err(error) => {
+                                        state.fail();
+                                        return Some((
+                                            Err(Error::encoding(
+                                                "Invalid UTF-8 prefix in SSE stream",
+                                                Some(Box::new(error)),
+                                            )),
+                                            (stream, state),
+                                        ));
+                                    }
+                                };
                                 state.buffer.push_str(partial);
                             }
 
@@ -173,7 +190,8 @@ where
                 }
             }
         }
-    }).fuse()
+    })
+    .fuse()
 }
 
 impl SseState {
@@ -218,28 +236,40 @@ pub fn process_message_stream_sse<S>(
 where
     S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin + 'static,
 {
-    process_sse(byte_stream).scan(false, |finished, result| {
-        let output = if *finished { None } else {
-            let decoded = result.and_then(|event| {
+    process_sse(byte_stream)
+        .scan(false, |finished, result| {
+            let output = if *finished {
+                None
+            } else {
+                let decoded = result.and_then(|event| {
+                tracing::trace!(target: "claudius::wire", event = %event.event, data = %event.data);
                 let result = parse_message_stream_event(&event);
                 if result.is_err() { STREAM_ERRORS.click(); }
                 result
             });
-            if decoded.is_err() { *finished = true; }
-            Some(decoded)
-        };
-        futures::future::ready(output)
-    }).filter_map(|result| futures::future::ready(match result {
-        Ok(MessageStreamEvent::Unknown) => None,
-        other => Some(other),
-    })).fuse()
+                if decoded.is_err() {
+                    *finished = true;
+                }
+                Some(decoded)
+            };
+            futures::future::ready(output)
+        })
+        .filter_map(|result| {
+            futures::future::ready(match result {
+                Ok(MessageStreamEvent::Unknown) => None,
+                other => Some(other),
+            })
+        })
+        .fuse()
 }
 
 /// Extract a complete SSE event from a buffer string with size validation.
 fn extract_event(buffer: &str) -> Result<Option<(Result<SseEvent>, String)>> {
-    let Some((event_end, delimiter_len)) = ["\n\n", "\r\n\r\n", "\r\r"].iter()
+    let Some((event_end, delimiter_len)) = ["\n\n", "\r\n\r\n", "\r\r"]
+        .iter()
         .filter_map(|delimiter| buffer.find(delimiter).map(|index| (index, delimiter.len())))
-        .min_by_key(|(index, _)| *index) else {
+        .min_by_key(|(index, _)| *index)
+    else {
         return Ok(None);
     };
 
@@ -346,7 +376,12 @@ fn parse_stream_error(event_data: &str) -> Error {
                 .and_then(|error| error.get("retryable"))
                 .and_then(|value| value.as_bool());
 
-            Error::api(status_code, error_type, message, error_json["request_id"].as_str().map(String::from))
+            Error::api(
+                status_code,
+                error_type,
+                message,
+                error_json["request_id"].as_str().map(String::from),
+            )
         }
         Err(_) => Error::api(
             500,
@@ -457,14 +492,14 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_unknown_event_type() {
-        let err = parse_message_stream_event(&SseEvent {
+    fn decoder_accepts_unknown_event_type() {
+        let event = parse_message_stream_event(&SseEvent {
             event: "unknown_event".to_string(),
             data: "{}".to_string(),
         })
-        .unwrap_err();
+        .unwrap();
 
-        assert!(err.to_string().contains("Unknown SSE event type"));
+        assert!(matches!(event, MessageStreamEvent::Unknown));
     }
 
     #[tokio::test]

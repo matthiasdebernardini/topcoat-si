@@ -315,9 +315,10 @@ impl<A: ChatAgent> ChatSession<A> {
     ///
     /// This updates both the visible configuration and the active session
     /// budget used to cap model requests.
-    pub fn set_session_spend(&mut self, dollars: Option<f64>) {
-        self.agent.config_mut().set_session_spend(dollars);
+    pub fn set_session_spend(&mut self, dollars: Option<f64>) -> Result<()> {
+        self.agent.config_mut().set_session_spend(dollars)?;
         self.session_spend = self.agent.config().session_spend.clone().map(Arc::new);
+        Ok(())
     }
 
     /// Sets or clears the active session spend budget.

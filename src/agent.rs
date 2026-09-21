@@ -121,22 +121,6 @@ pub trait Tool<A: Agent>: Send + Sync {
     fn to_param(&self) -> ToolUnionParam;
 }
 
-struct ToolNotFound(String);
-
-impl<A: Agent> Tool<A> for ToolNotFound {
-    fn name(&self) -> String {
-        self.0.clone()
-    }
-
-    fn callback(&self) -> Box<dyn ToolCallback<A> + '_> {
-        Box::new(ToolNotFoundCallback(self.0.clone()))
-    }
-
-    fn to_param(&self) -> ToolUnionParam {
-        unimplemented!();
-    }
-}
-
 struct ToolNotFoundCallback(String);
 
 #[async_trait::async_trait]
@@ -157,15 +141,13 @@ impl<A: Agent> ToolCallback<A> for ToolNotFoundCallback {
         tool_use: &ToolUseBlock,
         _intermediate: Box<dyn IntermediateToolResult>,
     ) -> ToolResult {
-        ControlFlow::Continue(Err(ToolResultBlock {
-            tool_use_id: tool_use.id.clone(),
-            content: Some(ToolResultBlockContent::String(format!(
-                "{} not found",
-                self.0
-            ))),
-            is_error: Some(true),
-            cache_control: None,
-        }))
+        ControlFlow::Continue(Err(tool_error(
+            tool_use,
+            &std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{} not found", self.0),
+            ),
+        )))
     }
 }
 
@@ -197,6 +179,25 @@ impl<A: Agent> Tool<A> for ToolBash20250124 {
     }
 }
 
+fn tool_error(tool: &ToolUseBlock, error: &(dyn std::error::Error + 'static)) -> ToolResultBlock {
+    tracing::error!(error, tool_name = %tool.name, tool_use_id = %tool.id, "Tool invocation failed");
+    ToolResultBlock::new(tool.id.clone())
+        .with_string_content(error.to_string())
+        .with_error(true)
+}
+
+fn tool_response(
+    tool: &ToolUseBlock,
+    response: std::io::Result<String>,
+) -> Box<dyn IntermediateToolResult> {
+    let result: ToolResult = ControlFlow::Continue(
+        response
+            .map(|text| ToolResultBlock::new(tool.id.clone()).with_string_content(text))
+            .map_err(|error| tool_error(tool, &error)),
+    );
+    Box::new(result)
+}
+
 struct BashCallback;
 
 #[async_trait::async_trait]
@@ -217,32 +218,24 @@ impl<A: Agent> ToolCallback<A> for BashCallback {
         let bash: BashTool = match serde_json::from_value(tool_use.input.clone()) {
             Ok(input) => input,
             Err(err) => {
-                return Box::new(ControlFlow::Continue(Err(ToolResultBlock {
-                    tool_use_id: tool_use.id.clone(),
-                    content: Some(ToolResultBlockContent::String(err.to_string())),
-                    is_error: Some(true),
-                    cache_control: None,
-                })));
+                return Box::new(ControlFlow::Continue(Err(tool_error(tool_use, &err))));
             }
         };
         if bash.command.is_none() && !bash.restart {
-            return Box::new(ControlFlow::Continue(Err(ToolResultBlock::new(tool_use.id.clone())
-                .with_string_content("command is required unless restart is true".into()).with_error(true))));
+            return Box::new(ControlFlow::Continue(Err(tool_error(
+                tool_use,
+                &std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "command is required unless restart is true",
+                ),
+            ))));
         }
-        match agent.bash(bash.command.as_deref().unwrap_or(""), bash.restart).await {
-            Ok(answer) => Box::new(ControlFlow::Continue(Ok(ToolResultBlock {
-                tool_use_id: tool_use.id.clone(),
-                content: Some(ToolResultBlockContent::String(answer.to_string())),
-                is_error: None,
-                cache_control: None,
-            }))),
-            Err(err) => Box::new(ControlFlow::Continue(Err(ToolResultBlock {
-                tool_use_id: tool_use.id.clone(),
-                content: Some(ToolResultBlockContent::String(err.to_string())),
-                is_error: Some(true),
-                cache_control: None,
-            }))),
-        }
+        tool_response(
+            tool_use,
+            agent
+                .bash(bash.command.as_deref().unwrap_or(""), bash.restart)
+                .await,
+        )
     }
 
     async fn apply_tool_result(
@@ -271,20 +264,7 @@ impl<A: Agent> ToolCallback<A> for TextEditorCallback {
         agent: &A,
         tool_use: &ToolUseBlock,
     ) -> Box<dyn IntermediateToolResult> {
-        match agent.text_editor(tool_use.clone()).await {
-            Ok(result) => Box::new(ControlFlow::Continue(Ok(ToolResultBlock {
-                tool_use_id: tool_use.id.clone(),
-                content: Some(ToolResultBlockContent::String(result)),
-                is_error: None,
-                cache_control: None,
-            }))),
-            Err(err) => Box::new(ControlFlow::Continue(Err(ToolResultBlock {
-                tool_use_id: tool_use.id.clone(),
-                content: Some(ToolResultBlockContent::String(err.to_string())),
-                is_error: Some(true),
-                cache_control: None,
-            }))),
-        }
+        tool_response(tool_use, agent.text_editor(tool_use.clone()).await)
     }
 
     async fn apply_tool_result(
@@ -313,14 +293,13 @@ impl<A: Agent> ToolCallback<A> for WebSearchCallback {
         _agent: &A,
         tool_use: &ToolUseBlock,
     ) -> Box<dyn IntermediateToolResult> {
-        Box::new(ControlFlow::Continue(Err(ToolResultBlock {
-            tool_use_id: tool_use.id.clone(),
-            content: Some(ToolResultBlockContent::String(
-                "Web search is not implemented".to_string(),
-            )),
-            is_error: Some(true),
-            cache_control: None,
-        })))
+        Box::new(ControlFlow::Continue(Err(tool_error(
+            tool_use,
+            &std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Web search is not implemented",
+            ),
+        ))))
     }
 
     async fn apply_tool_result(
@@ -356,28 +335,10 @@ impl<A: Agent> ToolCallback<A> for SearchFilesystemCallback {
         let search: SearchTool = match serde_json::from_value(tool_use.input.clone()) {
             Ok(input) => input,
             Err(err) => {
-                return Box::new(ControlFlow::Continue(Err(ToolResultBlock {
-                    tool_use_id: tool_use.id.clone(),
-                    content: Some(ToolResultBlockContent::String(err.to_string())),
-                    is_error: Some(true),
-                    cache_control: None,
-                })));
+                return Box::new(ControlFlow::Continue(Err(tool_error(tool_use, &err))));
             }
         };
-        match agent.search(&search.query).await {
-            Ok(answer) => Box::new(ControlFlow::Continue(Ok(ToolResultBlock {
-                tool_use_id: tool_use.id.clone(),
-                content: Some(ToolResultBlockContent::String(answer.to_string())),
-                is_error: None,
-                cache_control: None,
-            }))),
-            Err(err) => Box::new(ControlFlow::Continue(Err(ToolResultBlock {
-                tool_use_id: tool_use.id.clone(),
-                content: Some(ToolResultBlockContent::String(err.to_string())),
-                is_error: Some(true),
-                cache_control: None,
-            }))),
-        }
+        tool_response(tool_use, agent.search(&search.query).await)
     }
 
     async fn apply_tool_result(
@@ -914,19 +875,22 @@ impl Budget {
     /// use claudius::{Budget, KnownModel};
     ///
     /// // Create a $5.00 budget priced for Claude Sonnet 4.5
-    /// let budget = Budget::from_dollars_with_model(5.0, KnownModel::ClaudeSonnet45);
+    /// let budget = Budget::from_dollars_with_model(5.0, KnownModel::ClaudeSonnet45).unwrap();
     ///
     /// assert_eq!(budget.total_micro_cents(), 500_000_000); // $5.00
     /// ```
-    pub fn from_dollars_with_model(budget_dollars: f64, model: crate::KnownModel) -> Self {
-        let rates = model.token_rates();
-        Self::from_dollars_with_rates(
+    pub fn from_dollars_with_model(
+        budget_dollars: f64,
+        model: crate::KnownModel,
+    ) -> Result<Self, Error> {
+        let rates = model.token_rates()?;
+        Ok(Self::from_dollars_with_rates(
             budget_dollars,
             rates.input,
             rates.output,
             rates.cache_creation,
             rates.cache_read,
-        )
+        ))
     }
 
     /// Creates a budget with the given micro-cent amount using the published token rates
@@ -943,19 +907,19 @@ impl Budget {
     /// use claudius::{Budget, KnownModel};
     ///
     /// // Create a 500M micro-cent ($5.00) budget priced for Claude Opus 4.5
-    /// let budget = Budget::from_model(500_000_000, KnownModel::ClaudeOpus45);
+    /// let budget = Budget::from_model(500_000_000, KnownModel::ClaudeOpus45).unwrap();
     ///
     /// assert_eq!(budget.total_micro_cents(), 500_000_000);
     /// ```
-    pub fn from_model(budget_micro_cents: u64, model: crate::KnownModel) -> Self {
-        let rates = model.token_rates();
-        Self::new_with_rates(
+    pub fn from_model(budget_micro_cents: u64, model: crate::KnownModel) -> Result<Self, Error> {
+        let rates = model.token_rates()?;
+        Ok(Self::new_with_rates(
             budget_micro_cents,
             rates.input,
             rates.output,
             rates.cache_creation,
             rates.cache_read,
-        )
+        ))
     }
 
     /// Legacy constructor for backward compatibility - creates a token-based budget.
@@ -2061,7 +2025,10 @@ pub trait Agent: Send + Sync + Sized {
         let mut tool_results = vec![];
         for (tool_use, tool) in tools_and_blocks.iter() {
             AGENT_TOOL_CALLS.click();
-            let callback = tool.callback();
+            let callback: Box<dyn ToolCallback<Self> + '_> = match tool {
+                Some(tool) => tool.callback(),
+                None => Box::new(ToolNotFoundCallback(tool_use.name.clone())),
+            };
             let tool_use = tool_use.clone();
             let this = &*self;
             let compute_start = Instant::now();
@@ -2104,7 +2071,10 @@ pub trait Agent: Send + Sync + Sized {
         for (tool_use, tool) in tools_and_blocks.iter() {
             AGENT_TOOL_CALLS.click();
             let tool_context = context.child(format!("tool:{}", tool_use.name));
-            let callback = tool.callback();
+            let callback: Box<dyn ToolCallback<Self> + '_> = match tool {
+                Some(tool) => tool.callback(),
+                None => Box::new(ToolNotFoundCallback(tool_use.name.clone())),
+            };
             let this = &*self;
             let start = Instant::now();
             let intermediate = callback
@@ -2132,7 +2102,10 @@ pub trait Agent: Send + Sync + Sized {
     }
 
     /// Collect all ToolUseBlock blocks from the message.
-    async fn collect_tool_uses(&self, resp: &Message) -> Vec<(ToolUseBlock, Arc<dyn Tool<Self>>)> {
+    async fn collect_tool_uses(
+        &self,
+        resp: &Message,
+    ) -> Vec<(ToolUseBlock, Option<Arc<dyn Tool<Self>>>)> {
         let tools = self.tools().await;
         let mut tools_and_blocks = vec![];
         for block in resp.content.iter() {
@@ -2142,8 +2115,7 @@ pub trait Agent: Send + Sync + Sized {
             let tool = tools
                 .iter()
                 .find(|tool| tool.name() == tool_use.name)
-                .cloned()
-                .unwrap_or_else(|| Arc::new(ToolNotFound(tool_use.name.clone())) as _);
+                .cloned();
             tools_and_blocks.push((tool_use.clone(), tool));
         }
         tools_and_blocks
@@ -2216,12 +2188,22 @@ pub trait Agent: Send + Sync + Sized {
                     view_range: Option<(u32, i64)>,
                 }
                 let args: ViewTool = serde_json::from_value(tool_use.input)?;
-                let range = args.view_range.map(|(start, end)| {
-                    let end = if end == -1 { u32::MAX } else {
-                        u32::try_from(end).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "view_range end must be -1 or a positive line number"))?
-                    };
-                    Ok::<_, std::io::Error>((start, end))
-                }).transpose()?;
+                let range = args
+                    .view_range
+                    .map(|(start, end)| {
+                        let end = if end == -1 {
+                            u32::MAX
+                        } else {
+                            u32::try_from(end).map_err(|error| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    format!("view_range end {end} must be -1 or a positive line number: {error}"),
+                                )
+                            })?
+                        };
+                        Ok::<_, std::io::Error>((start, end))
+                    })
+                    .transpose()?;
                 validate_view_range(range)?;
                 self.view(&args.path, range).await
             }
@@ -2963,162 +2945,76 @@ async fn step_default_turn_impl<A: Agent>(
     let stream = streaming.is_some();
     let mut usage_total = Usage::new(0, 0);
     let mut request_count: u64 = 0;
-        let max_tokens = std::cmp::min(agent.max_tokens().await, tokens_rem.remaining_tokens());
-        let req = agent
-            .create_request(max_tokens, messages.clone(), stream)
-            .await;
-        if let Err(err) = agent.hook_message_create_params(&req).await {
-            return ControlFlow::Break(Err(err));
+    let max_tokens = std::cmp::min(agent.max_tokens().await, tokens_rem.remaining_tokens());
+    let req = agent
+        .create_request(max_tokens, messages.clone(), stream)
+        .await;
+    if let Err(err) = agent.hook_message_create_params(&req).await {
+        return ControlFlow::Break(Err(err));
+    }
+
+    AGENT_TURN_REQUESTS.click();
+    let resp = if let Some(streaming) = streaming.as_mut() {
+        match stream_message_with_renderer(
+            client,
+            req,
+            streaming.renderer,
+            streaming.context,
+            streaming.show_thinking,
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(err) => return ControlFlow::Break(Err(err)),
         }
-
-        AGENT_TURN_REQUESTS.click();
-        let resp = if let Some(streaming) = streaming.as_mut() {
-            match stream_message_with_renderer(
-                client,
-                req,
-                streaming.renderer,
-                streaming.context,
-                streaming.show_thinking,
-            )
-            .await
-            {
-                Ok(resp) => resp,
-                Err(err) => return ControlFlow::Break(Err(err)),
-            }
-        } else {
-            match client.send(req).await {
-                Ok(resp) => resp,
-                Err(err) => return ControlFlow::Break(Err(err)),
-            }
-        };
-
-        let assistant_message = MessageParam {
-            role: MessageRole::Assistant,
-            content: MessageParamContent::Array(resp.content.clone()),
-        };
-        let response_within_budget = tokens_rem.consume_response(&resp.usage);
-        usage_total = usage_total + resp.usage.clone();
-        request_count = request_count.saturating_add(1);
-
-        if let Err(err) = agent.hook_message(&resp).await {
-            return ControlFlow::Break(Err(err));
+    } else {
+        match client.send(req).await {
+            Ok(resp) => resp,
+            Err(err) => return ControlFlow::Break(Err(err)),
         }
+    };
 
-        push_or_merge_message(messages, assistant_message);
-        if !response_within_budget {
-            let tool_errors: Vec<ContentBlock> = resp.content.iter().filter_map(|block| match block {
-                ContentBlock::ToolUse(tool) => Some(ToolResultBlock::new(tool.id.clone())
-                    .with_string_content("Tool was not executed: token budget exhausted".into())
-                    .with_error(true).into()),
+    let assistant_message = MessageParam {
+        role: MessageRole::Assistant,
+        content: MessageParamContent::Array(resp.content.clone()),
+    };
+    let response_within_budget = tokens_rem.consume_response(&resp.usage);
+    usage_total = usage_total + resp.usage.clone();
+    request_count = request_count.saturating_add(1);
+
+    if let Err(err) = agent.hook_message(&resp).await {
+        return ControlFlow::Break(Err(err));
+    }
+
+    push_or_merge_message(messages, assistant_message);
+    if !response_within_budget {
+        let tool_errors: Vec<ContentBlock> = resp
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse(tool) => Some(
+                    ToolResultBlock::new(tool.id.clone())
+                        .with_string_content("Tool was not executed: token budget exhausted".into())
+                        .with_error(true)
+                        .into(),
+                ),
                 _ => None,
-            }).collect();
-            if !tool_errors.is_empty() {
-                push_or_merge_message(messages, MessageParam::new(MessageParamContent::Array(tool_errors), MessageRole::User));
-            }
-            return ControlFlow::Break(Ok(TurnOutcome {
-                stop_reason: StopReason::MaxTokens,
-                usage: usage_total,
-                request_count,
-            }));
+            })
+            .collect();
+        if !tool_errors.is_empty() {
+            push_or_merge_message(
+                messages,
+                MessageParam::new(MessageParamContent::Array(tool_errors), MessageRole::User),
+            );
         }
-        let tool_results = match resp.stop_reason {
-            None | Some(StopReason::EndTurn) => {
-                let stop_reason = match agent.handle_end_turn().await {
-                    Ok(stop_reason) => stop_reason,
-                    Err(err) => return ControlFlow::Break(Err(err)),
-                };
-                return ControlFlow::Break(Ok(TurnOutcome {
-                    stop_reason,
-                    usage: usage_total,
-                    request_count,
-                }));
-            }
-            Some(StopReason::MaxTokens) => {
-                let stop_reason = match agent.handle_max_tokens().await {
-                    Ok(stop_reason) => stop_reason,
-                    Err(err) => return ControlFlow::Break(Err(err)),
-                };
-                return ControlFlow::Break(Ok(TurnOutcome {
-                    stop_reason,
-                    usage: usage_total,
-                    request_count,
-                }));
-            }
-            Some(StopReason::StopSequence) => {
-                let stop_reason = match agent.handle_stop_sequence(resp.stop_sequence).await {
-                    Ok(stop_reason) => stop_reason,
-                    Err(err) => return ControlFlow::Break(Err(err)),
-                };
-                return ControlFlow::Break(Ok(TurnOutcome {
-                    stop_reason,
-                    usage: usage_total,
-                    request_count,
-                }));
-            }
-            Some(StopReason::Refusal) => {
-                let stop_reason = match agent.handle_refusal(resp).await {
-                    Ok(stop_reason) => stop_reason,
-                    Err(err) => return ControlFlow::Break(Err(err)),
-                };
-                return ControlFlow::Break(Ok(TurnOutcome {
-                    stop_reason,
-                    usage: usage_total,
-                    request_count,
-                }));
-            }
-            Some(reason @ (StopReason::ModelContextWindowExceeded | StopReason::Unknown)) => {
-                return ControlFlow::Break(Ok(TurnOutcome {
-                    stop_reason: reason,
-                    usage: usage_total,
-                    request_count,
-                }));
-            }
-            Some(StopReason::PauseTurn) => {
-                return ControlFlow::Continue(TurnStep { usage: usage_total, request_count });
-            }
-            Some(StopReason::ToolUse) => {
-                if let Some(streaming) = streaming.as_mut() {
-                    match agent
-                        .handle_tool_use_streaming(
-                            client,
-                            &resp,
-                            streaming.renderer,
-                            streaming.context,
-                        )
-                        .await
-                    {
-                        ControlFlow::Continue(results) => results,
-                        ControlFlow::Break(err) => {
-                            let outcome = err.map(|stop_reason| TurnOutcome {
-                                stop_reason,
-                                usage: usage_total,
-                                request_count,
-                            });
-                            return ControlFlow::Break(outcome);
-                        }
-                    }
-                } else {
-                    match agent.handle_tool_use(client, &resp).await {
-                        ControlFlow::Continue(results) => results,
-                        ControlFlow::Break(err) => {
-                            let outcome = err.map(|stop_reason| TurnOutcome {
-                                stop_reason,
-                                usage: usage_total,
-                                request_count,
-                            });
-                            return ControlFlow::Break(outcome);
-                        }
-                    }
-                }
-            }
-        };
-
-        // The model reported stop_reason = tool_use, but no usable tool_use blocks
-        // were collected (e.g. the model rendered text resembling a tool call instead
-        // of emitting a structured tool_use block). Appending a user message with empty
-        // content here would produce an invalid transcript entry ({"role":"user","content":[]})
-        // that the API rejects on the next request or on replay. End the turn instead.
-        if tool_results.is_empty() {
+        return ControlFlow::Break(Ok(TurnOutcome {
+            stop_reason: StopReason::MaxTokens,
+            usage: usage_total,
+            request_count,
+        }));
+    }
+    let tool_results = match resp.stop_reason {
+        None | Some(StopReason::EndTurn) => {
             let stop_reason = match agent.handle_end_turn().await {
                 Ok(stop_reason) => stop_reason,
                 Err(err) => return ControlFlow::Break(Err(err)),
@@ -3129,14 +3025,108 @@ async fn step_default_turn_impl<A: Agent>(
                 request_count,
             }));
         }
+        Some(StopReason::MaxTokens) => {
+            let stop_reason = match agent.handle_max_tokens().await {
+                Ok(stop_reason) => stop_reason,
+                Err(err) => return ControlFlow::Break(Err(err)),
+            };
+            return ControlFlow::Break(Ok(TurnOutcome {
+                stop_reason,
+                usage: usage_total,
+                request_count,
+            }));
+        }
+        Some(StopReason::StopSequence) => {
+            let stop_reason = match agent.handle_stop_sequence(resp.stop_sequence).await {
+                Ok(stop_reason) => stop_reason,
+                Err(err) => return ControlFlow::Break(Err(err)),
+            };
+            return ControlFlow::Break(Ok(TurnOutcome {
+                stop_reason,
+                usage: usage_total,
+                request_count,
+            }));
+        }
+        Some(StopReason::Refusal) => {
+            let stop_reason = match agent.handle_refusal(resp).await {
+                Ok(stop_reason) => stop_reason,
+                Err(err) => return ControlFlow::Break(Err(err)),
+            };
+            return ControlFlow::Break(Ok(TurnOutcome {
+                stop_reason,
+                usage: usage_total,
+                request_count,
+            }));
+        }
+        Some(reason @ (StopReason::ModelContextWindowExceeded | StopReason::Unknown)) => {
+            return ControlFlow::Break(Ok(TurnOutcome {
+                stop_reason: reason,
+                usage: usage_total,
+                request_count,
+            }));
+        }
+        Some(StopReason::PauseTurn) => {
+            return ControlFlow::Continue(TurnStep {
+                usage: usage_total,
+                request_count,
+            });
+        }
+        Some(StopReason::ToolUse) => {
+            if let Some(streaming) = streaming.as_mut() {
+                match agent
+                    .handle_tool_use_streaming(client, &resp, streaming.renderer, streaming.context)
+                    .await
+                {
+                    ControlFlow::Continue(results) => results,
+                    ControlFlow::Break(err) => {
+                        let outcome = err.map(|stop_reason| TurnOutcome {
+                            stop_reason,
+                            usage: usage_total,
+                            request_count,
+                        });
+                        return ControlFlow::Break(outcome);
+                    }
+                }
+            } else {
+                match agent.handle_tool_use(client, &resp).await {
+                    ControlFlow::Continue(results) => results,
+                    ControlFlow::Break(err) => {
+                        let outcome = err.map(|stop_reason| TurnOutcome {
+                            stop_reason,
+                            usage: usage_total,
+                            request_count,
+                        });
+                        return ControlFlow::Break(outcome);
+                    }
+                }
+            }
+        }
+    };
 
-        let user_message =
-            MessageParam::new(MessageParamContent::Array(tool_results), MessageRole::User);
-        push_or_merge_message(messages, user_message);
-        return ControlFlow::Continue(TurnStep {
+    // The model reported stop_reason = tool_use, but no usable tool_use blocks
+    // were collected (e.g. the model rendered text resembling a tool call instead
+    // of emitting a structured tool_use block). Appending a user message with empty
+    // content here would produce an invalid transcript entry ({"role":"user","content":[]})
+    // that the API rejects on the next request or on replay. End the turn instead.
+    if tool_results.is_empty() {
+        let stop_reason = match agent.handle_end_turn().await {
+            Ok(stop_reason) => stop_reason,
+            Err(err) => return ControlFlow::Break(Err(err)),
+        };
+        return ControlFlow::Break(Ok(TurnOutcome {
+            stop_reason,
             usage: usage_total,
             request_count,
-        });
+        }));
+    }
+
+    let user_message =
+        MessageParam::new(MessageParamContent::Array(tool_results), MessageRole::User);
+    push_or_merge_message(messages, user_message);
+    ControlFlow::Continue(TurnStep {
+        usage: usage_total,
+        request_count,
+    })
 }
 
 async fn stream_message_with_renderer(
@@ -3193,10 +3183,7 @@ async fn stream_message_with_renderer(
                         ContentBlock::Text(text_block) if !text_block.text.is_empty() => {
                             renderer.print_text(context, &text_block.text);
                         }
-                        block if block.is_thinking() => {
-                            let thinking_block = block
-                                .as_thinking()
-                                .expect("is_thinking blocks must expose thinking");
+                        ContentBlock::Thinking(thinking_block) => {
                             active_thinking_blocks.insert(start_event.index);
                             if show_thinking && !thinking_block.thinking.is_empty() {
                                 rendered_thinking_blocks.insert(start_event.index);
@@ -5393,7 +5380,8 @@ mod tests {
 
         let client = Anthropic::new(Some("test-key".to_string()))
             .unwrap()
-            .with_base_url(base_url);
+            .with_base_url(base_url)
+            .unwrap();
         let mut agent = EmptyToolUseAgent;
         let budget = Arc::new(Budget::new_flat_rate(100_000, 10));
         let mut messages = vec![MessageParam::user("hello")];
@@ -5803,7 +5791,7 @@ mod tests {
     fn budget_from_dollars_with_model_uses_correct_rates() {
         use crate::KnownModel;
 
-        let budget = Budget::from_dollars_with_model(1.0, KnownModel::ClaudeSonnet45);
+        let budget = Budget::from_dollars_with_model(1.0, KnownModel::ClaudeSonnet45).unwrap();
         assert_eq!(budget.total_micro_cents(), 100_000_000); // $1.00
 
         // Verify the rates are applied correctly by checking cost calculations
@@ -5822,7 +5810,7 @@ mod tests {
     fn budget_from_model_uses_correct_rates() {
         use crate::KnownModel;
 
-        let budget = Budget::from_model(500_000_000, KnownModel::ClaudeOpus45);
+        let budget = Budget::from_model(500_000_000, KnownModel::ClaudeOpus45).unwrap();
         assert_eq!(budget.total_micro_cents(), 500_000_000);
 
         // Opus 4.5 rates: input=500, output=2500
@@ -5839,7 +5827,7 @@ mod tests {
     fn budget_from_dollars_with_model_haiku() {
         use crate::KnownModel;
 
-        let budget = Budget::from_dollars_with_model(10.0, KnownModel::ClaudeHaiku45);
+        let budget = Budget::from_dollars_with_model(10.0, KnownModel::ClaudeHaiku45).unwrap();
         assert_eq!(budget.total_micro_cents(), 1_000_000_000); // $10.00
 
         // Haiku 4.5 rates: input=100, output=500, cache_creation=125, cache_read=10

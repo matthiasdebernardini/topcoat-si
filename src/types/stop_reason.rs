@@ -29,7 +29,6 @@ pub enum StopReason {
     /// A value introduced by a newer API version.
     #[serde(other)]
     Unknown,
-
 }
 
 impl fmt::Display for StopReason {

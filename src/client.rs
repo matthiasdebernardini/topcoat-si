@@ -1,9 +1,7 @@
 use std::collections::VecDeque;
 use std::env;
 use std::fs;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -11,11 +9,11 @@ use futures::{Stream, StreamExt, stream};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client as ReqwestClient, Response, header};
 use tokio::time::sleep;
+use tracing::{Instrument, Span, field};
 
 use crate::AccumulatingStream;
 use crate::backoff::ExponentialBackoff;
-use crate::client_logger::ClientLogger;
-use crate::error::{Error, Result, HttpMetadata, RequestPhase, map_reqwest_error};
+use crate::error::{Error, HttpMetadata, RequestPhase, Result, map_reqwest_error};
 use crate::observability::{
     CLIENT_REQUEST_DURATION, CLIENT_REQUEST_ERRORS, CLIENT_REQUEST_RETRIES, CLIENT_REQUESTS,
     CLIENT_RETRY_BACKOFF,
@@ -27,60 +25,59 @@ use crate::types::{
     MessageStreamEvent, MessageTokensCount, ModelInfo, ModelListParams, ModelListResponse,
 };
 
-/// A stream wrapper that logs events and the final message through a [`ClientLogger`].
-///
-/// This stream passes through all events from the underlying [`AccumulatingStream`],
-/// logging each event as it occurs and logging the final reconstructed message
-/// when the stream completes.
-pub struct LoggingStream<'a> {
-    inner: AccumulatingStream,
-    logger: &'a dyn ClientLogger,
-    receiver: Option<tokio::sync::oneshot::Receiver<Result<Message>>>,
+fn final_failure(error: &Error) {
+    let span = Span::current();
+    span.record("otel.status_code", "ERROR");
+    if let Some(id) = error.request_id() {
+        span.record("request_id", id);
+    }
+    if let Some(status) = error.status_code() {
+        span.record("http.status_code", status);
+    }
+    tracing::error!(
+        error = error as &dyn std::error::Error,
+        "API request failed"
+    );
 }
 
-impl<'a> LoggingStream<'a> {
-    /// Create a new logging stream wrapper.
-    fn new(
-        inner: AccumulatingStream,
-        receiver: tokio::sync::oneshot::Receiver<Result<Message>>,
-        logger: &'a dyn ClientLogger,
-    ) -> Self {
-        Self {
-            inner,
-            logger,
-            receiver: Some(receiver),
-        }
-    }
+fn record_usage(message: &Message) {
+    Span::current().record("input_tokens", message.usage.input_tokens);
+    Span::current().record("output_tokens", message.usage.output_tokens);
 }
 
-impl Stream for LoggingStream<'_> {
-    type Item = Result<MessageStreamEvent>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let inner = Pin::new(&mut self.inner);
-        match inner.poll_next(cx) {
-            Poll::Ready(Some(Ok(event))) => {
-                self.logger.log_stream_event(&event);
-                Poll::Ready(Some(Ok(event)))
+// Own the span until EOF, failure, or drop. Enter it only while polling, never across
+// another task's execution. Fuse the unfold so repeated polls after EOF are safe.
+fn trace_stream<S, T>(inner: S, span: Span) -> impl Stream<Item = Result<T>>
+where
+    S: Stream<Item = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    stream::unfold(Some((Box::pin(inner), span)), |state| async move {
+        let (mut inner, span) = state?;
+        let item = async {
+            let item = inner.next().await;
+            if let Some(Err(error)) = &item {
+                final_failure(error);
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-            Poll::Ready(None) => {
-                // Stream ended - try to get the accumulated message
-                if let Some(mut receiver) = self.receiver.take()
-                    && let Ok(Ok(ref message)) = receiver.try_recv()
-                {
-                    self.logger.log_stream_message(message);
-                }
-                Poll::Ready(None)
-            }
-            Poll::Pending => Poll::Pending,
+            item
         }
-    }
+        .instrument(span.clone())
+        .await;
+        item.map(|item| {
+            let next = if item.is_err() {
+                None
+            } else {
+                Some((inner, span))
+            };
+            (item, next)
+        })
+    })
+    .fuse()
 }
 
 const DEFAULT_API_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
-/// Default connect/read inactivity timeout shared by all requests.
+/// Total deadline for non-streaming requests; streams use a separate read timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const STRUCTURED_OUTPUTS_BETA: &str = "structured-outputs-2025-11-13";
 const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
@@ -213,15 +210,73 @@ where
 
 fn response_metadata(response: &Response) -> HttpMetadata {
     let headers = response.headers();
-    let seconds = |name| headers.get(name).and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<f64>().ok()).filter(|value| value.is_finite() && *value >= 0.0);
-    let retry_after = seconds("retry-after-ms").and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok())
+    Span::current().record("http.status_code", response.status().as_u16());
+    if let Some(id) = headers
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+    {
+        Span::current().record("request_id", id);
+    }
+    let seconds = |name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    };
+    let retry_after = seconds("retry-after-ms")
+        .and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok())
         .or_else(|| seconds("retry-after").and_then(|s| Duration::try_from_secs_f64(s).ok()))
-        .or_else(|| headers.get("retry-after").and_then(|value| value.to_str().ok())
-            .and_then(|value| time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc2822).ok())
-            .map(|deadline| Duration::from_secs_f64((deadline - time::OffsetDateTime::now_utc()).as_seconds_f64().max(0.0))));
-    HttpMetadata { status: response.status().as_u16(), error_type: None,
-        request_id: headers.get("request-id").and_then(|value| value.to_str().ok()).map(String::from), retry_after }
+        .or_else(|| {
+            headers
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| {
+                    time::OffsetDateTime::parse(
+                        value,
+                        &time::format_description::well_known::Rfc2822,
+                    )
+                    .ok()
+                })
+                .map(|deadline| {
+                    Duration::from_secs_f64(
+                        (deadline - time::OffsetDateTime::now_utc())
+                            .as_seconds_f64()
+                            .max(0.0),
+                    )
+                })
+        });
+    HttpMetadata {
+        status: response.status().as_u16(),
+        error_type: None,
+        request_id: headers
+            .get("request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(String::from),
+        retry_after,
+    }
+}
+
+fn configured_value(names: &[&str]) -> Result<Option<String>> {
+    for name in names {
+        match env::var(name) {
+            Ok(value) if !value.trim().is_empty() => return Ok(Some(value.trim().to_string())),
+            Ok(_) | Err(env::VarError::NotPresent) => {}
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(Error::validation(
+                    format!("Configuration variable {name} must contain Unicode text"),
+                    Some((*name).into()),
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Clone, Copy)]
+enum ResponseMode {
+    Buffered,
+    Streaming,
 }
 
 /// Client for the Anthropic API with performance optimizations.
@@ -251,49 +306,35 @@ impl std::fmt::Debug for Anthropic {
 }
 
 impl Anthropic {
-    fn build_http_client(timeout: Duration, streaming: bool) -> Result<ReqwestClient> {
+    fn build_http_client(timeout: Duration, mode: ResponseMode) -> Result<ReqwestClient> {
         let builder = ReqwestClient::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(timeout.min(Duration::from_secs(60)))
             .pool_max_idle_per_host(10) // Connection pooling optimization
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60));
-        let builder = if streaming { builder.read_timeout(timeout.min(Duration::from_secs(60))) }
-            else { builder.timeout(timeout) };
-        builder.build()
-            .map_err(|e| {
-                Error::http_client(
-                    format!("Failed to build HTTP client: {e}"),
-                    Some(Box::new(e)),
-                )
-            })
+        let builder = if matches!(mode, ResponseMode::Streaming) {
+            builder.read_timeout(timeout.min(Duration::from_secs(60)))
+        } else {
+            builder.timeout(timeout)
+        };
+        builder.build().map_err(|e| {
+            Error::http_client(
+                format!("Failed to build HTTP client: {e}"),
+                Some(Box::new(e)),
+            )
+        })
     }
 
     /// Resolve an API key value, handling file:// URLs
     fn resolve_api_key(key_value: &str) -> Result<String> {
         let key_value = key_value.trim();
-        if let Some(stripped) = key_value.strip_prefix("file://") {
-            // Handle file:// URLs
-            let path = if stripped.starts_with('/') {
-                // Absolute path: file:///root/.env -> /root/.env
-                stripped.to_string()
-            } else {
-                // Relative path: file://../foo -> ../foo
-                stripped.to_string()
-            };
-
-            fs::read_to_string(&path)
-                .map(|content| content.trim().to_string())
-                .map_err(|e| {
-                    Error::validation(
-                        format!("Failed to read API key from file '{}': {}", path, e),
-                        Some("api_key".to_string()),
-                    )
-                })
-        } else {
-            // Regular API key value
-            Ok(key_value.to_string())
-        }
+        let Some(path) = key_value.strip_prefix("file://") else {
+            return Ok(key_value.to_string());
+        };
+        fs::read_to_string(path)
+            .map(|content| content.trim().to_string())
+            .map_err(|error| Error::io(format!("Failed to read API key file '{path}'"), error))
     }
 
     /// Create a new Anthropic client.
@@ -305,31 +346,27 @@ impl Anthropic {
     /// The base URL is resolved from the CLAUDIUS_BASE_URL or ANTHROPIC_BASE_URL environment
     /// variables, in that order. If neither is set, the default Anthropic API URL is used.
     pub fn new(api_key: Option<String>) -> Result<Self> {
-        let api_key = match api_key {
-            Some(key) => Self::resolve_api_key(&key)?,
-            None => match env::var("CLAUDIUS_API_KEY").ok().filter(|key| !key.trim().is_empty()) {
-                Some(key) => Self::resolve_api_key(&key)?,
-                None => {
-                    let env_key = env::var("ANTHROPIC_API_KEY").map_err(|_| {
-                        Error::authentication(
-                            "API key not provided and ANTHROPIC_API_KEY environment variable not set",
-                        )
-                    })?;
-                    Self::resolve_api_key(&env_key)?
-                }
-            },
+        let key = match api_key {
+            Some(key) => key,
+            None => {
+                configured_value(&["CLAUDIUS_API_KEY", "ANTHROPIC_API_KEY"])?.ok_or_else(|| {
+                    Error::authentication(
+                        "No nonempty API key configured in CLAUDIUS_API_KEY or ANTHROPIC_API_KEY",
+                    )
+                })?
+            }
         };
+        let api_key = Self::resolve_api_key(&key)?;
 
         let timeout = DEFAULT_TIMEOUT;
-        let client = Self::build_http_client(timeout, false)?;
+        let client = Self::build_http_client(timeout, ResponseMode::Buffered)?;
 
         // Resolve base URL from environment variables, defaulting to the API URL.
         // This is resolved before building headers because some providers
         // (see `BASE_URLS_REQUIRING_AUTH_HEADER`) require an `Authorization`
         // header derived from the base URL.
-        let base_url = env::var("CLAUDIUS_BASE_URL")
-            .or_else(|_| env::var("ANTHROPIC_BASE_URL"))
-            .unwrap_or_else(|_| DEFAULT_API_URL.to_string());
+        let base_url = configured_value(&["CLAUDIUS_BASE_URL", "ANTHROPIC_BASE_URL"])?
+            .unwrap_or_else(|| DEFAULT_API_URL.to_string());
 
         // Pre-build headers for performance
         let cached_headers = Arc::new(Self::build_default_headers(&api_key, &base_url)?);
@@ -337,7 +374,7 @@ impl Anthropic {
         Ok(Self {
             api_key,
             client,
-            stream_client: Self::build_http_client(timeout, true)?,
+            stream_client: Self::build_http_client(timeout, ResponseMode::Streaming)?,
             base_url,
             timeout,
             max_retries: 3,
@@ -358,50 +395,43 @@ impl Anthropic {
     /// # use claudius::Anthropic;
     /// // For Anthropic's API (default)
     /// let client = Anthropic::new(Some("api-key".to_string()))?
-    ///     .with_base_url("https://api.anthropic.com".to_string());
+    ///     .with_base_url("https://api.anthropic.com".to_string())?;
     ///
     /// // For Minimax (international)
     /// let client = Anthropic::new(Some("api-key".to_string()))?
-    ///     .with_base_url("https://api.minimax.io/anthropic".to_string());
+    ///     .with_base_url("https://api.minimax.io/anthropic".to_string())?;
     ///
     /// // For Minimax (China)
     /// let client = Anthropic::new(Some("api-key".to_string()))?
-    ///     .with_base_url("https://api.minimaxi.com/anthropic".to_string());
+    ///     .with_base_url("https://api.minimaxi.com/anthropic".to_string())?;
     /// # Ok::<(), claudius::Error>(())
     /// ```
-    pub fn with_base_url(mut self, base_url: String) -> Self {
+    pub fn with_base_url(mut self, base_url: String) -> Result<Self> {
         // The set of default headers is derived from the base URL: providers
         // listed in `BASE_URLS_REQUIRING_AUTH_HEADER` get an `Authorization`
         // header. Rebuild the cached headers when switching to or from such a
         // provider so every subsequent request carries the right auth.
-        if requires_auth_header(&base_url) != requires_auth_header(&self.base_url) {
-            // The API key was already validated when the client was built, so
-            // rebuilding the headers cannot fail here.
-            self.cached_headers = Arc::new(
-                Self::build_default_headers(&self.api_key, &base_url).expect(
-                    "rebuilding default headers with an already-validated API key must succeed",
-                ),
-            );
-        }
+        self.cached_headers = Arc::new(Self::build_default_headers(&self.api_key, &base_url)?);
         self.base_url = base_url;
-        self
+        Ok(self)
     }
 
     /// Set a custom timeout for this client.
     ///
-    /// This method allows you to specify a different connect/read inactivity
-    /// timeout for API requests.
+    /// Sets the total deadline for non-streaming requests. Streaming reads use
+    /// an inactivity timeout of the smaller of this value and 60 seconds.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
         self.timeout = timeout;
-        self.stream_client = Self::build_http_client(timeout, true)?;
+        self.stream_client = Self::build_http_client(timeout, ResponseMode::Streaming)?;
 
-        self.client = Self::build_http_client(timeout, false).map_err(|e| match e {
-            Error::HttpClient { source, .. } => Error::http_client(
-                "Failed to build HTTP client with new timeout",
-                source.map(|src| Box::new(src) as Box<dyn std::error::Error + Send + Sync>),
-            ),
-            other => other,
-        })?;
+        self.client =
+            Self::build_http_client(timeout, ResponseMode::Buffered).map_err(|e| match e {
+                Error::HttpClient { source, .. } => Error::http_client(
+                    "Failed to build HTTP client with new timeout",
+                    source.map(|src| Box::new(src) as Box<dyn std::error::Error + Send + Sync>),
+                ),
+                other => other,
+            })?;
         Ok(self)
     }
 
@@ -434,7 +464,7 @@ impl Anthropic {
     ///
     /// This is a convenience method that chains with_base_url and with_timeout.
     pub fn with_base_url_and_timeout(self, base_url: String, timeout: Duration) -> Result<Self> {
-        self.with_base_url(base_url).with_timeout(timeout)
+        self.with_base_url(base_url)?.with_timeout(timeout)
     }
 
     /// Build default headers for API requests (static method for initialization).
@@ -509,29 +539,14 @@ impl Anthropic {
     /// Returns a deduplicated, ordered list.
     fn collect_betas(&self, request_betas: Option<&[String]>, auto_betas: &[&str]) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
-
-        for beta in &self.default_betas {
-            if seen.insert(beta.as_str().to_owned()) {
-                result.push(beta.clone());
-            }
-        }
-
-        if let Some(betas) = request_betas {
-            for beta in betas {
-                if seen.insert(beta.clone()) {
-                    result.push(beta.clone());
-                }
-            }
-        }
-
-        for &beta in auto_betas {
-            if seen.insert(beta.to_owned()) {
-                result.push(beta.to_owned());
-            }
-        }
-
-        result
+        self.default_betas
+            .iter()
+            .map(String::as_str)
+            .chain(request_betas.into_iter().flatten().map(String::as_str))
+            .chain(auto_betas.iter().copied())
+            .filter(|beta| seen.insert(*beta))
+            .map(String::from)
+            .collect()
     }
 
     /// Build headers with the `anthropic-beta` header set from the given betas.
@@ -560,15 +575,25 @@ impl Anthropic {
 
         for attempt in 0..=self.max_retries {
             match operation().await {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    Span::current().record("attempts", attempt + 1);
+                    return Ok(result);
+                }
                 Err(error) => {
                     // Check if error is retryable
-                    if !error.is_retryable() || error.retry_after().is_some_and(|delay| delay > Duration::from_secs(60)) {
+                    if !error.is_retryable()
+                        || error
+                            .retry_after()
+                            .is_some_and(|delay| delay > Duration::from_secs(60))
+                    {
+                        Span::current().record("attempts", attempt + 1);
+                        final_failure(&error);
                         return Err(error);
                     }
 
                     // Don't sleep on the last attempt
                     if attempt == self.max_retries {
+                        Span::current().record("attempts", attempt + 1);
                         last_error = Some(error);
                         break;
                     }
@@ -576,6 +601,12 @@ impl Anthropic {
                     let sleep_duration = ExponentialBackoff::next(attempt)
                         .max(error.retry_after().unwrap_or_default());
 
+                    tracing::warn!(
+                        error = &error as &dyn std::error::Error,
+                        attempt = attempt + 1,
+                        sleep_seconds = sleep_duration.as_secs_f64(),
+                        "Retrying API request"
+                    );
                     CLIENT_REQUEST_RETRIES.click();
                     CLIENT_RETRY_BACKOFF.add(sleep_duration.as_secs_f64());
                     sleep(sleep_duration).await;
@@ -584,8 +615,10 @@ impl Anthropic {
             }
         }
 
-        Err(last_error
-            .unwrap_or_else(|| Error::unknown("Failed after retries without capturing error")))
+        let error = last_error
+            .unwrap_or_else(|| Error::unknown("Failed after retries without capturing error"));
+        final_failure(&error);
+        Err(error)
     }
 
     /// Process API response errors and convert to our Error type
@@ -593,14 +626,24 @@ impl Anthropic {
         let mut metadata = response_metadata(&response);
         let body = match response.bytes().await {
             Ok(body) => body,
-            Err(error) => return Error::from_http("Failed to read error response", metadata, Some(Arc::new(error))),
+            Err(error) => {
+                return Error::from_http(
+                    "Failed to read error response",
+                    metadata,
+                    Some(Arc::new(error)),
+                );
+            }
         };
         let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
         if let Some(value) = parsed.as_ref() {
             metadata.error_type = value["error"]["type"].as_str().map(String::from);
-            metadata.request_id = metadata.request_id.or_else(|| value["request_id"].as_str().map(String::from));
+            metadata.request_id = metadata
+                .request_id
+                .or_else(|| value["request_id"].as_str().map(String::from));
         }
-        let message = parsed.as_ref().and_then(|value| value["error"]["message"].as_str())
+        let message = parsed
+            .as_ref()
+            .and_then(|value| value["error"]["message"].as_str())
             .unwrap_or("HTTP error response");
         Error::from_http(message, metadata, None)
     }
@@ -612,10 +655,15 @@ impl Anthropic {
     async fn decode_response<T: serde::de::DeserializeOwned>(response: Response) -> Result<T> {
         let metadata = response_metadata(&response);
         let body = response.bytes().await.map_err(|error| {
-            Error::from_http("Failed to read response body", metadata.clone(), Some(Arc::new(error)))
+            map_reqwest_error(error, RequestPhase::Body).with_http_metadata(metadata.clone())
         })?;
+        tracing::trace!(target: "claudius::wire", response = %String::from_utf8_lossy(&body));
         serde_json::from_slice(&body).map_err(|error| {
-            Error::from_http(format!("Failed to parse response ({} bytes): {error}", body.len()), metadata, Some(Arc::new(error)))
+            Error::from_http(
+                format!("Failed to parse response ({} bytes): {error}", body.len()),
+                metadata,
+                Some(Arc::new(error)),
+            )
         })
     }
 
@@ -628,6 +676,7 @@ impl Anthropic {
     ) -> Result<T> {
         let headers = headers.unwrap_or_else(|| self.default_headers());
 
+        tracing::trace!(target: "claudius::wire", request = %serde_json::to_string(body).unwrap_or_default());
         let response = self
             .client
             .post(url)
@@ -742,12 +791,19 @@ impl Anthropic {
     }
 
     /// Send a message to the API and get a non-streaming response.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "send",
+        otel.kind = "client", gen_ai.request.model = %params.model, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
     pub async fn send(&self, mut params: MessageCreateParams) -> Result<Message> {
         let start = Instant::now();
         CLIENT_REQUESTS.click();
 
         // Validate parameters first
         if let Err(err) = params.validate() {
+            final_failure(&err);
             CLIENT_REQUEST_ERRORS.click();
             CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
             return Err(err);
@@ -785,21 +841,8 @@ impl Anthropic {
         if result.is_err() {
             CLIENT_REQUEST_ERRORS.click();
         }
-        result
-    }
-
-    /// Send a message to the API with logging and get a non-streaming response.
-    ///
-    /// This method is identical to [`send`](Self::send) but additionally logs
-    /// the response through the provided [`ClientLogger`].
-    pub async fn send_with_logger(
-        &self,
-        params: MessageCreateParams,
-        logger: &dyn ClientLogger,
-    ) -> Result<Message> {
-        let result = self.send(params).await;
-        if let Ok(ref message) = result {
-            logger.log_response(message);
+        if let Ok(message) = &result {
+            record_usage(message);
         }
         result
     }
@@ -807,6 +850,12 @@ impl Anthropic {
     /// Send a message to the API and get a streaming response.
     ///
     /// Returns a stream of MessageStreamEvent objects that can be processed incrementally.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "stream",
+        otel.kind = "client", gen_ai.request.model = %params.model, stream = true,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
     pub async fn stream(
         &self,
         params: &MessageCreateParams,
@@ -816,6 +865,7 @@ impl Anthropic {
 
         // Validate parameters first
         if let Err(err) = params.validate() {
+            final_failure(&err);
             CLIENT_REQUEST_ERRORS.click();
             CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
             return Err(err);
@@ -827,6 +877,7 @@ impl Anthropic {
                 "stream must be true for streaming requests",
                 Some("stream".to_string()),
             );
+            final_failure(&err);
             CLIENT_REQUEST_ERRORS.click();
             CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
             return Err(err);
@@ -851,7 +902,7 @@ impl Anthropic {
         let response = self
             .retry_with_backoff(|| async {
                 let url = self.build_url("messages");
-        
+
                 let mut headers = self
                     .headers_with_betas(&all_betas)
                     .unwrap_or_else(|| self.default_headers());
@@ -860,6 +911,7 @@ impl Anthropic {
                     HeaderValue::from_static("text/event-stream"),
                 );
 
+                tracing::trace!(target: "claudius::wire", request = ?params);
                 let response = self
                     .stream_client
                     .post(&url)
@@ -889,32 +941,36 @@ impl Anthropic {
         // Get the byte stream from the response
         let request_id = response_metadata(&response).request_id;
         let stream = response.bytes_stream();
-        Ok(process_message_stream_sse(stream).map(move |item| item.map_err(|error| error.with_request_id(request_id.clone()))))
-    }
-
-    /// Send a message to the API with logging and get a streaming response.
-    ///
-    /// This method is identical to [`stream`](Self::stream) but additionally logs
-    /// each streaming event and the final reconstructed message through the
-    /// provided [`ClientLogger`].
-    ///
-    /// Returns a [`LoggingStream`] that wraps an [`AccumulatingStream`], logging
-    /// each event as it passes through and logging the final message when the
-    /// stream completes.
-    pub async fn stream_with_logger<'a>(
-        &self,
-        params: &MessageCreateParams,
-        logger: &'a dyn ClientLogger,
-    ) -> Result<LoggingStream<'a>> {
-        let raw_stream = self.stream(params).await?;
-        let (accumulating_stream, receiver) = AccumulatingStream::new(raw_stream);
-        Ok(LoggingStream::new(accumulating_stream, receiver, logger))
+        let (events, _receiver) = AccumulatingStream::new(process_message_stream_sse(stream));
+        let events = events.map(move |item| {
+            let item = item.map_err(|error| error.with_request_id(request_id.clone()));
+            if let Ok(event) = &item {
+                match event {
+                    MessageStreamEvent::MessageStart(start) => record_usage(&start.message),
+                    MessageStreamEvent::MessageDelta(delta) => {
+                        Span::current().record("output_tokens", delta.usage.output_tokens);
+                        if let Some(tokens) = delta.usage.input_tokens {
+                            Span::current().record("input_tokens", tokens);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            item
+        });
+        Ok(trace_stream(events, Span::current()))
     }
 
     /// Count tokens for a message.
     ///
     /// This method counts the number of tokens that would be used by a message with the given parameters.
     /// It's useful for estimating costs or making sure your messages fit within the model's context window.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "count_tokens",
+        otel.kind = "client", gen_ai.request.model = %params.model, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
     pub async fn count_tokens(
         &self,
         params: MessageCountTokensParams,
@@ -942,6 +998,12 @@ impl Anthropic {
     }
 
     /// Create a Message Batch for asynchronous processing.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "create_message_batch",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
     pub async fn create_message_batch(
         &self,
         params: MessageBatchCreateParams,
@@ -950,6 +1012,7 @@ impl Anthropic {
         CLIENT_REQUESTS.click();
 
         if let Err(err) = params.validate() {
+            final_failure(&err);
             CLIENT_REQUEST_ERRORS.click();
             CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
             return Err(err);
@@ -997,6 +1060,12 @@ impl Anthropic {
     }
 
     /// Retrieve a Message Batch by ID.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "get_message_batch",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
     pub async fn get_message_batch(&self, message_batch_id: &str) -> Result<MessageBatch> {
         let start = Instant::now();
         CLIENT_REQUESTS.click();
@@ -1024,6 +1093,12 @@ impl Anthropic {
     }
 
     /// List Message Batches in the current Workspace.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "list_message_batches",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
     pub async fn list_message_batches(
         &self,
         params: Option<MessageBatchListParams>,
@@ -1065,6 +1140,12 @@ impl Anthropic {
     }
 
     /// Cancel a Message Batch that is currently processing.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "cancel_message_batch",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
     pub async fn cancel_message_batch(&self, message_batch_id: &str) -> Result<MessageBatch> {
         let start = Instant::now();
         CLIENT_REQUESTS.click();
@@ -1087,6 +1168,12 @@ impl Anthropic {
     }
 
     /// Delete a Message Batch after processing has ended.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "delete_message_batch",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
     pub async fn delete_message_batch(
         &self,
         message_batch_id: &str,
@@ -1112,6 +1199,12 @@ impl Anthropic {
     }
 
     /// Stream results for an ended Message Batch as JSONL records.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "stream_message_batch_results",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = true,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
     pub async fn stream_message_batch_results(
         &self,
         message_batch_id: &str,
@@ -1138,13 +1231,22 @@ impl Anthropic {
             }
         };
 
-        Ok(process_message_batch_result_jsonl(response.bytes_stream()))
+        let request_id = response_metadata(&response).request_id;
+        let results = process_message_batch_result_jsonl(response.bytes_stream())
+            .map(move |result| result.map_err(|error| error.with_request_id(request_id.clone())));
+        Ok(trace_stream(results, Span::current()))
     }
 
     /// List available models from the API.
     ///
     /// Returns a paginated list of all available models. Use the parameters to control
     /// pagination and filter results.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "list_models",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
     pub async fn list_models(&self, params: Option<ModelListParams>) -> Result<ModelListResponse> {
         let start = Instant::now();
         CLIENT_REQUESTS.click();
@@ -1188,6 +1290,12 @@ impl Anthropic {
     ///
     /// Returns detailed information about the specified model, including its
     /// ID, creation date, display name, and type.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "get_model",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
     pub async fn get_model(&self, model_id: &str) -> Result<ModelInfo> {
         let start = Instant::now();
         CLIENT_REQUESTS.click();
@@ -1328,11 +1436,12 @@ Connection: close\r\n\r\n{}",
         format!("http://{}", address)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retry_logic_with_backoff() {
         let client = Anthropic {
             api_key: "test".to_string(),
             client: ReqwestClient::new(),
+            stream_client: ReqwestClient::new(),
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 2,
@@ -1366,6 +1475,7 @@ Connection: close\r\n\r\n{}",
         let client = Anthropic {
             api_key: "test".to_string(),
             client: ReqwestClient::new(),
+            stream_client: ReqwestClient::new(),
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 2,
@@ -1392,11 +1502,12 @@ Connection: close\r\n\r\n{}",
         assert_eq!(attempt_counter.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retry_logic_max_retries_exceeded() {
         let client = Anthropic {
             api_key: "test".to_string(),
             client: ReqwestClient::new(),
+            stream_client: ReqwestClient::new(),
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 2,
@@ -1423,12 +1534,13 @@ Connection: close\r\n\r\n{}",
         assert_eq!(attempt_counter.load(Ordering::SeqCst), 3);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn error_529_is_retryable() {
         // Test that 529 errors are properly mapped to rate_limit and are retryable
         let client = Anthropic {
             api_key: "test".to_string(),
             client: ReqwestClient::new(),
+            stream_client: ReqwestClient::new(),
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 2,
@@ -1525,8 +1637,9 @@ Connection: close\r\n\r\n{}",
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert!(error.is_validation());
-        assert!(format!("{}", error).contains("Failed to read API key from file"));
+        assert!(matches!(error, Error::Io { .. }));
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(format!("{}", error).contains("Failed to read API key file"));
     }
 
     #[test]
@@ -1550,13 +1663,11 @@ Connection: close\r\n\r\n{}",
         // Test builder pattern methods
         let configured_client = client
             .with_base_url("https://custom.api.com".to_string())
-            .with_max_retries(5)
-;
+            .unwrap()
+            .with_max_retries(5);
 
         assert_eq!(configured_client.base_url, "https://custom.api.com");
         assert_eq!(configured_client.max_retries, 5);
-        assert_eq!(configured_client.throughput_ops_sec, 2.0);
-        assert_eq!(configured_client.reserve_capacity, 1.0);
     }
 
     #[test]
@@ -1581,7 +1692,8 @@ Connection: close\r\n\r\n{}",
     fn build_url_custom_base_without_trailing_slash() {
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
-            .with_base_url("https://api.minimax.io/anthropic".to_string());
+            .with_base_url("https://api.minimax.io/anthropic".to_string())
+            .unwrap();
         assert_eq!(
             client.build_url("messages"),
             "https://api.minimax.io/anthropic/v1/messages"
@@ -1592,7 +1704,8 @@ Connection: close\r\n\r\n{}",
     fn build_url_custom_base_with_trailing_slash() {
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
-            .with_base_url("https://api.minimax.io/anthropic/".to_string());
+            .with_base_url("https://api.minimax.io/anthropic/".to_string())
+            .unwrap();
         assert_eq!(
             client.build_url("messages"),
             "https://api.minimax.io/anthropic/v1/messages"
@@ -1633,7 +1746,9 @@ Connection: close\r\n\r\n{}",
         let client = Anthropic::new(Some("test_key".to_string())).unwrap();
         assert!(!client.default_headers().contains_key("authorization"));
 
-        let client = client.with_base_url("https://inference.baseten.co".to_string());
+        let client = client
+            .with_base_url("https://inference.baseten.co".to_string())
+            .unwrap();
         let headers = client.default_headers();
         assert!(headers.contains_key("x-api-key"));
         assert_eq!(
@@ -1646,10 +1761,13 @@ Connection: close\r\n\r\n{}",
     fn with_base_url_away_from_baseten_drops_authorization() {
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
-            .with_base_url("https://inference.baseten.co".to_string());
+            .with_base_url("https://inference.baseten.co".to_string())
+            .unwrap();
         assert!(client.default_headers().contains_key("authorization"));
 
-        let client = client.with_base_url("https://api.anthropic.com".to_string());
+        let client = client
+            .with_base_url("https://api.anthropic.com".to_string())
+            .unwrap();
         assert!(!client.default_headers().contains_key("authorization"));
     }
 
@@ -1657,7 +1775,8 @@ Connection: close\r\n\r\n{}",
     fn build_url_minimax_china() {
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
-            .with_base_url("https://api.minimaxi.com/anthropic".to_string());
+            .with_base_url("https://api.minimaxi.com/anthropic".to_string())
+            .unwrap();
         assert_eq!(
             client.build_url("messages"),
             "https://api.minimaxi.com/anthropic/v1/messages"
@@ -1709,11 +1828,10 @@ Connection: close\r\n\r\n{}",
         let client = Anthropic {
             api_key: "test".to_string(),
             client: ReqwestClient::new(),
+            stream_client: ReqwestClient::new(),
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 1,
-            throughput_ops_sec: 1.0,
-            reserve_capacity: 1.0,
             cached_headers: Arc::new(HeaderMap::new()),
             default_betas: Vec::new(),
         };
@@ -1754,6 +1872,7 @@ Connection: close\r\n\r\n{}",
         Anthropic {
             api_key: "test".to_string(),
             client: ReqwestClient::new(),
+            stream_client: ReqwestClient::new(),
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 0,
@@ -1879,6 +1998,7 @@ Connection: close\r\n\r\n{}",
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
+            .unwrap()
             .with_default_betas(["default-beta"]);
         let request_params = MessageCreateParams::new(
             16,
@@ -1931,7 +2051,8 @@ Connection: close\r\n\r\n{}",
 
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
-            .with_base_url(base_url);
+            .with_base_url(base_url)
+            .unwrap();
         let batch = client.get_message_batch("msgbatch_123").await.unwrap();
         assert_eq!(batch.id, "msgbatch_123");
         assert_eq!(batch.request_counts.succeeded, 1);
@@ -1962,7 +2083,8 @@ Connection: close\r\n\r\n{}",
 
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
-            .with_base_url(base_url);
+            .with_base_url(base_url)
+            .unwrap();
         let params = MessageBatchListParams::new()
             .with_after_id("msgbatch_a")
             .with_limit(20)
@@ -2007,7 +2129,8 @@ Connection: close\r\n\r\n{}",
 
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
-            .with_base_url(base_url);
+            .with_base_url(base_url)
+            .unwrap();
         let batch = client.cancel_message_batch("msgbatch_123").await.unwrap();
         assert_eq!(batch.id, "msgbatch_123");
     }
@@ -2034,7 +2157,8 @@ Connection: close\r\n\r\n{}",
 
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
-            .with_base_url(base_url);
+            .with_base_url(base_url)
+            .unwrap();
         let deleted = client.delete_message_batch("msgbatch_123").await.unwrap();
         assert_eq!(deleted.r#type, "message_batch_deleted");
     }
@@ -2080,7 +2204,8 @@ Connection: close\r\n\r\n",
 
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
-            .with_base_url(base_url);
+            .with_base_url(base_url)
+            .unwrap();
         let stream = client
             .stream_message_batch_results("msgbatch_123")
             .await
@@ -2130,6 +2255,7 @@ Connection: close\r\n\r\n",
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
+            .unwrap()
             .with_timeout(Duration::from_millis(75))
             .unwrap();
         let params = MessageCreateParams::new_streaming(
@@ -2167,6 +2293,7 @@ event: ping\n",
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
+            .unwrap()
             .with_timeout(Duration::from_millis(50))
             .unwrap();
         let params = MessageCreateParams::new_streaming(
@@ -2210,6 +2337,7 @@ Connection: close\r\n\r\n",
         let client = Anthropic::new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
+            .unwrap()
             .with_timeout(Duration::from_millis(50))
             .unwrap()
             .with_max_retries(0);
