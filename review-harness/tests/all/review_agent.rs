@@ -11,7 +11,8 @@ impl Agent for AdapterAgent {
         self.called.store(restart, Ordering::Relaxed);
         Ok("restarted".into())
     }
-    async fn view(&self, _: &str, _: Option<(u32,u32)>) -> std::result::Result<String, std::io::Error> {
+    async fn view(&self, _: &str, range: Option<(u32,u32)>) -> std::result::Result<String, std::io::Error> {
+        assert_eq!(range, Some((2, u32::MAX)));
         self.called.store(true, Ordering::Relaxed);
         Ok("file content".into())
     }
@@ -85,4 +86,27 @@ async fn pause_turn_stops_after_budget_exhaustion() {
     assert_eq!(outcome.request_count, 1);
     assert_eq!(messages.len(), 2);
     assert_eq!(*agent.max_seen.lock().unwrap(), vec![10]);
+}
+
+#[tokio::test]
+async fn over_budget_tool_calls_receive_error_results() {
+    let response = Message::new("m".into(), vec![ToolUseBlock::new("t", "bash", json!({"command":"echo test"})).into()], KnownModel::ClaudeSonnet40.into(), Usage::new(101,1)).with_stop_reason(StopReason::ToolUse);
+    let client = Anthropic::new(Some("test".into())).unwrap().with_base_url(serve(response).await);
+    let budget = Arc::new(Budget::new_flat_rate(100,1));
+    let mut agent = ();
+    let mut messages = vec![MessageParam::user("hello")];
+    let outcome = agent.take_turn(&client, &mut messages, &budget).await.unwrap();
+    assert_eq!(outcome.request_count, 1);
+    assert_eq!(messages.len(), 3);
+    let wire = serde_json::to_value(&messages).unwrap();
+    assert_eq!(wire[2]["content"][0]["tool_use_id"], "t");
+    assert_eq!(wire[2]["content"][0]["is_error"], true);
+}
+
+#[tokio::test]
+async fn invalid_negative_editor_range_is_rejected() {
+    let agent = AdapterAgent { called: AtomicBool::new(false) };
+    let result = agent.text_editor(ToolUseBlock::new("t", "str_replace_based_edit_tool", json!({"command":"view","path":"test","view_range":[2,-2]}))).await;
+    assert!(result.is_err());
+    assert!(!agent.called.load(Ordering::Relaxed));
 }

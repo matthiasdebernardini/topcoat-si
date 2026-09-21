@@ -209,7 +209,8 @@ impl<A: Agent> ToolCallback<A> for BashCallback {
     ) -> Box<dyn IntermediateToolResult> {
         #[derive(serde::Deserialize)]
         struct BashTool {
-            command: String,
+            #[serde(default)]
+            command: Option<String>,
             #[serde(default)]
             restart: bool,
         }
@@ -224,7 +225,11 @@ impl<A: Agent> ToolCallback<A> for BashCallback {
                 })));
             }
         };
-        match agent.bash(&bash.command, bash.restart).await {
+        if bash.command.is_none() && !bash.restart {
+            return Box::new(ControlFlow::Continue(Err(ToolResultBlock::new(tool_use.id.clone())
+                .with_string_content("command is required unless restart is true".into()).with_error(true))));
+        }
+        match agent.bash(bash.command.as_deref().unwrap_or(""), bash.restart).await {
             Ok(answer) => Box::new(ControlFlow::Continue(Ok(ToolResultBlock {
                 tool_use_id: tool_use.id.clone(),
                 content: Some(ToolResultBlockContent::String(answer.to_string())),
@@ -1609,8 +1614,8 @@ pub trait FileSystem: Send + Sync {
     ///
     /// * `path` - The path to the file to view
     /// * `view_range` - Optional tuple of `(start, limit)` using 1-based line numbers.
-    ///   Returns lines where `start <= line_number < limit`. For example, `(1, 4)` returns
-    ///   lines 1, 2, and 3. Both `start` and `limit` must be >= 1.
+    ///   Returns lines where `start <= line_number <= limit`. For example, `(1, 4)` returns
+    ///   lines 1 through 4. Both values must be >= 1; `u32::MAX` means end of file.
     ///
     /// # Errors
     ///
@@ -2208,10 +2213,17 @@ pub trait Agent: Send + Sync + Sized {
                 #[derive(serde::Deserialize)]
                 struct ViewTool {
                     path: String,
-                    view_range: Option<(u32, u32)>,
+                    view_range: Option<(u32, i64)>,
                 }
                 let args: ViewTool = serde_json::from_value(tool_use.input)?;
-                self.view(&args.path, args.view_range).await
+                let range = args.view_range.map(|(start, end)| {
+                    let end = if end == -1 { u32::MAX } else {
+                        u32::try_from(end).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "view_range end must be -1 or a positive line number"))?
+                    };
+                    Ok::<_, std::io::Error>((start, end))
+                }).transpose()?;
+                validate_view_range(range)?;
+                self.view(&args.path, range).await
             }
             "str_replace" => {
                 #[derive(serde::Deserialize)]
@@ -2951,7 +2963,6 @@ async fn step_default_turn_impl<A: Agent>(
     let stream = streaming.is_some();
     let mut usage_total = Usage::new(0, 0);
     let mut request_count: u64 = 0;
-    loop {
         let max_tokens = std::cmp::min(agent.max_tokens().await, tokens_rem.remaining_tokens());
         let req = agent
             .create_request(max_tokens, messages.clone(), stream)
@@ -2993,15 +3004,23 @@ async fn step_default_turn_impl<A: Agent>(
             return ControlFlow::Break(Err(err));
         }
 
+        push_or_merge_message(messages, assistant_message);
         if !response_within_budget {
+            let tool_errors: Vec<ContentBlock> = resp.content.iter().filter_map(|block| match block {
+                ContentBlock::ToolUse(tool) => Some(ToolResultBlock::new(tool.id.clone())
+                    .with_string_content("Tool was not executed: token budget exhausted".into())
+                    .with_error(true).into()),
+                _ => None,
+            }).collect();
+            if !tool_errors.is_empty() {
+                push_or_merge_message(messages, MessageParam::new(MessageParamContent::Array(tool_errors), MessageRole::User));
+            }
             return ControlFlow::Break(Ok(TurnOutcome {
                 stop_reason: StopReason::MaxTokens,
                 usage: usage_total,
                 request_count,
             }));
         }
-        push_or_merge_message(messages, assistant_message);
-
         let tool_results = match resp.stop_reason {
             None | Some(StopReason::EndTurn) => {
                 let stop_reason = match agent.handle_end_turn().await {
@@ -3055,7 +3074,7 @@ async fn step_default_turn_impl<A: Agent>(
                 }));
             }
             Some(StopReason::PauseTurn) => {
-                continue;
+                return ControlFlow::Continue(TurnStep { usage: usage_total, request_count });
             }
             Some(StopReason::ToolUse) => {
                 if let Some(streaming) = streaming.as_mut() {
@@ -3118,7 +3137,6 @@ async fn step_default_turn_impl<A: Agent>(
             usage: usage_total,
             request_count,
         });
-    }
 }
 
 async fn stream_message_with_renderer(
