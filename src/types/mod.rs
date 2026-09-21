@@ -152,7 +152,7 @@ pub use tool_use_block::ToolUseBlock;
 pub use url_image_source::UrlImageSource;
 pub use url_pdf_source::UrlPdfSource;
 pub use usage::Usage;
-pub use usage_iteration::{UsageIteration, UsageIterationType};
+pub use usage_iteration::{IterationUsage, UsageIteration};
 pub use web_search_result_block::WebSearchResultBlock;
 pub use web_search_tool_20250305::{UserLocation, WebSearchTool20250305};
 pub use web_search_tool_result_block::WebSearchToolResultBlock;

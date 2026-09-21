@@ -15,7 +15,7 @@ pub struct CitationPageLocation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document_title: Option<String>,
 
-    /// The end page number (inclusive) of the citation in the document
+    /// The end page number (exclusive) of the citation in the document
     pub end_page_number: i32,
 
     /// The start page number (inclusive) of the citation in the document
@@ -40,14 +40,14 @@ impl CitationPageLocation {
         }
     }
 
-    /// Returns the number of pages in the citation span (inclusive range)
+    /// Returns the number of pages in the citation span (exclusive end)
     pub fn page_count(&self) -> i32 {
-        self.end_page_number - self.start_page_number + 1
+        self.end_page_number - self.start_page_number
     }
 
     /// Returns true if the citation is only for a single page
     pub fn is_single_page(&self) -> bool {
-        self.start_page_number == self.end_page_number
+        self.page_count() == 1
     }
 }
 
@@ -109,7 +109,7 @@ mod tests {
             start_page_number: 3,
         };
 
-        assert_eq!(location.page_count(), 3);
+        assert_eq!(location.page_count(), 2);
     }
 
     #[test]
@@ -118,7 +118,7 @@ mod tests {
             cited_text: "example text".to_string(),
             document_index: 0,
             document_title: None,
-            end_page_number: 3,
+            end_page_number: 4,
             start_page_number: 3,
         };
 

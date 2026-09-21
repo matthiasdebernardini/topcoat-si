@@ -8,10 +8,8 @@ use crate::types::{
 
 /// Security limits for DoS prevention
 const MAX_MESSAGE_COUNT: usize = 1000;
-const MAX_MESSAGE_LENGTH: usize = 1_000_000; // 1MB per message
 const MAX_STOP_SEQUENCES: usize = 100;
 const MAX_STOP_SEQUENCE_LENGTH: usize = 1000;
-const MAX_SYSTEM_PROMPT_LENGTH: usize = 100_000;
 const MAX_TOOLS_COUNT: usize = 100;
 
 /// Parameters for creating messages.
@@ -451,9 +449,12 @@ impl MessageCreateParams {
     /// - Security checks on string inputs
     pub fn validate(&self) -> Result<(), crate::Error> {
         // Basic parameter validation
-        if self.max_tokens == 0 {
+        if self.max_tokens == 0 && (self.stream
+            || self.thinking.is_some_and(|thinking| thinking != ThinkingConfig::Disabled)
+            || self.output_config.as_ref().is_some_and(|config| config.format.is_some())
+            || matches!(self.tool_choice, Some(ToolChoice::Any { .. } | ToolChoice::Tool { .. }))) {
             return Err(crate::Error::validation(
-                "max_tokens must be greater than 0",
+                "max_tokens: 0 cannot request streaming, thinking, structured output, or forced tools",
                 Some("max_tokens".to_string()),
             ));
         }
@@ -486,22 +487,6 @@ impl MessageCreateParams {
                 ),
                 Some("messages".to_string()),
             ));
-        }
-
-        // Validate message content sizes
-        for (i, message) in self.messages.iter().enumerate() {
-            let content_str = format!("{:?}", message.content); // Rough size estimate
-            if content_str.len() > MAX_MESSAGE_LENGTH {
-                return Err(crate::Error::validation(
-                    format!(
-                        "Message {} content size {} exceeds limit of {}",
-                        i,
-                        content_str.len(),
-                        MAX_MESSAGE_LENGTH
-                    ),
-                    Some(format!("messages[{i}]")),
-                ));
-            }
         }
 
         // Validate floating point parameters
@@ -555,21 +540,6 @@ impl MessageCreateParams {
                         Some(format!("stop_sequences[{i}]")),
                     ));
                 }
-            }
-        }
-
-        // Validate system prompt size
-        if let Some(ref system) = self.system {
-            let system_str = format!("{system:?}"); // Rough size estimate
-            if system_str.len() > MAX_SYSTEM_PROMPT_LENGTH {
-                return Err(crate::Error::validation(
-                    format!(
-                        "System prompt size {} exceeds limit of {}",
-                        system_str.len(),
-                        MAX_SYSTEM_PROMPT_LENGTH
-                    ),
-                    Some("system".to_string()),
-                ));
             }
         }
 

@@ -29,6 +29,10 @@ pub enum ContentBlockDelta {
     /// A signature delta.
     #[serde(rename = "signature_delta")]
     SignatureDelta(SignatureDelta),
+    /// A value introduced by a newer API version.
+    #[serde(other)]
+    Unknown,
+
 }
 
 impl<'de> Deserialize<'de> for ContentBlockDelta {
@@ -54,25 +58,12 @@ impl<'de> Deserialize<'de> for ContentBlockDelta {
             other if is_thinking_like_delta(other) => {
                 let thinking_delta: ThinkingDelta = from_value(value)?;
                 if thinking_delta.thinking.is_empty() {
-                    Err(serde::de::Error::custom(format!(
-                        "unknown thinking delta type {other:?} did not contain text"
-                    )))
+                    Ok(ContentBlockDelta::Unknown)
                 } else {
                     Ok(ContentBlockDelta::ThinkingDelta(thinking_delta))
                 }
             }
-            other => Err(serde::de::Error::unknown_variant(
-                other,
-                &[
-                    "text_delta",
-                    "input_json_delta",
-                    "citations_delta",
-                    "thinking_delta",
-                    "summary_delta",
-                    "thinking_summary_delta",
-                    "signature_delta",
-                ],
-            )),
+            _ => Ok(ContentBlockDelta::Unknown),
         }
     }
 }

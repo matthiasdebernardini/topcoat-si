@@ -4,8 +4,6 @@ use crate::types::Content;
 
 /// Parameter for a content block source.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
-#[serde(rename = "content")]
 pub struct ContentBlockSourceParam {
     /// The content of the source, which can be either a string or an array of content items.
     pub content: ContentBlockSourceContent,
@@ -70,8 +68,7 @@ mod tests {
         assert_eq!(
             json,
             json!({
-                "content": "Sample content",
-                "type": "content"
+                "content": "Sample content"
             })
         );
     }
@@ -102,8 +99,7 @@ mod tests {
                         },
                         "type": "image"
                     }
-                ],
-                "type": "content"
+                ]
             })
         );
     }
@@ -123,8 +119,7 @@ mod tests {
                         "text": "Sample text content",
                         "type": "text"
                     }
-                ],
-                "type": "content"
+                ]
             })
         );
     }

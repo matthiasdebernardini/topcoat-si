@@ -26,11 +26,16 @@ pub enum StopReason {
 
     /// The response stopped because it exceeded the model's context window
     ModelContextWindowExceeded,
+    /// A value introduced by a newer API version.
+    #[serde(other)]
+    Unknown,
+
 }
 
 impl fmt::Display for StopReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            StopReason::Unknown => write!(f, "unknown"),
             StopReason::EndTurn => write!(f, "end_turn"),
             StopReason::MaxTokens => write!(f, "max_tokens"),
             StopReason::StopSequence => write!(f, "stop_sequence"),

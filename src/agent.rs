@@ -3066,9 +3066,9 @@ async fn step_default_turn_impl<A: Agent>(
                     request_count,
                 }));
             }
-            Some(StopReason::ModelContextWindowExceeded) => {
+            Some(reason @ (StopReason::ModelContextWindowExceeded | StopReason::Unknown)) => {
                 return ControlFlow::Break(Ok(TurnOutcome {
-                    stop_reason: StopReason::ModelContextWindowExceeded,
+                    stop_reason: reason,
                     usage: usage_total,
                     request_count,
                 }));
@@ -3231,7 +3231,7 @@ async fn stream_message_with_renderer(
                         }
                     }
                     ContentBlockDelta::SignatureDelta(_) => {}
-                    ContentBlockDelta::CitationsDelta(_) => {}
+                    ContentBlockDelta::CitationsDelta(_) | ContentBlockDelta::Unknown => {}
                 },
                 MessageStreamEvent::ContentBlockStop(stop_event) => {
                     if active_tool_uses.remove(&stop_event.index) {
