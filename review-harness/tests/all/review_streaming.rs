@@ -33,7 +33,10 @@ async fn server_tool_json_deltas_must_be_accumulated() {
 #[tokio::test]
 async fn eof_without_message_stop_must_not_succeed() {
     let (mut events, message) = AccumulatingStream::new(stream::iter(vec![Ok(start()), Ok(text_start())]));
-    while let Some(event) = events.next().await { event.unwrap(); }
+    let mut errors = 0;
+    while let Some(event) = events.next().await { errors += usize::from(event.is_err()); }
+    assert_eq!(errors, 1);
+    assert!(events.next().await.is_none());
     let result = message.await.unwrap();
     assert!(result.is_err(), "truncated response was accepted: {result:?}");
 }
@@ -106,5 +109,34 @@ async fn malformed_event_terminates_before_later_event() {
     futures::pin_mut!(events);
     assert!(events.next().await.unwrap().is_err());
     assert!(events.next().await.is_none());
+    assert!(events.next().await.is_none());
+}
+
+#[tokio::test]
+async fn fallback_message_does_not_make_empty_stream_successful() {
+    let fallback = Message::new("fallback".into(), vec![], Model::Custom("test".into()), Usage::new(0, 0));
+    let (mut events, message) = AccumulatingStream::new_with_message(stream::empty(), fallback);
+    assert!(events.next().await.unwrap().is_err());
+    assert!(message.await.unwrap().is_err());
+    assert!(events.next().await.is_none());
+    assert!(events.next().await.is_none());
+}
+
+#[tokio::test]
+async fn sparse_block_index_is_rejected_without_allocating() {
+    let bad = MessageStreamEvent::ContentBlockStart(ContentBlockStartEvent::new(TextBlock::new("bad").into(), usize::MAX));
+    let (mut events, message) = AccumulatingStream::new(stream::iter(vec![Ok(start()), Ok(bad)]));
+    assert!(events.next().await.unwrap().is_ok());
+    assert!(events.next().await.unwrap().is_err());
+    assert!(message.await.unwrap().is_err());
+    assert!(events.next().await.is_none());
+}
+
+#[tokio::test]
+async fn stop_reason_is_sufficient_without_message_stop() {
+    let terminal = MessageStreamEvent::MessageDelta(MessageDeltaEvent::new(MessageDelta::new().with_stop_reason(StopReason::EndTurn), MessageDeltaUsage::new(1)));
+    let (mut events, message) = AccumulatingStream::new(stream::iter(vec![Ok(start()), Ok(terminal)]));
+    while let Some(event) = events.next().await { event.unwrap(); }
+    assert!(message.await.unwrap().is_ok());
     assert!(events.next().await.is_none());
 }

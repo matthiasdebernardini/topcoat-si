@@ -21,6 +21,8 @@ pub struct AccumulatingStream {
     message_tx: Option<tokio::sync::oneshot::Sender<Result<Message, Error>>>,
     message: Option<Message>,
     content_blocks: Vec<ContentBlockBuilder>,
+    done: bool,
+    completed: bool,
 }
 
 impl AccumulatingStream {
@@ -49,18 +51,23 @@ impl AccumulatingStream {
             message_tx: Some(tx),
             message: message.into(),
             content_blocks: Vec::new(),
+            done: false,
+            completed: false,
         };
         (this, rx)
     }
 
-    fn accumulate_event(&mut self, event: &MessageStreamEvent) {
+    fn accumulate_event(&mut self, event: &MessageStreamEvent) -> Result<(), Error> {
         match event {
             MessageStreamEvent::MessageStart(start) => {
                 self.message = Some(start.message.clone());
             }
             MessageStreamEvent::ContentBlockStart(start) => {
                 let idx = start.index;
-                while self.content_blocks.len() <= idx {
+                if idx > self.content_blocks.len() {
+                    return Err(Error::streaming("non-contiguous content block index", None));
+                }
+                if idx == self.content_blocks.len() {
                     self.content_blocks.push(ContentBlockBuilder::Empty);
                 }
                 self.content_blocks[idx] =
@@ -105,9 +112,16 @@ impl AccumulatingStream {
                     }
                 }
             }
-            MessageStreamEvent::MessageStop(_) => {}
+            MessageStreamEvent::MessageStop(_) => { self.completed = true; }
             MessageStreamEvent::Ping | MessageStreamEvent::Unknown => {}
         }
+        Ok(())
+    }
+
+    fn fail(&mut self, error: Error) -> std::task::Poll<Option<Result<MessageStreamEvent, Error>>> {
+        self.done = true;
+        if let Some(tx) = self.message_tx.take() { let _ = tx.send(Err(error.clone())); }
+        std::task::Poll::Ready(Some(Err(error)))
     }
 
     fn finalize(&mut self) -> Result<Message, Error> {
@@ -139,21 +153,28 @@ impl Stream for AccumulatingStream {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
+        if self.done { return std::task::Poll::Ready(None); }
         match self.inner.as_mut().poll_next(cx) {
             std::task::Poll::Ready(Some(Ok(event))) => {
-                self.accumulate_event(&event);
+                if let Err(error) = self.accumulate_event(&event) { return self.fail(error); }
                 std::task::Poll::Ready(Some(Ok(event)))
             }
-            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Ready(Some(Err(error))) => self.fail(error),
             std::task::Poll::Ready(None) => {
-                if let Some(tx) = self.message_tx.take() {
-                    let _ = tx.send(self.finalize());
+                if !self.completed && !self.message.as_ref().is_some_and(|msg| msg.stop_reason.is_some()) {
+                    let reason = if self.message.is_none() { "stream ended without a message start event" }
+                        else { "stream ended before message completion" };
+                    return self.fail(Error::streaming(reason, None));
                 }
-                std::task::Poll::Ready(None)
+                let result = self.finalize();
+                self.done = true;
+                if let Some(tx) = self.message_tx.take() { let _ = tx.send(result.clone()); }
+                std::task::Poll::Ready(result.err().map(Err))
             }
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
+
 }
 
 enum ContentBlockBuilder {
@@ -174,7 +195,9 @@ enum ContentBlockBuilder {
     ServerToolUse {
         id: String,
         name: String,
-        input: Value,
+        input_json: String,
+        input_value: Option<Value>,
+        saw_delta: bool,
         cache_control: Option<CacheControlEphemeral>,
     },
     Thinking {
@@ -203,7 +226,9 @@ impl ContentBlockBuilder {
             ContentBlock::ServerToolUse(server_tool_use) => ContentBlockBuilder::ServerToolUse {
                 id: server_tool_use.id,
                 name: server_tool_use.name,
-                input: server_tool_use.input,
+                input_json: String::new(),
+                input_value: Some(server_tool_use.input),
+                saw_delta: false,
                 cache_control: server_tool_use.cache_control,
             },
             ContentBlock::Thinking(thinking) => ContentBlockBuilder::Thinking {
@@ -234,11 +259,8 @@ impl ContentBlockBuilder {
                 citations.get_or_insert_with(Vec::new).push(citation);
             }
             (
-                ContentBlockBuilder::ToolUse {
-                    input_json,
-                    saw_delta,
-                    ..
-                },
+                ContentBlockBuilder::ToolUse { input_json, saw_delta, .. }
+                | ContentBlockBuilder::ServerToolUse { input_json, saw_delta, .. },
                 ContentBlockDelta::InputJsonDelta(json_delta),
             ) => {
                 *saw_delta = true;
@@ -316,17 +338,15 @@ impl ContentBlockBuilder {
                     cache_control,
                 })))
             }
-            ContentBlockBuilder::ServerToolUse {
-                id,
-                name,
-                input,
-                cache_control,
-            } => Ok(Some(ContentBlock::ServerToolUse(ServerToolUseBlock {
-                id,
-                name,
-                input,
-                cache_control,
-            }))),
+            ContentBlockBuilder::ServerToolUse { id, name, input_json, input_value, saw_delta, cache_control } => {
+                let tool = ContentBlockBuilder::ToolUse { id, name, input_json, input_value, saw_delta, cache_control }.build(stop_reason)?;
+                Ok(tool.map(|tool| match tool {
+                    ContentBlock::ToolUse(tool) => ContentBlock::ServerToolUse(ServerToolUseBlock {
+                        id: tool.id, name: tool.name, input: tool.input, cache_control: tool.cache_control,
+                    }),
+                    _ => unreachable!(),
+                }))
+            }
             ContentBlockBuilder::Thinking {
                 thinking,
                 signature,
