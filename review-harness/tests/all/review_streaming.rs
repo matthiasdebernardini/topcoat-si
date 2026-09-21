@@ -78,6 +78,33 @@ async fn slow_consumer_must_still_receive_buffered_events() {
     let events = process_sse(bytes);
     futures::pin_mut!(events);
     assert!(events.next().await.unwrap().is_ok());
-    tokio::time::sleep(std::time::Duration::from_secs(31)).await;
     assert!(events.next().await.unwrap().is_ok(), "consumer processing time falsely treated as network inactivity");
+}
+
+#[tokio::test]
+async fn split_crlf_and_cr_frames_decode() {
+    for chunks in [vec!["event: ping\r\ndata: {}\r", "\n\r\n"], vec!["event: ping\rdata: {}\r\r"]] {
+        let events: Vec<_> = process_message_stream_sse(stream::iter(chunks.into_iter().map(|s| Ok(Bytes::from(s))))).collect().await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Ok(MessageStreamEvent::Ping)));
+    }
+}
+
+#[tokio::test]
+async fn large_event_and_unknown_event_are_supported() {
+    let data = "x".repeat(100_000);
+    let body = format!("event: future_event\ndata: {{}}\n\nevent: content_block_start\ndata: {}\n\n", json!({"index":0,"content_block":{"type":"text","text":data}}));
+    let events: Vec<_> = process_message_stream_sse(stream::iter(vec![Ok(Bytes::from(body))])).collect().await;
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], Ok(MessageStreamEvent::ContentBlockStart(_))));
+}
+
+#[tokio::test]
+async fn malformed_event_terminates_before_later_event() {
+    let bytes = stream::iter(vec![Ok(Bytes::from_static(b"event: message_start\ndata: invalid\n\nevent: ping\ndata: {}\n\n"))]);
+    let events = process_message_stream_sse(bytes);
+    futures::pin_mut!(events);
+    assert!(events.next().await.unwrap().is_err());
+    assert!(events.next().await.is_none());
+    assert!(events.next().await.is_none());
 }

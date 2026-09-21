@@ -106,7 +106,7 @@ impl AccumulatingStream {
                 }
             }
             MessageStreamEvent::MessageStop(_) => {}
-            MessageStreamEvent::Ping => {}
+            MessageStreamEvent::Ping | MessageStreamEvent::Unknown => {}
         }
     }
 

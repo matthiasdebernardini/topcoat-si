@@ -3152,7 +3152,7 @@ async fn stream_message_with_renderer(
         }
         match event {
             Ok(event) => match &event {
-                MessageStreamEvent::Ping => {}
+                MessageStreamEvent::Ping | MessageStreamEvent::Unknown => {}
                 MessageStreamEvent::MessageStart(_) => {}
                 MessageStreamEvent::MessageDelta(_) => {}
                 MessageStreamEvent::ContentBlockStart(start_event) => {

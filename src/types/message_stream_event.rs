@@ -57,6 +57,10 @@ pub enum MessageStreamEvent {
     /// This is always the final event in a successful stream.
     #[serde(rename = "message_stop")]
     MessageStop(MessageStopEvent),
+    /// An event introduced by a newer API version.
+    #[serde(other)]
+    Unknown,
+
 }
 
 #[cfg(test)]

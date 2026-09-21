@@ -6,7 +6,7 @@
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt};
 use std::error::Error as StdError;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::observability::{
     STREAM_BYTES, STREAM_DURATION, STREAM_ERRORS, STREAM_EVENTS, STREAM_TTFB,
@@ -19,11 +19,8 @@ use crate::{
 /// Maximum buffer size to prevent DoS attacks (1MB)
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 
-/// Maximum event size (64KB)
-const MAX_EVENT_SIZE: usize = 64 * 1024;
-
-/// Timeout for receiving data between chunks (30 seconds)
-const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum event size (1MB).
+const MAX_EVENT_SIZE: usize = MAX_BUFFER_SIZE;
 
 /// A raw server-sent event frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +35,7 @@ pub struct SseEvent {
 struct SseState {
     buffer: String,
     pending_utf8: Vec<u8>,
-    last_activity: Instant,
+    finished: bool,
     total_bytes_processed: usize,
     start: Instant,
     first_byte: Option<Instant>,
@@ -70,7 +67,7 @@ where
     let state = SseState {
         buffer: String::new(),
         pending_utf8: Vec::new(),
-        last_activity: Instant::now(),
+        finished: false,
         total_bytes_processed: 0,
         start: Instant::now(),
         first_byte: None,
@@ -78,24 +75,14 @@ where
 
     stream::unfold((stream, state), move |(mut stream, mut state)| async move {
         loop {
-            // Check for timeout
-            if state.last_activity.elapsed() > CHUNK_TIMEOUT {
-                return Some((
-                    Err(Error::timeout(
-                        "SSE stream timeout: no data received within timeout period".to_string(),
-                        Some(CHUNK_TIMEOUT.as_secs_f64()),
-                    )),
-                    (stream, state),
-                ));
-            }
-
+            if state.finished { return None; }
             // Check if we have a complete event in the buffer
             match extract_event(&state.buffer) {
                 Ok(Some((event, remaining))) => {
                     state.buffer = remaining;
                     match &event {
                         Ok(_) => STREAM_EVENTS.click(),
-                        Err(_) => STREAM_ERRORS.click(),
+                        Err(_) => state.fail(),
                     }
                     return Some((event, (stream, state)));
                 }
@@ -103,13 +90,14 @@ where
                     // No complete event yet, continue reading
                 }
                 Err(e) => {
-                    STREAM_ERRORS.click();
+                    state.fail();
                     return Some((Err(e), (stream, state)));
                 }
             }
 
             // Check buffer size limit
             if state.buffer.len() > MAX_BUFFER_SIZE {
+                state.fail();
                 return Some((
                     Err(Error::streaming(
                         format!("SSE buffer size exceeded maximum limit: {MAX_BUFFER_SIZE} bytes"),
@@ -122,7 +110,6 @@ where
             // Read more data
             match stream.next().await {
                 Some(Ok(bytes)) => {
-                    state.last_activity = Instant::now();
                     state.total_bytes_processed += bytes.len();
                     STREAM_BYTES.count(bytes.len() as u64);
                     if state.first_byte.is_none() {
@@ -155,6 +142,7 @@ where
                                 continue;
                             }
 
+                            state.fail();
                             return Some((
                                 Err(Error::encoding(
                                     format!("Invalid UTF-8 in stream: {utf8_error}"),
@@ -166,22 +154,12 @@ where
                     }
                 }
                 Some(Err(e)) => {
-                    STREAM_ERRORS.click();
+                    state.fail();
                     return Some((Err(e), (stream, state)));
                 }
                 None => {
-                    // End of stream - try to process any remaining buffered events
-                    if !state.buffer.is_empty()
-                        && let Ok(Some((event, _))) = extract_event(&state.buffer)
-                    {
-                        match &event {
-                            Ok(_) => STREAM_EVENTS.click(),
-                            Err(_) => STREAM_ERRORS.click(),
-                        }
-                        return Some((event, (stream, state)));
-                    }
                     if !state.pending_utf8.is_empty() {
-                        STREAM_ERRORS.click();
+                        state.fail();
                         return Some((
                             Err(Error::encoding(
                                 "Incomplete UTF-8 sequence at end of SSE stream".to_string(),
@@ -190,12 +168,20 @@ where
                             (stream, state),
                         ));
                     }
+                    state.finished = true;
                     STREAM_DURATION.add(state.start.elapsed().as_secs_f64());
                     return None;
                 }
             }
         }
-    })
+    }).fuse()
+}
+
+impl SseState {
+    fn fail(&mut self) {
+        self.finished = true;
+        STREAM_ERRORS.click();
+    }
 }
 
 fn map_http_stream_error(err: reqwest::Error) -> Error {
@@ -252,22 +238,8 @@ pub fn parse_message_stream_event(event: &SseEvent) -> Result<MessageStreamEvent
             .map(MessageStreamEvent::ContentBlockStop)
             .map_err(Into::into),
         "error" => Err(parse_stream_error(&event.data)),
-        _ => Err(Error::serialization(
-            format!("Unknown SSE event type: {}", event.event),
-            None,
-        )),
+        _ => Ok(MessageStreamEvent::Unknown),
     }
-}
-
-fn debug_stream_event(event: &SseEvent) {
-    if std::env::var_os("CLAUDIUS_DEBUG_STREAM").is_none() {
-        return;
-    }
-
-    eprintln!(
-        "[claudius-debug] sse event={} data={}",
-        event.event, event.data
-    );
 }
 
 /// Process a stream of bytes into decoded Claudius [`MessageStreamEvent`] values.
@@ -277,22 +249,33 @@ pub fn process_message_stream_sse<S>(
 where
     S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin + 'static,
 {
-    process_sse(byte_stream).map(|result| {
-        result.and_then(|event| {
-            debug_stream_event(&event);
-            parse_message_stream_event(&event)
-        })
-    })
+    process_sse(byte_stream).scan(false, |finished, result| {
+        let output = if *finished { None } else {
+            let decoded = result.and_then(|event| {
+                let result = parse_message_stream_event(&event);
+                if result.is_err() { STREAM_ERRORS.click(); }
+                result
+            });
+            if decoded.is_err() { *finished = true; }
+            Some(decoded)
+        };
+        futures::future::ready(output)
+    }).filter_map(|result| futures::future::ready(match result {
+        Ok(MessageStreamEvent::Unknown) => None,
+        other => Some(other),
+    })).fuse()
 }
 
 /// Extract a complete SSE event from a buffer string with size validation.
 fn extract_event(buffer: &str) -> Result<Option<(Result<SseEvent>, String)>> {
-    let Some(event_end) = buffer.find("\n\n") else {
+    let Some((event_end, delimiter_len)) = ["\n\n", "\r\n\r\n", "\r\r"].iter()
+        .filter_map(|delimiter| buffer.find(delimiter).map(|index| (index, delimiter.len())))
+        .min_by_key(|(index, _)| *index) else {
         return Ok(None);
     };
 
     let event_text = &buffer[..event_end];
-    let rest = buffer[event_end + 2..].to_string();
+    let rest = buffer[event_end + delimiter_len..].to_string();
 
     if event_text.len() > MAX_EVENT_SIZE {
         return Ok(Some((
@@ -321,7 +304,7 @@ fn extract_event(buffer: &str) -> Result<Option<(Result<SseEvent>, String)>> {
     let mut event_type = None;
     let mut data_lines = Vec::new();
 
-    for raw_line in event_text.lines() {
+    for raw_line in event_text.split(['\r', '\n']) {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if let Some(value) = parse_field_value(line, "event:") {
             event_type = Some(value.trim().to_string());
