@@ -1,37 +1,25 @@
-# Claudius review evidence
+# Claudius repair evidence
 
-Use [the Claude review prompt](../../CLAUDE-CLAUDIUS-REVIEW.md) for the independent audit. [REVIEW.md](REVIEW.md) contains the original 22 findings and source references. The pinned production source is in [vendor/claudius](../../vendor/claudius/); the relative Cargo dependency in this directory points there. Tests are kept outside the upstream crate.
+The repaired vendored crate passes **63 harness tests and 685 library tests**. Clippy passes with warnings denied, including the executable targets. [FIXES.md](FIXES.md) maps all 22 original findings and nine additional findings to commits and tests. [AST-GREP-REVIEW.md](AST-GREP-REVIEW.md) records the source scan and dispositions of its remaining advisory matches.
 
-The initial review found 685 existing library tests passing with a dummy API key. The review harness has 31 checks: 27 reproductions plus four telemetry checks. Verified after vendoring with nextest: **21 fail and 10 pass**, matching the expected results before fixes. Six passing reproductions deliberately assert faulty behavior; four passing telemetry checks demonstrate manual interoperability and its limits. An all-green run is not the expected baseline.
+[REVIEW.md](REVIEW.md) and the original logs describe the historical baseline: 10 passes and 21 failures. Correcting six tests that asserted bugs changed that baseline to 4 passes and 27 failures. The current harness asserts repaired behavior. Seven integration suites now share one test binary; nextest still isolates tests in separate processes for process-global metric and environment checks.
 
-Run from the snapshot root with cargo-nextest installed. Clear inherited API endpoint/key settings and put build output outside the snapshot. The fake environment key is needed only by some original library tests; all review network tests use local endpoints and explicit dummy keys.
-
-```sh
-export CARGO_TARGET_DIR="${TMPDIR:-/tmp}/claudius-review-target"
-```
-
-Original library baseline:
+Run from the project root. All network tests use synthetic credentials and localhost. `mbx` requires Cargo, cargo-nextest, and the appropriate Rust toolchain.
 
 ```sh
-env -u CLAUDIUS_API_KEY -u CLAUDIUS_BASE_URL -u ANTHROPIC_BASE_URL -u CLAUDIUS_DEBUG_STREAM ANTHROPIC_API_KEY=review-dummy-key cargo nextest run --manifest-path vendor/claudius/Cargo.toml -p claudius --lib --locked --no-default-features --features rustls-tls
+export CARGO_TARGET_DIR=/tmp/claudius-review-target
+
+env -u CLAUDIUS_API_KEY -u ANTHROPIC_API_KEY -u CLAUDIUS_BASE_URL -u ANTHROPIC_BASE_URL -u CLAUDIUS_DEBUG_STREAM mbx nextest run --manifest-path reviews/claudius/Cargo.toml -p claudius-review-harness --locked --no-fail-fast
+
+env -u CLAUDIUS_API_KEY -u CLAUDIUS_BASE_URL -u ANTHROPIC_BASE_URL -u CLAUDIUS_DEBUG_STREAM ANTHROPIC_API_KEY=review-dummy-key mbx nextest run --manifest-path vendor/claudius/Cargo.toml -p claudius --lib --locked --no-default-features --features rustls-tls --no-fail-fast
+
+mbx clippy --manifest-path vendor/claudius/Cargo.toml --all-targets --no-default-features --features rustls-tls,binaries --locked -- -D warnings
 ```
 
-Complete independent harness (expected nonzero exit because it reproduces defects):
+Filter an integration suite by adding, for example, `-E 'test(review_streaming::)'` to the harness command. Add `--lib` for telemetry checks. No test deliberately sleeps longer than one second; the old 31-second consumer test now exercises already-buffered events without sleeping. Retry policy tests use virtual time where possible and inspect request counts.
 
-```sh
-env -u CLAUDIUS_API_KEY -u ANTHROPIC_API_KEY -u CLAUDIUS_BASE_URL -u ANTHROPIC_BASE_URL -u CLAUDIUS_DEBUG_STREAM cargo nextest run --manifest-path reviews/claudius/Cargo.toml -p claudius-review-harness --locked --no-fail-fast
-```
+The crate depends on `tracing`, with exporter configuration left to its host. The harness checks automatic request spans, error source chains, retry breadcrumbs, concurrent parents, streamed failure/cancellation, and contextual tool errors with an in-memory OpenTelemetry exporter and Sentry test transport. A separate test serializes an exception through an OTLP/HTTP exporter to a local receiver.
 
-Telemetry interoperability checks only:
+OpenTelemetry API/SDK/OTLP 0.32 are paired with `tracing-opentelemetry` 0.33; Sentry and `sentry-tracing` use 0.49.3. These dependencies belong to this unpublished harness, not the vendored SDK. See [FIXES.md](FIXES.md) for host configuration and validation limits.
 
-```sh
-env -u CLAUDIUS_API_KEY -u ANTHROPIC_API_KEY -u CLAUDIUS_BASE_URL -u ANTHROPIC_BASE_URL -u CLAUDIUS_DEBUG_STREAM cargo nextest run --manifest-path reviews/claudius/Cargo.toml -p claudius-review-harness --locked --lib
-```
-
-Choose one reproduction suite by adding `--test review_streaming`, `--test review_client`, `--test review_types`, `--test review_error_debug`, `--test review_metrics`, `--test review_agent`, or `--test review_logging` to the complete-harness command. The slow-consumer reproduction takes 31 seconds. The harness is intentionally unpublished and has its own Cargo.lock; it does not add telemetry dependencies to Claudius.
-
-The four tests in src/lib.rs use Sentry's in-memory test transport and an OTLP/HTTP receiver on localhost. No hosted account or live model request is needed. They verify standard error-chain capture and explicitly instrumented export, not automatic instrumentation or production collector integration.
-
-Original logs are retained in [logs](logs/). `vendored-nextest.log` records verification after moving the source and harness here. Original paths and cargo-test commands in historical logs refer to the original review session; use nextest for new test runs.
-
-For an independent follow-up, write `CLAUDE-REVIEW.md` in this directory and leave REVIEW.md as the original report. New reproduction tests belong here, not inside vendor/claudius.
+Final-run summaries are in [logs/fixed-validation.txt](logs/fixed-validation.txt). Historical logs remain unchanged. No live Anthropic call, hosted Sentry project, production Echt collector, or native-TLS run was used.

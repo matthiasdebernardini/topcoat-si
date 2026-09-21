@@ -1,0 +1,21 @@
+Implementation: d12a7e4
+Date: 2026-09-21
+Commands: see ../README.md and ../AST-GREP-REVIEW.md
+
+harness: exit 0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.83s
+     Summary [   5.146s] 63 tests run: 63 passed, 0 skipped
+
+library: exit 0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.65s
+     Summary [   1.448s] 685 tests run: 685 passed, 0 skipped
+
+clippy: exit 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.72s
+
+ast-grep: exit 0; 0 blocking findings; 153 advisory matches, all dispositioned
+sg: summary|project: isProject=true,projectDir=/Users/md/.agents/skills/rust-new/templates
+sg: summary|file: scannedFileCount=97,skippedFileCount=0
+sg: summary|rule: effectiveRuleCount=38,skippedRuleCount=2
+
+mbx shared-cache cleanup warnings were emitted due to sandbox permissions; compilation, tests and Clippy succeeded.
