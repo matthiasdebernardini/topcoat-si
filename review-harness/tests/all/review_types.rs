@@ -24,7 +24,7 @@ fn cache_prewarm_allows_zero_output_tokens() {
 #[test]
 fn accepts_base64_image_below_anthropic_limit() {
     // Valid 640x640 RGB PNG: 1,229,883 raw bytes / 1,639,844 base64 bytes.
-    let data = base64::engine::general_purpose::STANDARD.encode(include_bytes!("fixtures/review_valid_640px.png"));
+    let data = base64::engine::general_purpose::STANDARD.encode(include_bytes!("../fixtures/review_valid_640px.png"));
     let source = Base64ImageSource::new(data, ImageMediaType::Png);
     let message = MessageParam::new_with_blocks(vec![ContentBlock::Image(ImageBlock::new_with_base64(source))], MessageRole::User);
     let params = MessageCreateParams::new(100, vec![message], KnownModel::ClaudeOpus5.into());

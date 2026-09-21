@@ -28,17 +28,18 @@ async fn serve(body: String) -> Anthropic {
 }
 
 #[tokio::test]
-async fn logging_stream_swallows_missing_message_error() {
+async fn logging_stream_reports_missing_message_error() {
     let client = serve(String::new()).await;
     let params = ().create_request(100,vec![MessageParam::user("hello")],true).await;
     let logger = Logger::default();
     let events: Vec<_> = client.stream_with_logger(&params,&logger).await.unwrap().collect().await;
-    assert!(events.is_empty(),"Empty server response becomes clean EOF, with no Err item");
+    assert_eq!(events.len(), 1);
+    assert!(events[0].as_ref().unwrap_err().to_string().contains("message"));
     assert!(logger.completed.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn failed_stream_is_logged_as_successfully_completed() {
+async fn failed_stream_is_not_logged_as_completed() {
     let message = Message::new("msg_partial".into(), vec![], KnownModel::ClaudeSonnet40.into(),Usage::new(100,0));
     let body = format!("event: message_start\ndata: {}\n\nevent: error\ndata: {}\n\n",json!({"type":"message_start","message":message}),json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}));
     let client = serve(body).await;
@@ -46,6 +47,5 @@ async fn failed_stream_is_logged_as_successfully_completed() {
     let logger = Logger::default();
     let events: Vec<_> = client.stream_with_logger(&params,&logger).await.unwrap().collect().await;
     assert_eq!(events.iter().filter(|event| event.is_err()).count(),1);
-    assert_eq!(logger.completed.lock().unwrap().len(),1,"Failure incorrectly triggers success completion callback");
-    assert_eq!(logger.completed.lock().unwrap()[0].stop_reason,None);
+    assert!(logger.completed.lock().unwrap().is_empty());
 }

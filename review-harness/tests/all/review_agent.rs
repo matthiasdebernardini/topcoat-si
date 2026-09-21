@@ -18,21 +18,21 @@ impl Agent for AdapterAgent {
 }
 
 #[tokio::test]
-async fn documented_restart_is_rejected_before_callback() {
+async fn documented_restart_invokes_callback() {
     let mut agent = AdapterAgent { called: AtomicBool::new(false) };
     let client = Anthropic::new(Some("test".into())).unwrap();
     let response = Message::new("m".into(), vec![ToolUseBlock::new("t", "bash", json!({"restart":true})).into()], KnownModel::ClaudeSonnet40.into(), Usage::new(1,1));
     let ControlFlow::Continue(results) = agent.handle_default_tool_use(&client, &response).await else { panic!() };
-    assert!(!agent.called.load(Ordering::Relaxed));
-    assert!(serde_json::to_string(&results).unwrap().contains("missing field `command`"));
+    assert!(agent.called.load(Ordering::Relaxed));
+    assert!(!serde_json::to_string(&results).unwrap().contains("\"is_error\":true"));
 }
 
 #[tokio::test]
-async fn documented_end_of_file_range_is_rejected_before_callback() {
+async fn documented_end_of_file_range_invokes_callback() {
     let agent = AdapterAgent { called: AtomicBool::new(false) };
     let result = agent.text_editor(ToolUseBlock::new("t", "str_replace_based_edit_tool", json!({"command":"view","path":"test","view_range":[2,-1]}))).await;
-    assert!(result.unwrap_err().to_string().contains("expected u32"));
-    assert!(!agent.called.load(Ordering::Relaxed));
+    assert!(result.is_ok());
+    assert!(agent.called.load(Ordering::Relaxed));
 }
 
 async fn serve(response: Message) -> String {
@@ -50,7 +50,7 @@ async fn serve(response: Message) -> String {
 }
 
 #[tokio::test]
-async fn over_budget_completed_answer_disappears() {
+async fn over_budget_completed_answer_is_preserved() {
     let response = Message::new("m".into(), vec![TextBlock::new("The completed answer").into()], KnownModel::ClaudeSonnet40.into(), Usage::new(101,1)).with_stop_reason(StopReason::EndTurn);
     let client = Anthropic::new(Some("test".into())).unwrap().with_base_url(serve(response).await);
     let budget = Arc::new(Budget::new_flat_rate(100,1));
@@ -59,7 +59,8 @@ async fn over_budget_completed_answer_disappears() {
     let outcome = agent.take_turn(&client, &mut messages, &budget).await.unwrap();
     assert_eq!(outcome.request_count,1);
     assert_eq!(outcome.stop_reason, StopReason::MaxTokens);
-    assert_eq!(messages.len(),1, "Completed answer was discarded");
+    assert_eq!(messages.len(),2);
+    assert!(serde_json::to_string(&messages).unwrap().contains("The completed answer"));
 }
 
 struct PausingAgent { max_seen: std::sync::Mutex<Vec<u32>> }
@@ -74,13 +75,14 @@ impl Agent for PausingAgent {
 }
 
 #[tokio::test]
-async fn pause_turn_submits_zero_token_request_after_budget_exhaustion() {
+async fn pause_turn_stops_after_budget_exhaustion() {
     let response = Message::new("m".into(), vec![TextBlock::new("paused").into()], KnownModel::ClaudeSonnet40.into(), Usage::new(95,5)).with_stop_reason(StopReason::PauseTurn);
     let client = Anthropic::new(Some("test".into())).unwrap().with_base_url(serve(response).await);
     let budget = Arc::new(Budget::new_flat_rate(100,1));
     let mut agent = PausingAgent { max_seen: std::sync::Mutex::new(vec![]) };
     let mut messages = vec![MessageParam::user("hello")];
-    let err = agent.take_turn(&client, &mut messages, &budget).await.unwrap_err();
-    assert!(err.to_string().contains("attempted zero token request"));
-    assert_eq!(*agent.max_seen.lock().unwrap(), vec![10,0]);
+    let outcome = agent.take_turn(&client, &mut messages, &budget).await.unwrap();
+    assert_eq!(outcome.request_count, 1);
+    assert_eq!(messages.len(), 2);
+    assert_eq!(*agent.max_seen.lock().unwrap(), vec![10]);
 }
