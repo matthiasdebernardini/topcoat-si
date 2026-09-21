@@ -31,7 +31,7 @@ pub use agent::{
 pub use chat::ThinkingMode;
 pub use client::{Anthropic, LoggingStream};
 pub use client_logger::ClientLogger;
-pub use error::{Error, Result};
+pub use error::{Error, HttpMetadata, Result};
 pub use json_schema::JsonSchema;
 pub use observability::register_biometrics;
 pub use prompt::{

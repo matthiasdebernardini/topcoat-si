@@ -6,7 +6,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a client with custom retry settings
     let client = Anthropic::new(None)?
         .with_max_retries(5) // Try up to 5 times
-        .with_backoff_params(1.0 / 60.0, 1.0 / 60.0) // Conservative backoff for 1 req/min capacity
+         // Conservative backoff for 1 req/min capacity
         .with_timeout(Duration::from_secs(30))?;
 
     println!("Client configured with retry settings:");

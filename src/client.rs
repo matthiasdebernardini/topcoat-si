@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::env;
-use std::error::Error as StdError;
 use std::fs;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,13 +10,12 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client as ReqwestClient, Response, header};
-use serde::Deserialize;
 use tokio::time::sleep;
 
 use crate::AccumulatingStream;
 use crate::backoff::ExponentialBackoff;
 use crate::client_logger::ClientLogger;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, HttpMetadata, RequestPhase, map_reqwest_error};
 use crate::observability::{
     CLIENT_REQUEST_DURATION, CLIENT_REQUEST_ERRORS, CLIENT_REQUEST_RETRIES, CLIENT_REQUESTS,
     CLIENT_RETRY_BACKOFF,
@@ -83,7 +81,7 @@ impl Stream for LoggingStream<'_> {
 const DEFAULT_API_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 /// Default connect/read inactivity timeout shared by all requests.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const STRUCTURED_OUTPUTS_BETA: &str = "structured-outputs-2025-11-13";
 const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const FALLBACK_CREDIT_BETA: &str = "fallback-credit-2026-07-01";
@@ -108,19 +106,6 @@ fn requires_auth_header(base_url: &str) -> bool {
         .any(|url| url.trim_end_matches('/') == normalized)
 }
 
-fn format_reqwest_error(err: &reqwest::Error) -> String {
-    let mut parts = vec![err.to_string()];
-    let mut source = StdError::source(err);
-    while let Some(inner) = source {
-        let detail = inner.to_string();
-        if !parts.iter().any(|part| part == &detail) {
-            parts.push(detail);
-        }
-        source = inner.source();
-    }
-    parts.join(": ")
-}
-
 const MAX_MESSAGE_BATCH_RESULT_LINE_BYTES: usize = 64 * 1024 * 1024;
 
 struct MessageBatchJsonlState<S> {
@@ -128,26 +113,6 @@ struct MessageBatchJsonlState<S> {
     buffer: Vec<u8>,
     pending_lines: VecDeque<Vec<u8>>,
     finished: bool,
-}
-
-fn map_batch_result_stream_error(err: reqwest::Error) -> Error {
-    let details = format_reqwest_error(&err);
-    if err.is_timeout() {
-        Error::timeout(
-            format!("Message batch results stream timed out: {details}"),
-            None,
-        )
-    } else if err.is_connect() {
-        Error::connection(
-            format!("Message batch results stream connection error: {details}"),
-            Some(Box::new(err)),
-        )
-    } else {
-        Error::streaming(
-            format!("Error in message batch results stream: {details}"),
-            Some(Box::new(err)),
-        )
-    }
 }
 
 fn parse_message_batch_result_line(line: &[u8]) -> Result<MessageBatchResult> {
@@ -236,7 +201,7 @@ where
                 }
                 Some(Err(err)) => {
                     state.finished = true;
-                    return Some((Err(map_batch_result_stream_error(err)), state));
+                    return Some((Err(map_reqwest_error(err, RequestPhase::Body)), state));
                 }
                 None => {
                     state.finished = true;
@@ -246,16 +211,28 @@ where
     })
 }
 
+fn response_metadata(response: &Response) -> HttpMetadata {
+    let headers = response.headers();
+    let seconds = |name| headers.get(name).and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<f64>().ok()).filter(|value| value.is_finite() && *value >= 0.0);
+    let retry_after = seconds("retry-after-ms").and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok())
+        .or_else(|| seconds("retry-after").and_then(|s| Duration::try_from_secs_f64(s).ok()))
+        .or_else(|| headers.get("retry-after").and_then(|value| value.to_str().ok())
+            .and_then(|value| time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc2822).ok())
+            .map(|deadline| Duration::from_secs_f64((deadline - time::OffsetDateTime::now_utc()).as_seconds_f64().max(0.0))));
+    HttpMetadata { status: response.status().as_u16(), error_type: None,
+        request_id: headers.get("request-id").and_then(|value| value.to_str().ok()).map(String::from), retry_after }
+}
+
 /// Client for the Anthropic API with performance optimizations.
 #[derive(Clone)]
 pub struct Anthropic {
     api_key: String,
     client: ReqwestClient,
+    stream_client: ReqwestClient,
     base_url: String,
     timeout: Duration,
     max_retries: usize,
-    throughput_ops_sec: f64,
-    reserve_capacity: f64,
     /// Cached headers for performance - Arc for cheap cloning
     cached_headers: Arc<HeaderMap>,
     /// Beta feature headers included on every request.
@@ -274,15 +251,16 @@ impl std::fmt::Debug for Anthropic {
 }
 
 impl Anthropic {
-    fn build_http_client(timeout: Duration) -> Result<ReqwestClient> {
-        ReqwestClient::builder()
+    fn build_http_client(timeout: Duration, streaming: bool) -> Result<ReqwestClient> {
+        let builder = ReqwestClient::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(timeout)
-            .read_timeout(timeout)
+            .connect_timeout(timeout.min(Duration::from_secs(60)))
             .pool_max_idle_per_host(10) // Connection pooling optimization
             .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(60))
-            .build()
+            .tcp_keepalive(Duration::from_secs(60));
+        let builder = if streaming { builder.read_timeout(timeout.min(Duration::from_secs(60))) }
+            else { builder.timeout(timeout) };
+        builder.build()
             .map_err(|e| {
                 Error::http_client(
                     format!("Failed to build HTTP client: {e}"),
@@ -343,7 +321,7 @@ impl Anthropic {
         };
 
         let timeout = DEFAULT_TIMEOUT;
-        let client = Self::build_http_client(timeout)?;
+        let client = Self::build_http_client(timeout, false)?;
 
         // Resolve base URL from environment variables, defaulting to the API URL.
         // This is resolved before building headers because some providers
@@ -359,11 +337,10 @@ impl Anthropic {
         Ok(Self {
             api_key,
             client,
+            stream_client: Self::build_http_client(timeout, true)?,
             base_url,
             timeout,
             max_retries: 3,
-            throughput_ops_sec: 1.0 / 60.0,
-            reserve_capacity: 1.0 / 60.0,
             cached_headers,
             default_betas: Vec::new(),
         })
@@ -416,8 +393,9 @@ impl Anthropic {
     /// timeout for API requests.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
         self.timeout = timeout;
+        self.stream_client = Self::build_http_client(timeout, true)?;
 
-        self.client = Self::build_http_client(timeout).map_err(|e| match e {
+        self.client = Self::build_http_client(timeout, false).map_err(|e| match e {
             Error::HttpClient { source, .. } => Error::http_client(
                 "Failed to build HTTP client with new timeout",
                 source.map(|src| Box::new(src) as Box<dyn std::error::Error + Send + Sync>),
@@ -438,15 +416,6 @@ impl Anthropic {
     /// Get the API key being used by this client.
     pub fn api_key(&self) -> &str {
         &self.api_key
-    }
-
-    /// Set the backoff parameters for this client.
-    ///
-    /// This method allows you to configure the exponential backoff algorithm.
-    pub fn with_backoff_params(mut self, throughput_ops_sec: f64, reserve_capacity: f64) -> Self {
-        self.throughput_ops_sec = throughput_ops_sec;
-        self.reserve_capacity = reserve_capacity;
-        self
     }
 
     /// Set default beta feature headers included on every request.
@@ -587,7 +556,6 @@ impl Anthropic {
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let backoff = ExponentialBackoff::new(self.throughput_ops_sec, self.reserve_capacity);
         let mut last_error = None;
 
         for attempt in 0..=self.max_retries {
@@ -595,7 +563,7 @@ impl Anthropic {
                 Ok(result) => return Ok(result),
                 Err(error) => {
                     // Check if error is retryable
-                    if !error.is_retryable() {
+                    if !error.is_retryable() || error.retry_after().is_some_and(|delay| delay > Duration::from_secs(60)) {
                         return Err(error);
                     }
 
@@ -605,27 +573,8 @@ impl Anthropic {
                         break;
                     }
 
-                    // Calculate backoff duration
-                    let exp_backoff_duration = backoff.next();
-
-                    // Get retry-after from error if available
-                    let header_backoff_duration = match &error {
-                        Error::RateLimit {
-                            retry_after: Some(seconds),
-                            ..
-                        } => Some(Duration::from_secs(*seconds)),
-                        Error::ServiceUnavailable {
-                            retry_after: Some(seconds),
-                            ..
-                        } => Some(Duration::from_secs(*seconds)),
-                        _ => None,
-                    };
-
-                    // Take the maximum of exponential backoff and header-based backoff
-                    let sleep_duration = match header_backoff_duration {
-                        Some(header_duration) => exp_backoff_duration.max(header_duration),
-                        None => exp_backoff_duration,
-                    };
+                    let sleep_duration = ExponentialBackoff::next(attempt)
+                        .max(error.retry_after().unwrap_or_default());
 
                     CLIENT_REQUEST_RETRIES.click();
                     CLIENT_RETRY_BACKOFF.add(sleep_duration.as_secs_f64());
@@ -641,110 +590,33 @@ impl Anthropic {
 
     /// Process API response errors and convert to our Error type
     async fn process_error_response(response: Response) -> Error {
-        let status = response.status();
-        let status_code = status.as_u16();
-
-        // Get headers we might need for error processing
-        let request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|val| val.to_str().ok())
-            .map(String::from);
-
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|val| val.to_str().ok())
-            .and_then(|val| val.parse::<u64>().ok());
-
-        // Try to parse error response body
-        #[derive(Deserialize)]
-        struct ErrorResponse {
-            error: Option<ErrorDetail>,
-        }
-
-        #[derive(Deserialize)]
-        struct ErrorDetail {
-            #[serde(rename = "type")]
-            error_type: Option<String>,
-            message: Option<String>,
-            param: Option<String>,
-        }
-
-        let error_body = match response.text().await {
+        let mut metadata = response_metadata(&response);
+        let body = match response.bytes().await {
             Ok(body) => body,
-            Err(e) => {
-                return Error::http_client(
-                    format!("Failed to read error response: {e}"),
-                    Some(Box::new(e)),
-                );
-            }
+            Err(error) => return Error::from_http("Failed to read error response", metadata, Some(Arc::new(error))),
         };
-
-        // Try to parse as JSON first
-        let parsed_error = serde_json::from_str::<ErrorResponse>(&error_body).ok();
-        let error_type = parsed_error
-            .as_ref()
-            .and_then(|e| e.error.as_ref())
-            .and_then(|e| e.error_type.clone());
-        let error_message = parsed_error
-            .as_ref()
-            .and_then(|e| e.error.as_ref())
-            .and_then(|e| e.message.clone())
-            .unwrap_or_else(|| error_body.clone());
-        let error_param = parsed_error
-            .as_ref()
-            .and_then(|e| e.error.as_ref())
-            .and_then(|e| e.param.clone());
-
-        // Map HTTP status code to appropriate error type
-        match status_code {
-            400 => Error::bad_request(error_message, error_param),
-            401 => Error::authentication(error_message),
-            403 => Error::permission(error_message),
-            404 => Error::not_found(error_message, None, None),
-            408 => Error::timeout(error_message, None),
-            429 => Error::rate_limit(error_message, retry_after),
-            500 => Error::internal_server(error_message, request_id),
-            502..=504 => Error::service_unavailable(error_message, retry_after),
-            529 => Error::rate_limit(error_message, retry_after),
-            _ => Error::api(status_code, error_type, error_message, request_id),
+        let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+        if let Some(value) = parsed.as_ref() {
+            metadata.error_type = value["error"]["type"].as_str().map(String::from);
+            metadata.request_id = metadata.request_id.or_else(|| value["request_id"].as_str().map(String::from));
         }
+        let message = parsed.as_ref().and_then(|value| value["error"]["message"].as_str())
+            .unwrap_or("HTTP error response");
+        Error::from_http(message, metadata, None)
     }
 
-    /// Convert reqwest errors to appropriate Error types
-    fn map_request_error(&self, e: reqwest::Error) -> Error {
-        let details = format_reqwest_error(&e);
-        if e.is_timeout() {
-            Error::timeout(
-                format!("Request timed out: {details}"),
-                Some(self.timeout.as_secs_f64()),
-            )
-        } else if e.is_connect() {
-            Error::connection(format!("Connection error: {details}"), Some(Box::new(e)))
-        } else {
-            Error::http_client(format!("Request failed: {details}"), Some(Box::new(e)))
-        }
+    fn map_request_error(&self, error: reqwest::Error) -> Error {
+        map_reqwest_error(error, RequestPhase::Headers)
     }
 
-    fn map_response_body_error(&self, e: reqwest::Error) -> Error {
-        let details = format_reqwest_error(&e);
-        if e.is_timeout() {
-            Error::timeout(
-                format!("Response body timed out: {details}"),
-                Some(self.timeout.as_secs_f64()),
-            )
-        } else if e.is_connect() {
-            Error::connection(
-                format!("Response body connection error: {details}"),
-                Some(Box::new(e)),
-            )
-        } else {
-            Error::http_client(
-                format!("Failed to read response body: {details}"),
-                Some(Box::new(e)),
-            )
-        }
+    async fn decode_response<T: serde::de::DeserializeOwned>(response: Response) -> Result<T> {
+        let metadata = response_metadata(&response);
+        let body = response.bytes().await.map_err(|error| {
+            Error::from_http("Failed to read response body", metadata.clone(), Some(Arc::new(error)))
+        })?;
+        serde_json::from_slice(&body).map_err(|error| {
+            Error::from_http(format!("Failed to parse response ({} bytes): {error}", body.len()), metadata, Some(Arc::new(error)))
+        })
     }
 
     /// Execute a POST request with error handling
@@ -769,14 +641,7 @@ impl Anthropic {
             return Err(Self::process_error_response(response).await);
         }
 
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| self.map_response_body_error(e))?;
-
-        serde_json::from_slice::<T>(&body).map_err(|e| {
-            Error::serialization(format!("Failed to parse response: {e}"), Some(Box::new(e)))
-        })
+        Self::decode_response(response).await
     }
 
     /// Execute a GET request with error handling
@@ -804,14 +669,7 @@ impl Anthropic {
             return Err(Self::process_error_response(response).await);
         }
 
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| self.map_response_body_error(e))?;
-
-        serde_json::from_slice::<T>(&body).map_err(|e| {
-            Error::serialization(format!("Failed to parse response: {e}"), Some(Box::new(e)))
-        })
+        Self::decode_response(response).await
     }
 
     /// Execute an empty-body POST request with error handling.
@@ -834,14 +692,7 @@ impl Anthropic {
             return Err(Self::process_error_response(response).await);
         }
 
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| self.map_response_body_error(e))?;
-
-        serde_json::from_slice::<T>(&body).map_err(|e| {
-            Error::serialization(format!("Failed to parse response: {e}"), Some(Box::new(e)))
-        })
+        Self::decode_response(response).await
     }
 
     /// Execute a DELETE request with error handling.
@@ -864,14 +715,7 @@ impl Anthropic {
             return Err(Self::process_error_response(response).await);
         }
 
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| self.map_response_body_error(e))?;
-
-        serde_json::from_slice::<T>(&body).map_err(|e| {
-            Error::serialization(format!("Failed to parse response: {e}"), Some(Box::new(e)))
-        })
+        Self::decode_response(response).await
     }
 
     /// Execute a streaming GET request with error handling.
@@ -883,7 +727,7 @@ impl Anthropic {
         let headers = headers.unwrap_or_else(|| self.default_headers());
 
         let response = self
-            .client
+            .stream_client
             .get(url)
             .headers(headers)
             .send()
@@ -1017,7 +861,7 @@ impl Anthropic {
                 );
 
                 let response = self
-                    .client
+                    .stream_client
                     .post(&url)
                     .headers(headers)
                     .json(params)
@@ -1043,10 +887,9 @@ impl Anthropic {
         };
 
         // Get the byte stream from the response
+        let request_id = response_metadata(&response).request_id;
         let stream = response.bytes_stream();
-
-        // Create an SSE processor
-        Ok(process_message_stream_sse(stream))
+        Ok(process_message_stream_sse(stream).map(move |item| item.map_err(|error| error.with_request_id(request_id.clone()))))
     }
 
     /// Send a message to the API with logging and get a streaming response.
@@ -1493,8 +1336,6 @@ Connection: close\r\n\r\n{}",
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 2,
-            throughput_ops_sec: 1.0 / 60.0,
-            reserve_capacity: 1.0 / 60.0,
             cached_headers: Arc::new(HeaderMap::new()),
             default_betas: Vec::new(),
         };
@@ -1528,8 +1369,6 @@ Connection: close\r\n\r\n{}",
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 2,
-            throughput_ops_sec: 1.0 / 60.0,
-            reserve_capacity: 1.0 / 60.0,
             cached_headers: Arc::new(HeaderMap::new()),
             default_betas: Vec::new(),
         };
@@ -1561,8 +1400,6 @@ Connection: close\r\n\r\n{}",
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 2,
-            throughput_ops_sec: 1.0 / 60.0,
-            reserve_capacity: 1.0 / 60.0,
             cached_headers: Arc::new(HeaderMap::new()),
             default_betas: Vec::new(),
         };
@@ -1595,8 +1432,6 @@ Connection: close\r\n\r\n{}",
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 2,
-            throughput_ops_sec: 1.0 / 60.0,
-            reserve_capacity: 1.0 / 60.0,
             cached_headers: Arc::new(HeaderMap::new()),
             default_betas: Vec::new(),
         };
@@ -1716,7 +1551,7 @@ Connection: close\r\n\r\n{}",
         let configured_client = client
             .with_base_url("https://custom.api.com".to_string())
             .with_max_retries(5)
-            .with_backoff_params(2.0, 1.0);
+;
 
         assert_eq!(configured_client.base_url, "https://custom.api.com");
         assert_eq!(configured_client.max_retries, 5);
@@ -1922,8 +1757,6 @@ Connection: close\r\n\r\n{}",
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 0,
-            throughput_ops_sec: 1.0 / 60.0,
-            reserve_capacity: 1.0 / 60.0,
             cached_headers: Arc::new(HeaderMap::new()),
             default_betas: Vec::new(),
         }

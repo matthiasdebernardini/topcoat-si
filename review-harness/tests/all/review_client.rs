@@ -36,7 +36,7 @@ fn ok_response() -> Vec<u8> {
     format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
 }
 fn client(url: String) -> Anthropic {
-    Anthropic::new(Some("dummy-key".into())).unwrap().with_base_url(url).with_max_retries(1).with_backoff_params(1000.0, 1000.0)
+    Anthropic::new(Some("dummy-key".into())).unwrap().with_base_url(url).with_max_retries(1)
         .with_timeout(Duration::from_secs(2)).unwrap()
 }
 fn params() -> MessageCreateParams { MessageCreateParams::simple("hello", KnownModel::ClaudeHaiku45) }
@@ -64,4 +64,85 @@ async fn request_id_should_be_preserved_for_server_error() {
     let err = client(url).with_max_retries(0).send(params()).await.unwrap_err();
     task.abort();
     assert_eq!(err.request_id(), Some("req_header"));
+}
+
+fn error_response(status: u16, headers: &str) -> Vec<u8> {
+    let body = r#"{"error":{"type":"synthetic_error","message":"failed"},"request_id":"req_body"}"#;
+    format!("HTTP/1.1 {status} Error\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
+}
+
+#[tokio::test]
+async fn retryable_statuses_retry_once() {
+    for status in [408, 409, 429, 500, 501, 502, 503, 504, 529] {
+        let (url, attempts, task) = server(error_response(status, "retry-after-ms: 1\r\n"), ok_response()).await;
+        assert!(client(url).send(params()).await.is_ok(), "{status}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "{status}");
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn http_metadata_survives_each_error_kind() {
+    for status in [400, 401, 403, 404, 408, 409, 429, 500, 503, 529] {
+        let (url, _, task) = server(error_response(status, "retry-after: 86400\r\n"), vec![]).await;
+        let err = client(url).send(params()).await.unwrap_err();
+        assert_eq!(err.status_code(), Some(status));
+        assert_eq!(err.request_id(), Some("req_body"));
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(86400)));
+        assert_eq!(err.metadata().unwrap().error_type.as_deref(), Some("synthetic_error"));
+        if status == 529 { assert!(matches!(err, Error::Overloaded { .. })); }
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn http_date_retry_after_is_preserved_without_sleep() {
+    let (url, attempts, task) = server(error_response(503, "retry-after: Wed, 21 Oct 2099 07:28:00 GMT\r\n"), ok_response()).await;
+    let err = client(url).send(params()).await.unwrap_err();
+    assert!(err.retry_after().unwrap() > Duration::from_secs(60));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn truncated_200_and_builder_errors_are_not_retried() {
+    let (url, attempts, task) = server(b"HTTP/1.1 200 OK\r\nrequest-id: req_partial\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{".to_vec(), ok_response()).await;
+    let err = client(url).send(params()).await.unwrap_err();
+    assert!(!err.is_retryable());
+    assert_eq!(err.request_id(), Some("req_partial"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    task.abort();
+    let err = client("invalid://bad".into()).send(params()).await.unwrap_err();
+    assert!(!err.is_retryable());
+}
+
+#[tokio::test]
+async fn timeout_does_not_repeat_a_billed_post() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let seen = attempts.clone();
+    let task = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            seen.fetch_add(1, Ordering::SeqCst);
+            sockets.push(socket);
+        }
+    });
+    let err = client(url).with_max_retries(3).with_timeout(Duration::from_millis(30)).unwrap().send(params()).await.unwrap_err();
+    assert!(err.is_timeout());
+    assert!(!err.is_retryable());
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn invalid_200_retains_request_id_and_length() {
+    let (url, attempts, task) = server(b"HTTP/1.1 200 OK\r\nrequest-id: req_decode\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad".to_vec(), ok_response()).await;
+    let err = client(url).send(params()).await.unwrap_err();
+    assert_eq!(err.request_id(), Some("req_decode"));
+    assert!(err.to_string().contains("3 bytes"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    task.abort();
 }

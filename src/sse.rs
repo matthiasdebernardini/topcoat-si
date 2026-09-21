@@ -5,7 +5,6 @@
 
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt};
-use std::error::Error as StdError;
 use std::time::Instant;
 
 use crate::observability::{
@@ -61,7 +60,7 @@ where
     S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin + 'static,
 {
     // Convert reqwest errors to our error type
-    let stream = byte_stream.map(|result| result.map_err(map_http_stream_error));
+    let stream = byte_stream.map(|result| result.map_err(|error| crate::error::map_reqwest_error(error, crate::error::RequestPhase::Body)));
 
     // Initialize state with production hardening
     let state = SseState {
@@ -182,36 +181,6 @@ impl SseState {
         self.finished = true;
         STREAM_ERRORS.click();
     }
-}
-
-fn map_http_stream_error(err: reqwest::Error) -> Error {
-    let details = format_reqwest_error(&err);
-    if err.is_timeout() {
-        Error::timeout(format!("HTTP stream timed out: {details}"), None)
-    } else if err.is_connect() {
-        Error::connection(
-            format!("HTTP stream connection error: {details}"),
-            Some(Box::new(err)),
-        )
-    } else {
-        Error::streaming(
-            format!("Error in HTTP stream: {details}"),
-            Some(Box::new(err)),
-        )
-    }
-}
-
-fn format_reqwest_error(err: &reqwest::Error) -> String {
-    let mut parts = vec![err.to_string()];
-    let mut source = StdError::source(err);
-    while let Some(inner) = source {
-        let detail = inner.to_string();
-        if !parts.iter().any(|part| part == &detail) {
-            parts.push(detail);
-        }
-        source = inner.source();
-    }
-    parts.join(": ")
 }
 
 /// Decode a raw [`SseEvent`] into a Claudius [`MessageStreamEvent`].
@@ -364,12 +333,20 @@ fn parse_stream_error(event_data: &str) -> Error {
                 .and_then(|error| error.get("status_code"))
                 .and_then(|value| value.as_u64())
                 .and_then(|value| u16::try_from(value).ok())
-                .unwrap_or(500);
+                .unwrap_or(match error_type.as_deref() {
+                    Some("overloaded_error") => 529,
+                    Some("rate_limit_error" | "rate_limit") => 429,
+                    Some("invalid_request_error") => 400,
+                    Some("authentication_error") => 401,
+                    Some("permission_error") => 403,
+                    Some("not_found_error" | "not_found") => 404,
+                    _ => 500,
+                });
             let _retryable = error_object
                 .and_then(|error| error.get("retryable"))
                 .and_then(|value| value.as_bool());
 
-            Error::api(status_code, error_type, message, None)
+            Error::api(status_code, error_type, message, error_json["request_id"].as_str().map(String::from))
         }
         Err(_) => Error::api(
             500,
@@ -714,7 +691,7 @@ mod tests {
         })
         .unwrap_err();
 
-        assert_eq!(err.status_code(), Some(500));
+        assert_eq!(err.status_code(), Some(404));
         assert!(err.to_string().contains("missing"));
     }
 }
