@@ -108,21 +108,6 @@ fn requires_auth_header(base_url: &str) -> bool {
         .any(|url| url.trim_end_matches('/') == normalized)
 }
 
-fn stream_debug_enabled() -> bool {
-    env::var_os("CLAUDIUS_DEBUG_STREAM").is_some()
-}
-
-fn debug_stream_request(url: &str, params: &MessageCreateParams) {
-    if !stream_debug_enabled() {
-        return;
-    }
-
-    match serde_json::to_string_pretty(params) {
-        Ok(body) => eprintln!("[claudius-debug] stream request POST {url}\n{body}"),
-        Err(err) => eprintln!("[claudius-debug] failed to serialize stream request: {err}"),
-    }
-}
-
 fn format_reqwest_error(err: &reqwest::Error) -> String {
     let mut parts = vec![err.to_string()];
     let mut source = StdError::source(err);
@@ -262,7 +247,7 @@ where
 }
 
 /// Client for the Anthropic API with performance optimizations.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Anthropic {
     api_key: String,
     client: ReqwestClient,
@@ -277,9 +262,21 @@ pub struct Anthropic {
     default_betas: Vec<String>,
 }
 
+impl std::fmt::Debug for Anthropic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Anthropic")
+            .field("api_key", &"[REDACTED]")
+            .field("cached_headers", &"[REDACTED]")
+            .field("timeout", &self.timeout)
+            .field("max_retries", &self.max_retries)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Anthropic {
     fn build_http_client(timeout: Duration) -> Result<ReqwestClient> {
         ReqwestClient::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(timeout)
             .read_timeout(timeout)
             .pool_max_idle_per_host(10) // Connection pooling optimization
@@ -296,6 +293,7 @@ impl Anthropic {
 
     /// Resolve an API key value, handling file:// URLs
     fn resolve_api_key(key_value: &str) -> Result<String> {
+        let key_value = key_value.trim();
         if let Some(stripped) = key_value.strip_prefix("file://") {
             // Handle file:// URLs
             let path = if stripped.starts_with('/') {
@@ -331,7 +329,7 @@ impl Anthropic {
     pub fn new(api_key: Option<String>) -> Result<Self> {
         let api_key = match api_key {
             Some(key) => Self::resolve_api_key(&key)?,
-            None => match env::var("CLAUDIUS_API_KEY").ok() {
+            None => match env::var("CLAUDIUS_API_KEY").ok().filter(|key| !key.trim().is_empty()) {
                 Some(key) => Self::resolve_api_key(&key)?,
                 None => {
                     let env_key = env::var("ANTHROPIC_API_KEY").map_err(|_| {
@@ -507,11 +505,16 @@ impl Anthropic {
                 })?,
             );
         }
+        for name in ["x-api-key", "authorization"] {
+            if let Some(value) = headers.get_mut(name) {
+                value.set_sensitive(true);
+            }
+        }
         Ok(headers)
     }
 
     /// Get cached headers for performance (no allocation needed).
-    fn default_headers(&self) -> HeaderMap {
+    pub fn default_headers(&self) -> HeaderMap {
         (*self.cached_headers).clone()
     }
 
@@ -1004,8 +1007,7 @@ impl Anthropic {
         let response = self
             .retry_with_backoff(|| async {
                 let url = self.build_url("messages");
-                debug_stream_request(&url, params);
-
+        
                 let mut headers = self
                     .headers_with_betas(&all_betas)
                     .unwrap_or_else(|| self.default_headers());
