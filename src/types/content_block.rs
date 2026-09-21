@@ -1,0 +1,472 @@
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+
+use crate::types::{
+    DocumentBlock, FallbackBlock, ImageBlock, RedactedThinkingBlock, ServerToolUseBlock, TextBlock,
+    ThinkingBlock, ToolResultBlock, ToolUseBlock, WebSearchToolResultBlock,
+};
+
+/// A block of content in a message.
+///
+/// This enum represents the different types of content blocks that can be included
+/// in a message's content.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum ContentBlock {
+    /// A block of text content
+    #[serde(rename = "text")]
+    Text(TextBlock),
+
+    /// An image block
+    #[serde(rename = "image")]
+    Image(ImageBlock),
+
+    /// A block representing a tool use request
+    #[serde(rename = "tool_use")]
+    ToolUse(ToolUseBlock),
+
+    /// A block representing a server-side tool use request
+    #[serde(rename = "server_tool_use")]
+    ServerToolUse(ServerToolUseBlock),
+
+    /// A web search tool result block
+    #[serde(rename = "web_search_tool_result")]
+    WebSearchToolResult(WebSearchToolResultBlock),
+
+    /// A tool result block
+    #[serde(rename = "tool_result")]
+    ToolResult(ToolResultBlock),
+
+    /// A document block
+    #[serde(rename = "document")]
+    Document(DocumentBlock),
+
+    /// A block containing model thinking
+    #[serde(rename = "thinking")]
+    Thinking(ThinkingBlock),
+
+    /// A block containing redacted thinking data
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking(RedactedThinkingBlock),
+
+    /// A boundary between a refusing model and the model that continued generation.
+    #[serde(rename = "fallback")]
+    Fallback(FallbackBlock),
+}
+
+impl<'de> Deserialize<'de> for ContentBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let block_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| serde::de::Error::missing_field("type"))?
+            .to_string();
+
+        match block_type.as_str() {
+            "text" => from_value(value).map(ContentBlock::Text),
+            "image" => from_value(value).map(ContentBlock::Image),
+            "tool_use" => from_value(value).map(ContentBlock::ToolUse),
+            "server_tool_use" => from_value(value).map(ContentBlock::ServerToolUse),
+            "web_search_tool_result" => from_value(value).map(ContentBlock::WebSearchToolResult),
+            "tool_result" => from_value(value).map(ContentBlock::ToolResult),
+            "document" => from_value(value).map(ContentBlock::Document),
+            "thinking" | "thinking_summary" | "summary" => {
+                from_value(value).map(ContentBlock::Thinking)
+            }
+            "redacted_thinking" => from_value(value).map(ContentBlock::RedactedThinking),
+            "fallback" => from_value(value).map(ContentBlock::Fallback),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &[
+                    "text",
+                    "image",
+                    "tool_use",
+                    "server_tool_use",
+                    "web_search_tool_result",
+                    "tool_result",
+                    "document",
+                    "thinking",
+                    "thinking_summary",
+                    "summary",
+                    "redacted_thinking",
+                    "fallback",
+                ],
+            )),
+        }
+    }
+}
+
+fn from_value<T, E>(value: Value) -> Result<T, E>
+where
+    T: serde::de::DeserializeOwned,
+    E: serde::de::Error,
+{
+    serde_json::from_value(value).map_err(E::custom)
+}
+
+impl ContentBlock {
+    /// Returns true if this block is a text block
+    pub fn is_text(&self) -> bool {
+        matches!(self, ContentBlock::Text(_))
+    }
+
+    /// Returns true if this block is an image block
+    pub fn is_image(&self) -> bool {
+        matches!(self, ContentBlock::Image(_))
+    }
+
+    /// Returns true if this block is a tool use block
+    pub fn is_tool_use(&self) -> bool {
+        matches!(self, ContentBlock::ToolUse(_))
+    }
+
+    /// Returns true if this block is a server tool use block
+    pub fn is_server_tool_use(&self) -> bool {
+        matches!(self, ContentBlock::ServerToolUse(_))
+    }
+
+    /// Returns true if this block is a web search tool result block
+    pub fn is_web_search_tool_result(&self) -> bool {
+        matches!(self, ContentBlock::WebSearchToolResult(_))
+    }
+
+    /// Returns true if this block is a tool result block
+    pub fn is_tool_result(&self) -> bool {
+        matches!(self, ContentBlock::ToolResult(_))
+    }
+
+    /// Returns true if this block is a document block
+    pub fn is_document(&self) -> bool {
+        matches!(self, ContentBlock::Document(_))
+    }
+
+    /// Returns true if this block is a thinking block
+    pub fn is_thinking(&self) -> bool {
+        matches!(self, ContentBlock::Thinking(_))
+    }
+
+    /// Returns true if this block is a redacted thinking block
+    pub fn is_redacted_thinking(&self) -> bool {
+        matches!(self, ContentBlock::RedactedThinking(_))
+    }
+
+    /// Returns true if this block marks a model fallback boundary.
+    pub fn is_fallback(&self) -> bool {
+        matches!(self, ContentBlock::Fallback(_))
+    }
+
+    /// Returns a reference to the inner TextBlock if this is a Text variant,
+    /// or None otherwise.
+    pub fn as_text(&self) -> Option<&TextBlock> {
+        match self {
+            ContentBlock::Text(block) => Some(block),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the inner ImageBlock if this is an Image variant,
+    /// or None otherwise.
+    pub fn as_image(&self) -> Option<&ImageBlock> {
+        match self {
+            ContentBlock::Image(block) => Some(block),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the inner ToolUseBlock if this is a ToolUse variant,
+    /// or None otherwise.
+    pub fn as_tool_use(&self) -> Option<&ToolUseBlock> {
+        match self {
+            ContentBlock::ToolUse(block) => Some(block),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the inner ServerToolUseBlock if this is a ServerToolUse variant,
+    /// or None otherwise.
+    pub fn as_server_tool_use(&self) -> Option<&ServerToolUseBlock> {
+        match self {
+            ContentBlock::ServerToolUse(block) => Some(block),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the inner WebSearchToolResultBlock if this is a WebSearchToolResult variant,
+    /// or None otherwise.
+    pub fn as_web_search_tool_result(&self) -> Option<&WebSearchToolResultBlock> {
+        match self {
+            ContentBlock::WebSearchToolResult(block) => Some(block),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the inner ToolResultBlock if this is a ToolResult variant,
+    /// or None otherwise.
+    pub fn as_tool_result(&self) -> Option<&ToolResultBlock> {
+        match self {
+            ContentBlock::ToolResult(block) => Some(block),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the inner DocumentBlock if this is a Document variant,
+    /// or None otherwise.
+    pub fn as_document(&self) -> Option<&DocumentBlock> {
+        match self {
+            ContentBlock::Document(block) => Some(block),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the inner ThinkingBlock if this is a Thinking variant,
+    /// or None otherwise.
+    pub fn as_thinking(&self) -> Option<&ThinkingBlock> {
+        match self {
+            ContentBlock::Thinking(block) => Some(block),
+            _ => None,
+        }
+    }
+
+    /// Returns a reference to the inner RedactedThinkingBlock if this is a RedactedThinking variant,
+    /// or None otherwise.
+    pub fn as_redacted_thinking(&self) -> Option<&RedactedThinkingBlock> {
+        match self {
+            ContentBlock::RedactedThinking(block) => Some(block),
+            _ => None,
+        }
+    }
+}
+
+/// Helper methods to create ContentBlock variants
+impl From<TextBlock> for ContentBlock {
+    fn from(block: TextBlock) -> Self {
+        ContentBlock::Text(block)
+    }
+}
+
+impl From<ImageBlock> for ContentBlock {
+    fn from(block: ImageBlock) -> Self {
+        ContentBlock::Image(block)
+    }
+}
+
+impl From<ToolUseBlock> for ContentBlock {
+    fn from(block: ToolUseBlock) -> Self {
+        ContentBlock::ToolUse(block)
+    }
+}
+
+impl From<ServerToolUseBlock> for ContentBlock {
+    fn from(block: ServerToolUseBlock) -> Self {
+        ContentBlock::ServerToolUse(block)
+    }
+}
+
+impl From<WebSearchToolResultBlock> for ContentBlock {
+    fn from(block: WebSearchToolResultBlock) -> Self {
+        ContentBlock::WebSearchToolResult(block)
+    }
+}
+
+impl From<ToolResultBlock> for ContentBlock {
+    fn from(block: ToolResultBlock) -> Self {
+        ContentBlock::ToolResult(block)
+    }
+}
+
+impl From<DocumentBlock> for ContentBlock {
+    fn from(block: DocumentBlock) -> Self {
+        ContentBlock::Document(block)
+    }
+}
+
+impl From<ThinkingBlock> for ContentBlock {
+    fn from(block: ThinkingBlock) -> Self {
+        ContentBlock::Thinking(block)
+    }
+}
+
+impl From<RedactedThinkingBlock> for ContentBlock {
+    fn from(block: RedactedThinkingBlock) -> Self {
+        ContentBlock::RedactedThinking(block)
+    }
+}
+
+impl From<FallbackBlock> for ContentBlock {
+    fn from(block: FallbackBlock) -> Self {
+        ContentBlock::Fallback(block)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_block_serialization() {
+        let text_block = TextBlock::new("This is some text content.");
+        let content_block = ContentBlock::from(text_block);
+
+        let json = serde_json::to_string(&content_block).unwrap();
+        let expected = r#"{"type":"text","text":"This is some text content."}"#;
+
+        assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn tool_use_block_serialization() {
+        let input_json = serde_json::json!({
+            "query": "weather in San Francisco",
+            "limit": 5
+        });
+
+        let tool_block = ToolUseBlock::new("tool_123", "search", input_json);
+        let content_block = ContentBlock::from(tool_block);
+
+        let json = serde_json::to_string(&content_block).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected: serde_json::Value = serde_json::json!({
+            "type": "tool_use",
+            "id": "tool_123",
+            "input": {"limit": 5, "query": "weather in San Francisco"},
+            "name": "search"
+        });
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn server_tool_use_block_serialization() {
+        let server_block =
+            ServerToolUseBlock::new_web_search("tool_123", "weather in San Francisco");
+        let content_block = ContentBlock::from(server_block);
+
+        let json = serde_json::to_string(&content_block).unwrap();
+        let expected = r#"{"type":"server_tool_use","id":"tool_123","input":{"query":"weather in San Francisco"},"name":"web_search"}"#;
+
+        assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn thinking_block_serialization() {
+        let thinking_block = ThinkingBlock::new(
+            "Let me think through this problem step by step...",
+            "abc123signature",
+        );
+        let content_block = ContentBlock::from(thinking_block);
+
+        let json = serde_json::to_string(&content_block).unwrap();
+        let expected = r#"{"type":"thinking","signature":"abc123signature","thinking":"Let me think through this problem step by step..."}"#;
+
+        assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn fallback_block_deserialization() {
+        let json = serde_json::json!({
+            "type": "fallback",
+            "from": { "model": "claude-fable-5-1" },
+            "to": { "model": "claude-opus-5" }
+        });
+        let block: ContentBlock = serde_json::from_value(json).unwrap();
+        let ContentBlock::Fallback(block) = block else {
+            panic!("expected fallback block");
+        };
+        assert_eq!(
+            block.from.model,
+            crate::types::Model::Known(crate::types::KnownModel::ClaudeFable51)
+        );
+        assert_eq!(
+            block.to.model,
+            crate::types::Model::Known(crate::types::KnownModel::ClaudeOpus5)
+        );
+    }
+
+    #[test]
+    fn thinking_summary_block_deserializes_as_thinking() {
+        let json = r#"{"type":"thinking_summary","summary":"Condensed reasoning."}"#;
+        let content_block: ContentBlock = serde_json::from_str(json).unwrap();
+
+        let thinking = content_block
+            .as_thinking()
+            .expect("summary block should deserialize as thinking");
+        assert_eq!(thinking.signature, "");
+        assert_eq!(thinking.thinking, "Condensed reasoning.");
+    }
+
+    #[test]
+    fn redacted_thinking_block_serialization() {
+        let redacted_block = RedactedThinkingBlock::new("encoded-thinking-data-123");
+        let content_block = ContentBlock::from(redacted_block);
+
+        let json = serde_json::to_string(&content_block).unwrap();
+        let expected = r#"{"type":"redacted_thinking","data":"encoded-thinking-data-123"}"#;
+
+        assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn deserialization() {
+        let json = r#"{"text":"This is some text content.","type":"text"}"#;
+        let content_block: ContentBlock = serde_json::from_str(json).unwrap();
+
+        assert!(content_block.is_text());
+        assert!(!content_block.is_tool_use());
+
+        if let ContentBlock::Text(block) = content_block {
+            assert_eq!(block.text, "This is some text content.");
+        } else {
+            panic!("Expected TextBlock");
+        }
+
+        let json = r#"{"id":"tool_123","input":{"query":"weather in San Francisco"},"name":"web_search","type":"server_tool_use"}"#;
+        let content_block: ContentBlock = serde_json::from_str(json).unwrap();
+
+        assert!(content_block.is_server_tool_use());
+        assert!(!content_block.is_text());
+
+        if let ContentBlock::ServerToolUse(block) = content_block {
+            assert_eq!(block.id, "tool_123");
+            assert_eq!(block.name, "web_search");
+        } else {
+            panic!("Expected ServerToolUseBlock");
+        }
+    }
+
+    #[test]
+    fn as_methods() {
+        let text_block = TextBlock::new("This is some text content.");
+        let content_block = ContentBlock::from(text_block);
+
+        assert!(content_block.as_text().is_some());
+        assert!(content_block.as_image().is_none());
+        assert!(content_block.as_tool_use().is_none());
+        assert!(content_block.as_server_tool_use().is_none());
+        assert!(content_block.as_web_search_tool_result().is_none());
+        assert!(content_block.as_tool_result().is_none());
+        assert!(content_block.as_document().is_none());
+        assert!(content_block.as_thinking().is_none());
+        assert!(content_block.as_redacted_thinking().is_none());
+
+        let text_ref = content_block.as_text().unwrap();
+        assert_eq!(text_ref.text, "This is some text content.");
+    }
+
+    #[test]
+    fn image_block_serialization() {
+        let image_source =
+            crate::types::UrlImageSource::new("https://example.com/image.jpg".to_string());
+        let image_block = ImageBlock::new_with_url(image_source);
+        let content_block = ContentBlock::from(image_block);
+
+        let json = serde_json::to_string(&content_block).unwrap();
+        let expected =
+            r#"{"type":"image","source":{"type":"url","url":"https://example.com/image.jpg"}}"#;
+
+        assert_eq!(json, expected);
+    }
+}

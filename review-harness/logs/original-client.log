@@ -1,0 +1,38 @@
+   Compiling claudius v0.33.0 (/private/tmp/claudius-review-20260921)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.42s
+     Running tests/review_client.rs (target/debug/deps/review_client-cea275b60b899bf2)
+
+running 3 tests
+test request_id_should_be_preserved_for_server_error ... FAILED
+test truncated_503_body_should_still_retry ... FAILED
+test disconnected_connection_before_headers_should_retry ... FAILED
+
+failures:
+
+---- request_id_should_be_preserved_for_server_error stdout ----
+
+thread 'request_id_should_be_preserved_for_server_error' (142088643) panicked at tests/review_client.rs:66:5:
+assertion `left == right` failed
+  left: None
+ right: Some("req_header")
+
+---- truncated_503_body_should_still_retry stdout ----
+
+thread 'truncated_503_body_should_still_retry' (142088644) panicked at tests/review_client.rs:57:5:
+503 with disconnected error body failed after 1 attempt(s): Err(HttpClient { message: "Failed to read error response: error decoding response body for url (http://127.0.0.1:64708/v1/messages)", source: Some(reqwest::Error { kind: Decode, url: "http://127.0.0.1:64708/v1/messages", source: reqwest::Error { kind: Body, source: hyper::Error(Body, Custom { kind: UnexpectedEof, error: IncompleteBody }) } }) })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- disconnected_connection_before_headers_should_retry stdout ----
+
+thread 'disconnected_connection_before_headers_should_retry' (142088642) panicked at tests/review_client.rs:49:5:
+transient disconnect failed after 1 attempt(s): Err(HttpClient { message: "Request failed: error sending request for url (http://127.0.0.1:64707/v1/messages): client error (SendRequest): connection closed before message completed", source: Some(reqwest::Error { kind: Request, url: "http://127.0.0.1:64707/v1/messages", source: hyper_util::client::legacy::Error(SendRequest, hyper::Error(IncompleteMessage)) }) })
+
+
+failures:
+    disconnected_connection_before_headers_should_retry
+    request_id_should_be_preserved_for_server_error
+    truncated_503_body_should_still_retry
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test review_client`

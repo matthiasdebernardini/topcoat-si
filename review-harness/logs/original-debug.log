@@ -1,0 +1,35 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running tests/review_error_debug.rs (target/debug/deps/review_error_debug-e34da869685bbec9)
+
+running 3 tests
+test baseten_client_debug_must_redact_credentials ... FAILED
+test client_debug_must_redact_credentials ... FAILED
+test network_timeout_preserves_source_chain ... FAILED
+
+failures:
+
+---- baseten_client_debug_must_redact_credentials stdout ----
+
+thread 'baseten_client_debug_must_redact_credentials' (142194434) panicked at tests/review_error_debug.rs:19:5:
+client Debug contains dummy API credential 3 times
+
+---- client_debug_must_redact_credentials stdout ----
+
+thread 'client_debug_must_redact_credentials' (142194435) panicked at tests/review_error_debug.rs:10:5:
+client Debug contains dummy API credential 2 times
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- network_timeout_preserves_source_chain stdout ----
+
+thread 'network_timeout_preserves_source_chain' (142194436) panicked at tests/review_error_debug.rs:37:5:
+timeout discarded its reqwest source: Timeout error: Request timed out: error sending request for url (http://127.0.0.1:49237/v1/messages): operation timed out (0.05 seconds)
+
+
+failures:
+    baseten_client_debug_must_redact_credentials
+    client_debug_must_redact_credentials
+    network_timeout_preserves_source_chain
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `--test review_error_debug`

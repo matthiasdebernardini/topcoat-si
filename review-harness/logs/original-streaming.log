@@ -1,0 +1,68 @@
+   Compiling claudius v0.33.0 (/private/tmp/claudius-review-20260921)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.44s
+     Running tests/review_streaming.rs (target/debug/deps/review_streaming-752f53b2a40a90e7)
+
+running 7 tests
+test incomplete_utf8_at_eof_must_terminate_after_error ... FAILED
+test crlf_is_a_valid_sse_line_ending ... FAILED
+test stream_error_must_reach_final_message_receiver ... FAILED
+test eof_without_message_stop_must_not_succeed ... FAILED
+test server_tool_json_deltas_must_be_accumulated ... FAILED
+test oversized_buffer_must_terminate_after_error ... FAILED
+test slow_consumer_must_still_receive_buffered_events ... FAILED
+
+failures:
+
+---- incomplete_utf8_at_eof_must_terminate_after_error stdout ----
+
+thread 'incomplete_utf8_at_eof_must_terminate_after_error' (142073786) panicked at tests/review_streaming.rs:63:5:
+EOF error repeats indefinitely
+
+---- crlf_is_a_valid_sse_line_ending stdout ----
+
+thread 'crlf_is_a_valid_sse_line_ending' (142073784) panicked at tests/review_streaming.rs:53:5:
+assertion `left == right` failed: valid SSE frame silently discarded
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- stream_error_must_reach_final_message_receiver stdout ----
+
+thread 'stream_error_must_reach_final_message_receiver' (142073790) panicked at tests/review_streaming.rs:46:5:
+failed response was accepted: Ok(Message { id: "msg_test", content: [Text(TextBlock { citations: None, text: "partial", cache_control: None })], model: Custom("claude-test"), role: Assistant, stop_reason: None, stop_sequence: None, stop_details: None, type: "message", usage: Usage { cache_creation_input_tokens: None, cache_read_input_tokens: None, input_tokens: 10, output_tokens: 0, output_tokens_details: None, server_tool_use: None, iterations: None } })
+
+---- eof_without_message_stop_must_not_succeed stdout ----
+
+thread 'eof_without_message_stop_must_not_succeed' (142073785) panicked at tests/review_streaming.rs:38:5:
+truncated response was accepted: Ok(Message { id: "msg_test", content: [Text(TextBlock { citations: None, text: "partial", cache_control: None })], model: Custom("claude-test"), role: Assistant, stop_reason: None, stop_sequence: None, stop_details: None, type: "message", usage: Usage { cache_creation_input_tokens: None, cache_read_input_tokens: None, input_tokens: 10, output_tokens: 0, output_tokens_details: None, server_tool_use: None, iterations: None } })
+
+---- server_tool_json_deltas_must_be_accumulated stdout ----
+
+thread 'server_tool_json_deltas_must_be_accumulated' (142073788) panicked at tests/review_streaming.rs:30:5:
+assertion `left == right` failed
+  left: Object {}
+ right: Object {"query": String("weather NYC today")}
+
+---- oversized_buffer_must_terminate_after_error stdout ----
+
+thread 'oversized_buffer_must_terminate_after_error' (142073787) panicked at tests/review_streaming.rs:72:5:
+buffer limit error repeats indefinitely
+
+---- slow_consumer_must_still_receive_buffered_events stdout ----
+
+thread 'slow_consumer_must_still_receive_buffered_events' (142073789) panicked at tests/review_streaming.rs:82:5:
+consumer processing time falsely treated as network inactivity
+
+
+failures:
+    crlf_is_a_valid_sse_line_ending
+    eof_without_message_stop_must_not_succeed
+    incomplete_utf8_at_eof_must_terminate_after_error
+    oversized_buffer_must_terminate_after_error
+    server_tool_json_deltas_must_be_accumulated
+    slow_consumer_must_still_receive_buffered_events
+    stream_error_must_reach_final_message_receiver
+
+test result: FAILED. 0 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.00s
+
+error: test failed, to rerun pass `--test review_streaming`

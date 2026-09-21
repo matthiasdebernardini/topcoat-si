@@ -1,0 +1,1197 @@
+use serde::{Deserialize, Serialize};
+
+use crate::types::{
+    CacheControlEphemeral, FallbackConfig, Fallbacks, MessageParam, Metadata, Model, OutputConfig,
+    OutputFormat, SystemPrompt, TextBlock, ThinkingConfig, ThinkingDisplay, ToolChoice,
+    ToolUnionParam,
+};
+
+/// Security limits for DoS prevention
+const MAX_MESSAGE_COUNT: usize = 1000;
+const MAX_MESSAGE_LENGTH: usize = 1_000_000; // 1MB per message
+const MAX_STOP_SEQUENCES: usize = 100;
+const MAX_STOP_SEQUENCE_LENGTH: usize = 1000;
+const MAX_SYSTEM_PROMPT_LENGTH: usize = 100_000;
+const MAX_TOOLS_COUNT: usize = 100;
+
+/// Parameters for creating messages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MessageCreateParams {
+    /// The maximum number of tokens to generate before stopping.
+    ///
+    /// Note that our models may stop _before_ reaching this maximum. This parameter
+    /// only specifies the absolute maximum number of tokens to generate.
+    ///
+    /// Different models have different maximum values for this parameter. See
+    /// [models](https://docs.anthropic.com/en/docs/models-overview) for details.
+    pub max_tokens: u32,
+
+    /// Input messages.
+    ///
+    /// Our models are trained to operate on alternating `user` and `assistant`
+    /// conversational turns. When creating a new `Message`, you specify the prior
+    /// conversational turns with the `messages` parameter, and the model then generates
+    /// the next `Message` in the conversation. Consecutive `user` or `assistant` turns
+    /// in your request will be combined into a single turn.
+    pub messages: Vec<MessageParam>,
+
+    /// The model that will complete your prompt.
+    ///
+    /// See [models](https://docs.anthropic.com/en/docs/models-overview) for additional
+    /// details and options.
+    pub model: Model,
+
+    /// Top-level cache control for automatic prompt caching.
+    ///
+    /// When set, the system automatically applies the cache breakpoint to the last
+    /// cacheable block in the request. This is the simplest way to enable prompt caching
+    /// for multi-turn conversations where the growing message history should be cached
+    /// automatically.
+    ///
+    /// See
+    /// [automatic caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching#automatic-caching)
+    /// for details.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
+
+    /// An object describing metadata about the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Metadata>,
+
+    /// Output format configuration for structured outputs.
+    ///
+    /// When set, constrains Claude's response to follow a specific JSON schema,
+    /// ensuring valid, parseable output for downstream processing.
+    ///
+    /// This feature requires the beta header `structured-outputs-2025-11-13`.
+    ///
+    /// See
+    /// [structured outputs](https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs)
+    /// for details.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormat>,
+
+    /// Output configuration for structured outputs and effort control.
+    ///
+    /// This is the newer configuration format. When set, it takes precedence
+    /// over the deprecated `output_format` field for structured outputs.
+    /// Also supports the `effort` parameter for controlling thinking depth
+    /// with adaptive thinking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+
+    /// Custom text sequences that will cause the model to stop generating.
+    ///
+    /// Our models will normally stop when they have naturally completed their turn,
+    /// which will result in a response `stop_reason` of `"end_turn"`.
+    ///
+    /// If you want the model to stop generating when it encounters custom strings of
+    /// text, you can use the `stop_sequences` parameter. If the model encounters one of
+    /// the custom sequences, the response `stop_reason` value will be `"stop_sequence"`
+    /// and the response `stop_sequence` value will contain the matched stop sequence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
+
+    /// System prompt.
+    ///
+    /// A system prompt is a way of providing context and instructions to Claude, such
+    /// as specifying a particular goal or role. See the
+    /// [guide to system prompts](https://docs.anthropic.com/en/docs/system-prompts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<SystemPrompt>,
+
+    /// Amount of randomness injected into the response.
+    ///
+    /// Defaults to `1.0`. Ranges from `0.0` to `1.0`. Use `temperature` closer to `0.0`
+    /// for analytical / multiple choice, and closer to `1.0` for creative and
+    /// generative tasks.
+    ///
+    /// Note that even with `temperature` of `0.0`, the results will not be fully
+    /// deterministic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+
+    /// Configuration for enabling Claude's extended thinking.
+    ///
+    /// When enabled, responses include `thinking` content blocks showing Claude's
+    /// thinking process before the final answer. Requires a minimum budget of 1,024
+    /// tokens and counts towards your `max_tokens` limit.
+    ///
+    /// See
+    /// [extended thinking](https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking)
+    /// for details.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+
+    /// How the model should use the provided tools.
+    ///
+    /// The model can use a specific tool, any available tool, decide by itself, or not
+    /// use tools at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+
+    /// Definitions of tools that the model may use.
+    ///
+    /// If you include `tools` in your API request, the model may return `tool_use`
+    /// content blocks that represent the model's use of those tools. You can then run
+    /// those tools using the tool input generated by the model and then optionally
+    /// return results back to the model using `tool_result` content blocks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolUnionParam>>,
+
+    /// Only sample from the top K options for each subsequent token.
+    ///
+    /// Used to remove "long tail" low probability responses.
+    /// [Learn more technical details here](https://towardsdatascience.com/how-to-sample-from-language-models-682bceb97277).
+    ///
+    /// Recommended for advanced use cases only. You usually only need to use
+    /// `temperature`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+
+    /// Use nucleus sampling.
+    ///
+    /// In nucleus sampling, we compute the cumulative distribution over all the options
+    /// for each subsequent token in decreasing probability order and cut it off once it
+    /// reaches a particular probability specified by `top_p`. You should either alter
+    /// `temperature` or `top_p`, but not both.
+    ///
+    /// Recommended for advanced use cases only. You usually only need to use
+    /// `temperature`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+
+    /// Models to fall back to if this request is refused.
+    ///
+    /// When a model with safety classifiers (such as Claude Fable 5) declines a request
+    /// with `stop_reason: "refusal"`, the API can transparently retry the request against
+    /// the models listed here, in order, and return the first successful response.
+    ///
+    /// Server-side fallback is in beta and requires the `fallbacks` beta header. See
+    /// [server-side fallback](https://docs.anthropic.com/en/docs/build-with-claude/refusals-and-fallback#server-side-fallback)
+    /// for details.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallbacks: Option<Fallbacks>,
+
+    /// Opaque cache-miss credit from a refused request, redeemed when manually
+    /// retrying on a fallback model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_credit_token: Option<String>,
+
+    /// Whether to incrementally stream the response using server-sent events.
+    ///
+    /// See [streaming](https://docs.anthropic.com/en/api/messages-streaming) for
+    /// details.
+    pub stream: bool,
+
+    /// Beta feature headers to include with this request.
+    ///
+    /// These are merged with any client-level default betas and the
+    /// auto-detected `structured-outputs-2025-11-13` beta. Duplicates are
+    /// removed before sending.
+    #[serde(skip)]
+    pub betas: Option<Vec<String>>,
+}
+
+impl MessageCreateParams {
+    /// Helper function to validate a float value is within the 0.0-1.0 range (optimized)
+    #[inline]
+    fn validate_float_range(value: f32, field_name: &str) -> Result<(), crate::Error> {
+        // Fast path for common valid values
+        if (0.0..=1.0).contains(&value) && value.is_finite() {
+            return Ok(());
+        }
+
+        // Handle edge cases
+        if value.is_nan() {
+            return Err(crate::Error::validation(
+                format!("{field_name} cannot be NaN"),
+                Some(field_name.to_string()),
+            ));
+        }
+
+        Err(crate::Error::validation(
+            format!("{field_name} must be between 0.0 and 1.0, got {value}"),
+            Some(field_name.to_string()),
+        ))
+    }
+    /// Create a new message creation parameters with streaming disabled.
+    pub fn new(max_tokens: u32, messages: Vec<MessageParam>, model: Model) -> Self {
+        Self {
+            max_tokens,
+            messages,
+            model,
+            cache_control: None,
+            metadata: None,
+            output_format: None,
+            output_config: None,
+            stop_sequences: None,
+            system: None,
+            temperature: None,
+            thinking: None,
+            tool_choice: None,
+            tools: None,
+            top_k: None,
+            top_p: None,
+            fallbacks: None,
+            fallback_credit_token: None,
+            stream: false,
+            betas: None,
+        }
+    }
+
+    /// Create new streaming message creation parameters.
+    pub fn new_streaming(max_tokens: u32, messages: Vec<MessageParam>, model: Model) -> Self {
+        Self {
+            max_tokens,
+            messages,
+            model,
+            cache_control: None,
+            metadata: None,
+            output_format: None,
+            output_config: None,
+            stop_sequences: None,
+            system: None,
+            temperature: None,
+            thinking: None,
+            tool_choice: None,
+            tools: None,
+            top_k: None,
+            top_p: None,
+            fallbacks: None,
+            fallback_credit_token: None,
+            stream: true,
+            betas: None,
+        }
+    }
+
+    /// Enable automatic prompt caching.
+    ///
+    /// Applies the cache breakpoint to the last cacheable block automatically.
+    pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
+        self.cache_control = Some(cache_control);
+        self
+    }
+
+    /// Add metadata to the parameters.
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    /// Add output format for structured outputs.
+    ///
+    /// When set, constrains Claude's response to follow a specific JSON schema,
+    /// ensuring valid, parseable output for downstream processing.
+    ///
+    /// This feature requires the beta header `structured-outputs-2025-11-13`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use serde_json::json;
+    /// use claudius::{MessageCreateParams, OutputFormat, KnownModel};
+    ///
+    /// let params = MessageCreateParams::simple("Extract info", KnownModel::ClaudeHaiku45)
+    ///     .with_output_format(OutputFormat::json_schema(json!({
+    ///         "type": "object",
+    ///         "properties": {
+    ///             "name": { "type": "string" }
+    ///         },
+    ///         "required": ["name"],
+    ///         "additionalProperties": false
+    ///     })));
+    /// ```
+    pub fn with_output_format(mut self, output_format: OutputFormat) -> Self {
+        self.output_format = Some(output_format);
+        self
+    }
+
+    /// Add output configuration.
+    ///
+    /// This is the newer configuration format that supports both structured
+    /// output format and the effort parameter for adaptive thinking.
+    pub fn with_output_config(mut self, output_config: OutputConfig) -> Self {
+        self.output_config = Some(output_config);
+        self
+    }
+
+    /// Add stop sequences to the parameters.
+    pub fn with_stop_sequences(mut self, stop_sequences: Vec<String>) -> Self {
+        self.stop_sequences = Some(stop_sequences);
+        self
+    }
+
+    /// Add a system prompt as a string.
+    pub fn with_system_string(mut self, system: String) -> Self {
+        self.system = Some(SystemPrompt::from_string(system));
+        self
+    }
+
+    /// Add a system prompt as text blocks.
+    pub fn with_system_blocks(mut self, blocks: Vec<TextBlock>) -> Self {
+        self.system = Some(SystemPrompt::from_blocks(blocks));
+        self
+    }
+
+    /// Add a system prompt.
+    pub fn with_system(mut self, system: impl Into<SystemPrompt>) -> Self {
+        self.system = Some(system.into());
+        self
+    }
+
+    /// Add temperature to the parameters.
+    pub fn with_temperature(mut self, temperature: f32) -> Result<Self, crate::Error> {
+        Self::validate_float_range(temperature, "temperature")?;
+        self.temperature = Some(temperature);
+        Ok(self)
+    }
+
+    /// Add thinking configuration to the parameters.
+    pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
+        self.thinking = Some(thinking);
+        self
+    }
+
+    /// Add tool choice to the parameters.
+    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = Some(tool_choice);
+        self
+    }
+
+    /// Add tools to the parameters.
+    pub fn with_tools(mut self, tools: Vec<ToolUnionParam>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Add top_k to the parameters.
+    pub fn with_top_k(mut self, top_k: u32) -> Self {
+        self.top_k = Some(top_k);
+        self
+    }
+
+    /// Add top_p to the parameters.
+    pub fn with_top_p(mut self, top_p: f32) -> Result<Self, crate::Error> {
+        Self::validate_float_range(top_p, "top_p")?;
+        self.top_p = Some(top_p);
+        Ok(self)
+    }
+
+    /// Sets the streaming option.
+    pub fn with_stream(mut self, stream: bool) -> Self {
+        self.stream = stream;
+        self
+    }
+
+    /// Set the models to fall back to if this request is refused.
+    ///
+    /// Replaces any previously configured fallbacks. Server-side fallback is in beta and
+    /// requires the `fallbacks` beta header.
+    pub fn with_fallbacks(
+        mut self,
+        fallbacks: impl IntoIterator<Item = impl Into<FallbackConfig>>,
+    ) -> Self {
+        self.fallbacks = Some(Fallbacks::Models(
+            fallbacks.into_iter().map(Into::into).collect(),
+        ));
+        self
+    }
+
+    /// Use Anthropic's recommended fallback routing for each refusal category.
+    pub fn with_default_fallbacks(mut self) -> Self {
+        self.fallbacks = Some(Fallbacks::Default);
+        self
+    }
+
+    /// Redeem the cache-miss credit returned by a prior refusal.
+    pub fn with_fallback_credit_token(mut self, token: impl Into<String>) -> Self {
+        self.fallback_credit_token = Some(token.into());
+        self
+    }
+
+    /// Add a single fallback model for this request.
+    ///
+    /// Appends to any previously configured fallbacks, preserving order.
+    pub fn with_fallback(mut self, fallback: impl Into<FallbackConfig>) -> Self {
+        let config = fallback.into();
+        match self
+            .fallbacks
+            .get_or_insert_with(|| Fallbacks::Models(Vec::new()))
+        {
+            Fallbacks::Models(fallbacks) => fallbacks.push(config),
+            Fallbacks::Default => self.fallbacks = Some(Fallbacks::Models(vec![config])),
+        }
+        self
+    }
+
+    /// Set the beta feature headers for this request.
+    ///
+    /// These are merged with any client-level default betas and the
+    /// auto-detected `structured-outputs-2025-11-13` beta. Duplicates are
+    /// removed before sending.
+    pub fn with_betas(mut self, betas: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.betas = Some(betas.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Add a single beta feature header for this request.
+    ///
+    /// Appends to any previously set betas.
+    pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
+        self.betas.get_or_insert_with(Vec::new).push(beta.into());
+        self
+    }
+
+    /// Validate all parameters before sending to the API with security checks.
+    ///
+    /// Performs comprehensive validation including DoS prevention measures:
+    /// - Limits on message count and size to prevent resource exhaustion
+    /// - Validation of all numeric ranges
+    /// - Security checks on string inputs
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        // Basic parameter validation
+        if self.max_tokens == 0 {
+            return Err(crate::Error::validation(
+                "max_tokens must be greater than 0",
+                Some("max_tokens".to_string()),
+            ));
+        }
+
+        // Security: Prevent excessive token requests that could be expensive
+        if self.max_tokens > 1_000_000 {
+            return Err(crate::Error::validation(
+                format!(
+                    "max_tokens exceeds security limit of 1,000,000, got {}",
+                    self.max_tokens
+                ),
+                Some("max_tokens".to_string()),
+            ));
+        }
+
+        if self.messages.is_empty() {
+            return Err(crate::Error::validation(
+                "At least one message is required",
+                Some("messages".to_string()),
+            ));
+        }
+
+        // Security: Prevent DoS via excessive message count
+        if self.messages.len() > MAX_MESSAGE_COUNT {
+            return Err(crate::Error::validation(
+                format!(
+                    "Message count {} exceeds security limit of {}",
+                    self.messages.len(),
+                    MAX_MESSAGE_COUNT
+                ),
+                Some("messages".to_string()),
+            ));
+        }
+
+        // Validate message content sizes
+        for (i, message) in self.messages.iter().enumerate() {
+            let content_str = format!("{:?}", message.content); // Rough size estimate
+            if content_str.len() > MAX_MESSAGE_LENGTH {
+                return Err(crate::Error::validation(
+                    format!(
+                        "Message {} content size {} exceeds limit of {}",
+                        i,
+                        content_str.len(),
+                        MAX_MESSAGE_LENGTH
+                    ),
+                    Some(format!("messages[{i}]")),
+                ));
+            }
+        }
+
+        // Validate floating point parameters
+        if let Some(temp) = self.temperature {
+            Self::validate_float_range(temp, "temperature")?;
+        }
+        if let Some(top_p) = self.top_p {
+            Self::validate_float_range(top_p, "top_p")?;
+        }
+
+        // Validate top_k is reasonable
+        if let Some(top_k) = self.top_k
+            && top_k > 1000
+        {
+            return Err(crate::Error::validation(
+                format!("top_k {top_k} exceeds reasonable limit of 1000"),
+                Some("top_k".to_string()),
+            ));
+        }
+
+        // Validate stop sequences
+        if let Some(ref stop_sequences) = self.stop_sequences {
+            if stop_sequences.len() > MAX_STOP_SEQUENCES {
+                return Err(crate::Error::validation(
+                    format!(
+                        "Stop sequences count {} exceeds limit of {}",
+                        stop_sequences.len(),
+                        MAX_STOP_SEQUENCES
+                    ),
+                    Some("stop_sequences".to_string()),
+                ));
+            }
+
+            for (i, seq) in stop_sequences.iter().enumerate() {
+                if seq.len() > MAX_STOP_SEQUENCE_LENGTH {
+                    return Err(crate::Error::validation(
+                        format!(
+                            "Stop sequence {} length {} exceeds limit of {}",
+                            i,
+                            seq.len(),
+                            MAX_STOP_SEQUENCE_LENGTH
+                        ),
+                        Some(format!("stop_sequences[{i}]")),
+                    ));
+                }
+
+                // Security: Check for potentially problematic characters
+                if seq.contains('\0') {
+                    return Err(crate::Error::validation(
+                        format!("Stop sequence {i} contains null bytes"),
+                        Some(format!("stop_sequences[{i}]")),
+                    ));
+                }
+            }
+        }
+
+        // Validate system prompt size
+        if let Some(ref system) = self.system {
+            let system_str = format!("{system:?}"); // Rough size estimate
+            if system_str.len() > MAX_SYSTEM_PROMPT_LENGTH {
+                return Err(crate::Error::validation(
+                    format!(
+                        "System prompt size {} exceeds limit of {}",
+                        system_str.len(),
+                        MAX_SYSTEM_PROMPT_LENGTH
+                    ),
+                    Some("system".to_string()),
+                ));
+            }
+        }
+
+        // Validate tools count
+        if let Some(ref tools) = self.tools
+            && tools.len() > MAX_TOOLS_COUNT
+        {
+            return Err(crate::Error::validation(
+                format!(
+                    "Tools count {} exceeds limit of {}",
+                    tools.len(),
+                    MAX_TOOLS_COUNT
+                ),
+                Some("tools".to_string()),
+            ));
+        }
+
+        if let Some(Fallbacks::Models(fallbacks)) = &self.fallbacks
+            && fallbacks.len() > 3
+        {
+            return Err(crate::Error::validation(
+                "fallbacks may contain at most 3 models",
+                Some("fallbacks".to_string()),
+            ));
+        }
+        if let Some(Fallbacks::Models(fallbacks)) = &self.fallbacks {
+            if fallbacks.is_empty() {
+                return Err(crate::Error::validation(
+                    "fallbacks must not be empty",
+                    Some("fallbacks".to_string()),
+                ));
+            }
+            for (index, fallback) in fallbacks.iter().enumerate() {
+                if fallback.model == self.model
+                    || fallbacks[..index]
+                        .iter()
+                        .any(|previous| previous.model == fallback.model)
+                {
+                    return Err(crate::Error::validation(
+                        "fallback models must be distinct from the primary and each other",
+                        Some(format!("fallbacks[{index}].model")),
+                    ));
+                }
+            }
+        }
+
+        // Validate thinking config with security checks
+        if let Some(ref thinking) = self.thinking {
+            match thinking {
+                ThinkingConfig::Enabled { budget_tokens }
+                | ThinkingConfig::EnabledWithDisplay { budget_tokens, .. } => {
+                    if *budget_tokens < 1024 {
+                        return Err(crate::Error::validation(
+                            format!(
+                                "Thinking budget must be at least 1024 tokens, got {budget_tokens}"
+                            ),
+                            Some("thinking.budget_tokens".to_string()),
+                        ));
+                    }
+                    if *budget_tokens > self.max_tokens {
+                        return Err(crate::Error::validation(
+                            format!(
+                                "Thinking budget ({budget_tokens}) cannot exceed max_tokens ({})",
+                                self.max_tokens
+                            ),
+                            Some("thinking.budget_tokens".to_string()),
+                        ));
+                    }
+
+                    // Security: Prevent excessive thinking budget
+                    if *budget_tokens > 100_000 {
+                        return Err(crate::Error::validation(
+                            format!(
+                                "Thinking budget {budget_tokens} exceeds security limit of 100,000"
+                            ),
+                            Some("thinking.budget_tokens".to_string()),
+                        ));
+                    }
+                }
+                ThinkingConfig::Disabled => {
+                    // No validation needed for disabled state
+                }
+                ThinkingConfig::Adaptive | ThinkingConfig::AdaptiveWithDisplay { .. } => {
+                    // No validation needed for adaptive thinking
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create a simple message request with sensible defaults.
+    ///
+    /// This is a convenience method for creating basic message requests without
+    /// needing to specify all parameters explicitly.
+    pub fn simple(prompt: impl Into<MessageParam>, model: impl Into<Model>) -> Self {
+        Self::new(
+            1024, // Reasonable default for max_tokens
+            vec![prompt.into()],
+            model.into(),
+        )
+    }
+
+    /// Create a simple streaming message request with sensible defaults.
+    pub fn simple_streaming(prompt: impl Into<MessageParam>, model: impl Into<Model>) -> Self {
+        Self::new_streaming(
+            1024, // Reasonable default for max_tokens
+            vec![prompt.into()],
+            model.into(),
+        )
+    }
+
+    /// Add a single message to the parameters.
+    pub fn with_message(mut self, message: impl Into<MessageParam>) -> Self {
+        self.messages.push(message.into());
+        self
+    }
+
+    /// Add multiple messages to the parameters.
+    pub fn with_messages(
+        mut self,
+        messages: impl IntoIterator<Item = impl Into<MessageParam>>,
+    ) -> Self {
+        self.messages.extend(messages.into_iter().map(|m| m.into()));
+        self
+    }
+
+    /// Check if this request requires the structured outputs beta header.
+    ///
+    /// Returns `true` if any of:
+    /// - `output_format` is set (for JSON outputs)
+    /// - `output_config.format` is set (for JSON outputs via new config)
+    /// - Any tool has `strict: true` (for strict tool use)
+    ///
+    /// When this returns `true`, the client should include the
+    /// `anthropic-beta: structured-outputs-2025-11-13` header.
+    pub fn requires_structured_outputs_beta(&self) -> bool {
+        // Check if output_format is set
+        if self.output_format.is_some() {
+            return true;
+        }
+
+        // Check if output_config has a format set
+        if let Some(ref config) = self.output_config
+            && config.format.is_some()
+        {
+            return true;
+        }
+
+        // Check if any tool has strict mode enabled
+        if let Some(ref tools) = self.tools {
+            for tool in tools {
+                if tool.is_strict() {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Check whether this request uses the beta progress-update display mode.
+    pub fn requires_thinking_display_updates_beta(&self) -> bool {
+        self.thinking.as_ref().and_then(ThinkingConfig::display) == Some(ThinkingDisplay::Updates)
+    }
+}
+
+impl Default for MessageCreateParams {
+    fn default() -> Self {
+        use crate::types::KnownModel;
+
+        Self {
+            max_tokens: 1024,
+            messages: vec![],
+            model: Model::Known(KnownModel::Claude37SonnetLatest),
+            cache_control: None,
+            metadata: None,
+            output_format: None,
+            output_config: None,
+            stop_sequences: None,
+            system: None,
+            temperature: None,
+            thinking: None,
+            tool_choice: None,
+            tools: None,
+            top_k: None,
+            top_p: None,
+            fallbacks: None,
+            fallback_credit_token: None,
+            stream: false,
+            betas: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        ContentBlock, Effort, KnownModel, MessageRole, OutputConfig, ToolResultBlock,
+    };
+    use serde_json::{json, to_value};
+
+    #[test]
+    fn message_create_params_non_streaming() {
+        let message = MessageParam::new_with_string("Hello, Claude".to_string(), MessageRole::User);
+
+        let params = MessageCreateParams::new(
+            1000,
+            vec![message],
+            Model::Known(KnownModel::Claude37Sonnet20250219),
+        )
+        .with_system_string("You are a helpful assistant.".to_string())
+        .with_temperature(0.125)
+        .unwrap();
+
+        let json = to_value(&params).unwrap();
+        assert!(!params.stream);
+
+        assert_eq!(
+            json,
+            json!({
+                "max_tokens": 1000,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Hello, Claude"
+                    }
+                ],
+                "model": "claude-3-7-sonnet-20250219",
+                "system": "You are a helpful assistant.",
+                "temperature": 0.125,
+                "stream": false
+            })
+        );
+    }
+
+    #[test]
+    fn message_create_params_streaming() {
+        let message = MessageParam::new_with_string("Hello, Claude".to_string(), MessageRole::User);
+
+        let params = MessageCreateParams::new_streaming(
+            1000,
+            vec![message],
+            Model::Known(KnownModel::Claude37Sonnet20250219),
+        );
+
+        let json = to_value(&params).unwrap();
+        assert!(params.stream);
+
+        assert_eq!(
+            json,
+            json!({
+                "max_tokens": 1000,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Hello, Claude"
+                    }
+                ],
+                "model": "claude-3-7-sonnet-20250219",
+                "stream": true
+            })
+        );
+    }
+
+    #[test]
+    fn message_create_params_with_stream() {
+        let message = MessageParam::new_with_string("Hello, Claude".to_string(), MessageRole::User);
+
+        let params = MessageCreateParams::new(
+            1000,
+            vec![message],
+            Model::Known(KnownModel::Claude37Sonnet20250219),
+        )
+        .with_stream(true);
+
+        let json = to_value(&params).unwrap();
+        assert!(params.stream);
+
+        assert_eq!(
+            json,
+            json!({
+                "max_tokens": 1000,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Hello, Claude"
+                    }
+                ],
+                "model": "claude-3-7-sonnet-20250219",
+                "stream": true
+            })
+        );
+    }
+
+    #[test]
+    fn message_create_params_simple() {
+        let params = MessageCreateParams::simple("Hello, world!", KnownModel::Claude37SonnetLatest);
+
+        assert_eq!(params.max_tokens, 1024);
+        assert_eq!(params.messages.len(), 1);
+        assert_eq!(params.messages[0].role, MessageRole::User);
+        assert!(!params.stream);
+    }
+
+    #[test]
+    fn message_create_params_simple_streaming() {
+        let params = MessageCreateParams::simple_streaming(
+            "Tell me a joke",
+            KnownModel::Claude37SonnetLatest,
+        );
+
+        assert_eq!(params.max_tokens, 1024);
+        assert_eq!(params.messages.len(), 1);
+        assert!(params.stream);
+    }
+
+    #[test]
+    fn message_create_params_default() {
+        let params = MessageCreateParams::default();
+
+        assert_eq!(params.max_tokens, 1024);
+        assert_eq!(params.messages.len(), 0);
+        assert!(!params.stream);
+    }
+
+    #[test]
+    fn message_create_params_with_message() {
+        let params = MessageCreateParams::default()
+            .with_message("Hello")
+            .with_message(MessageParam::assistant("Hi there"));
+
+        assert_eq!(params.messages.len(), 2);
+        assert_eq!(params.messages[0].role, MessageRole::User);
+        assert_eq!(params.messages[1].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn message_create_params_ergonomic_system() {
+        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+            .with_system("You are a helpful assistant.");
+
+        assert!(params.system.is_some());
+    }
+
+    #[test]
+    fn requires_structured_outputs_beta_with_output_format() {
+        use crate::types::OutputFormat;
+
+        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+            .with_output_format(OutputFormat::json_schema(json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            })));
+
+        assert!(
+            params.requires_structured_outputs_beta(),
+            "params with output_format should require structured outputs beta"
+        );
+    }
+
+    #[test]
+    fn requires_structured_outputs_beta_with_strict_tool() {
+        use crate::types::{ToolParam, ToolUnionParam};
+
+        let tool = ToolParam::new(
+            "get_weather".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "location": { "type": "string" }
+                },
+                "required": ["location"],
+                "additionalProperties": false
+            }),
+        )
+        .with_strict(true);
+
+        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+            .with_tools(vec![ToolUnionParam::CustomTool(tool)]);
+
+        assert!(
+            params.requires_structured_outputs_beta(),
+            "params with strict tool should require structured outputs beta"
+        );
+    }
+
+    #[test]
+    fn requires_structured_outputs_beta_with_non_strict_tool() {
+        use crate::types::{ToolParam, ToolUnionParam};
+
+        let tool = ToolParam::new(
+            "get_weather".to_string(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "location": { "type": "string" }
+                },
+                "required": ["location"]
+            }),
+        );
+
+        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+            .with_tools(vec![ToolUnionParam::CustomTool(tool)]);
+
+        assert!(
+            !params.requires_structured_outputs_beta(),
+            "params with non-strict tool should not require structured outputs beta"
+        );
+    }
+
+    #[test]
+    fn requires_structured_outputs_beta_without_features() {
+        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest);
+
+        assert!(
+            !params.requires_structured_outputs_beta(),
+            "params without output_format or strict tools should not require structured outputs beta"
+        );
+    }
+
+    #[test]
+    fn requires_structured_outputs_beta_with_output_config() {
+        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+            .with_output_config(OutputConfig::new().with_format(OutputFormat::json_schema(
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" }
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }),
+            )));
+
+        assert!(
+            params.requires_structured_outputs_beta(),
+            "params with output_config.format should require structured outputs beta"
+        );
+    }
+
+    #[test]
+    fn requires_structured_outputs_beta_with_output_config_effort_only() {
+        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+            .with_output_config(OutputConfig::new().with_effort(Effort::High));
+
+        assert!(
+            !params.requires_structured_outputs_beta(),
+            "params with output_config effort only should not require structured outputs beta"
+        );
+    }
+
+    #[test]
+    fn with_output_config_builder() {
+        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+            .with_output_config(OutputConfig::new().with_effort(Effort::High));
+
+        assert!(params.output_config.is_some());
+    }
+
+    #[test]
+    fn message_create_params_serializes_tool_result_messages_without_duplicate_type() {
+        let message = MessageParam::new_with_blocks(
+            vec![ContentBlock::ToolResult(
+                ToolResultBlock::new("toolu_123".to_string()).with_string_content("ok".to_string()),
+            )],
+            MessageRole::User,
+        );
+
+        let params = MessageCreateParams::new(
+            1000,
+            vec![message],
+            Model::Known(KnownModel::Claude37Sonnet20250219),
+        );
+
+        let json = to_value(&params).unwrap();
+        assert_eq!(
+            json,
+            json!({
+                "max_tokens": 1000,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_123",
+                                "content": "ok"
+                            }
+                        ]
+                    }
+                ],
+                "model": "claude-3-7-sonnet-20250219",
+                "stream": false
+            })
+        );
+    }
+
+    #[test]
+    fn with_betas_sets_betas() {
+        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+            .with_betas(["compact-2026-01-12", "some-other-beta"]);
+
+        assert_eq!(
+            params.betas,
+            Some(vec![
+                "compact-2026-01-12".to_string(),
+                "some-other-beta".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn with_beta_appends() {
+        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+            .with_beta("compact-2026-01-12")
+            .with_beta("some-other-beta");
+
+        assert_eq!(
+            params.betas,
+            Some(vec![
+                "compact-2026-01-12".to_string(),
+                "some-other-beta".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn betas_not_serialized() {
+        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+            .with_beta("compact-2026-01-12");
+
+        let json = to_value(&params).unwrap();
+        assert!(
+            json.get("betas").is_none(),
+            "betas should not appear in serialized JSON"
+        );
+    }
+
+    #[test]
+    fn fallbacks_none_by_default() {
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable5);
+        assert_eq!(params.fallbacks, None);
+
+        // Omitted from serialized JSON when unset.
+        let json = to_value(&params).unwrap();
+        assert!(json.get("fallbacks").is_none());
+    }
+
+    #[test]
+    fn with_fallbacks_replaces() {
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable5)
+            .with_fallbacks([KnownModel::ClaudeSonnet45, KnownModel::ClaudeHaiku45]);
+
+        assert_eq!(
+            params.fallbacks,
+            Some(Fallbacks::Models(vec![
+                FallbackConfig::new(KnownModel::ClaudeSonnet45),
+                FallbackConfig::new(KnownModel::ClaudeHaiku45),
+            ]))
+        );
+    }
+
+    #[test]
+    fn with_fallback_appends_in_order() {
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable5)
+            .with_fallback(KnownModel::ClaudeSonnet45)
+            .with_fallback(KnownModel::ClaudeHaiku45);
+
+        assert_eq!(
+            params.fallbacks,
+            Some(Fallbacks::Models(vec![
+                FallbackConfig::new(KnownModel::ClaudeSonnet45),
+                FallbackConfig::new(KnownModel::ClaudeHaiku45),
+            ]))
+        );
+    }
+
+    #[test]
+    fn fallbacks_serialization() {
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable5)
+            .with_fallbacks([KnownModel::ClaudeSonnet45]);
+
+        let json = to_value(&params).unwrap();
+        assert_eq!(
+            json.get("fallbacks").unwrap(),
+            &json!([{ "model": "claude-sonnet-4-5" }])
+        );
+    }
+
+    #[test]
+    fn fallbacks_deserialization() {
+        let json = json!({
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "Hello" }],
+            "model": "claude-fable-5",
+            "stream": false,
+            "fallbacks": [
+                { "model": "claude-sonnet-4-5" },
+                { "model": "claude-haiku-4-5" }
+            ]
+        });
+
+        let params: MessageCreateParams = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            params.fallbacks,
+            Some(Fallbacks::Models(vec![
+                FallbackConfig::new(KnownModel::ClaudeSonnet45),
+                FallbackConfig::new(KnownModel::ClaudeHaiku45),
+            ]))
+        );
+    }
+
+    #[test]
+    fn default_fallbacks_serialization() {
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable51)
+            .with_default_fallbacks();
+        assert_eq!(to_value(params).unwrap()["fallbacks"], json!("default"));
+    }
+}

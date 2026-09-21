@@ -1,0 +1,537 @@
+//! Interactive chat application for conversing with Claude.
+//!
+//! This binary provides a streaming REPL interface for chatting with Claude
+//! models via the Anthropic API.
+//!
+//! # Usage
+//!
+//! ```bash
+//! # Basic usage with default settings
+//! claudius-chat
+//!
+//! # Specify a model
+//! claudius-chat --model claude-sonnet-4-0
+//!
+//! # Set a system prompt
+//! claudius-chat --system "You are a helpful coding assistant"
+//!
+//! # Disable colors (useful for piping output)
+//! claudius-chat --no-color
+//! ```
+//!
+//! # Commands
+//!
+//! While chatting, you can use slash commands:
+//! - `/help` - Show available commands
+//! - `/clear` - Clear conversation history
+//! - `/model <name>` - Change the model
+//! - `/system [prompt]` - Set or clear system prompt
+//! - `/stats` - Show session statistics
+//! - `/quit` - Exit the application
+
+use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use arrrg::CommandLine;
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
+
+use claudius::chat::{
+    ChatAgent, ChatArgs, ChatCommand, ChatConfig, ChatSession, PlainTextRenderer, help_text,
+    parse_command,
+};
+use claudius::{Anthropic, Effort, Model, StopReason, ThinkingConfig, ThinkingDisplay};
+use claudius::{OperatorLine, Renderer, StreamContext};
+
+struct ChatTerminal {
+    editor: DefaultEditor,
+    renderer: PlainTextRenderer,
+}
+
+impl ChatTerminal {
+    fn new(
+        use_color: bool,
+        interrupted: Arc<AtomicBool>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            editor: DefaultEditor::new()?,
+            renderer: PlainTextRenderer::with_color_and_interrupt(use_color, interrupted),
+        })
+    }
+
+    fn read_line(&mut self, prompt: &str) -> io::Result<OperatorLine> {
+        match self.editor.readline(prompt) {
+            Ok(line) => Ok(OperatorLine::Line(line)),
+            Err(ReadlineError::Interrupted) => Ok(OperatorLine::Interrupted),
+            Err(ReadlineError::Eof) => Ok(OperatorLine::Eof),
+            Err(err) => Err(io::Error::other(err.to_string())),
+        }
+    }
+
+    fn add_history_entry(&mut self, line: &str) {
+        let _ = self.editor.add_history_entry(line);
+    }
+}
+
+impl Renderer for ChatTerminal {
+    fn start_agent(&mut self, context: &dyn StreamContext) {
+        self.renderer.start_agent(context);
+    }
+
+    fn finish_agent(&mut self, context: &dyn StreamContext, stop_reason: Option<&StopReason>) {
+        self.renderer.finish_agent(context, stop_reason);
+    }
+
+    fn print_text(&mut self, context: &dyn StreamContext, text: &str) {
+        self.renderer.print_text(context, text);
+    }
+
+    fn print_thinking(&mut self, context: &dyn StreamContext, text: &str) {
+        self.renderer.print_thinking(context, text);
+    }
+
+    fn print_error(&mut self, context: &dyn StreamContext, error: &str) {
+        self.renderer.print_error(context, error);
+    }
+
+    fn print_info(&mut self, context: &dyn StreamContext, info: &str) {
+        self.renderer.print_info(context, info);
+    }
+
+    fn start_tool_use(&mut self, context: &dyn StreamContext, name: &str, id: &str) {
+        self.renderer.start_tool_use(context, name, id);
+    }
+
+    fn print_tool_input(&mut self, context: &dyn StreamContext, partial_json: &str) {
+        self.renderer.print_tool_input(context, partial_json);
+    }
+
+    fn finish_tool_use(&mut self, context: &dyn StreamContext) {
+        self.renderer.finish_tool_use(context);
+    }
+
+    fn start_tool_result(
+        &mut self,
+        context: &dyn StreamContext,
+        tool_use_id: &str,
+        is_error: bool,
+    ) {
+        self.renderer
+            .start_tool_result(context, tool_use_id, is_error);
+    }
+
+    fn print_tool_result_text(&mut self, context: &dyn StreamContext, text: &str) {
+        self.renderer.print_tool_result_text(context, text);
+    }
+
+    fn finish_tool_result(&mut self, context: &dyn StreamContext) {
+        self.renderer.finish_tool_result(context);
+    }
+
+    fn finish_response(&mut self, context: &dyn StreamContext) {
+        self.renderer.finish_response(context);
+    }
+
+    fn print_interrupted(&mut self, context: &dyn StreamContext) {
+        self.renderer.print_interrupted(context);
+    }
+
+    fn should_interrupt(&self) -> bool {
+        self.renderer.should_interrupt()
+    }
+
+    fn read_operator_line(&mut self, prompt: &str) -> io::Result<Option<OperatorLine>> {
+        self.read_line(prompt).map(Some)
+    }
+}
+
+/// Main entry point for the claudius-chat application.
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (args, _) = ChatArgs::from_command_line_relaxed("claudius-chat [OPTIONS]");
+    let config = ChatConfig::try_from(args)?;
+    let use_color = config.use_color;
+
+    let client = Anthropic::new(None)?;
+    let mut session = ChatSession::new(client, config);
+
+    // Flag for interrupt handling during streaming
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let mut terminal = ChatTerminal::new(use_color, interrupted.clone())?;
+    let context = ();
+
+    // Set up Ctrl+C handler
+    let interrupted_clone = interrupted.clone();
+    ctrlc::set_handler(move || {
+        interrupted_clone.store(true, Ordering::Relaxed);
+    })?;
+
+    println!("Claude Chat (model: {})", session.config().model());
+    println!("Type /help for commands, /quit to exit\n");
+
+    loop {
+        // Reset interrupt flag before each input
+        interrupted.store(false, Ordering::Relaxed);
+
+        match terminal.read_line("You: ") {
+            Ok(OperatorLine::Line(line)) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+
+                terminal.add_history_entry(line);
+
+                // Check for slash commands
+                if let Some(cmd) = parse_command(line) {
+                    match cmd {
+                        ChatCommand::Quit => {
+                            println!("Goodbye!");
+                            break;
+                        }
+                        ChatCommand::Clear => {
+                            session.clear();
+                            terminal.print_info(&context, "Conversation cleared.");
+                        }
+                        ChatCommand::Help => {
+                            for line in help_text().lines() {
+                                println!("    {}", line);
+                            }
+                        }
+                        ChatCommand::Model(model_name) => {
+                            let model = model_name
+                                .parse()
+                                .unwrap_or_else(|_| Model::Custom(model_name.clone()));
+                            session.template_mut().model = Some(model);
+                            terminal
+                                .print_info(&context, &format!("Model changed to: {}", model_name));
+                        }
+                        ChatCommand::System(message) => {
+                            session.insert_system_message(message.clone());
+                            terminal.print_info(
+                                &context,
+                                &format!("System message inserted: {}", message),
+                            );
+                        }
+                        ChatCommand::MaxTokens(value) => {
+                            session.template_mut().max_tokens = Some(value);
+                            terminal.print_info(&context, &format!("max_tokens set to {value}"));
+                        }
+                        ChatCommand::Temperature(value) => {
+                            session.template_mut().temperature = Some(value);
+                            terminal
+                                .print_info(&context, &format!("temperature set to {:.2}", value));
+                        }
+                        ChatCommand::ClearTemperature => {
+                            session.template_mut().temperature = None;
+                            terminal.print_info(&context, "temperature reset to model default");
+                        }
+                        ChatCommand::TopP(value) => {
+                            session.template_mut().top_p = Some(value);
+                            terminal.print_info(&context, &format!("top_p set to {:.2}", value));
+                        }
+                        ChatCommand::ClearTopP => {
+                            session.template_mut().top_p = None;
+                            terminal.print_info(&context, "top_p reset to model default");
+                        }
+                        ChatCommand::TopK(value) => {
+                            session.template_mut().top_k = Some(value);
+                            terminal.print_info(&context, &format!("top_k set to {value}"));
+                        }
+                        ChatCommand::ClearTopK => {
+                            session.template_mut().top_k = None;
+                            terminal.print_info(&context, "top_k reset to model default");
+                        }
+                        ChatCommand::AddStopSequence(sequence) => {
+                            let stop_sequences = session
+                                .template_mut()
+                                .stop_sequences
+                                .get_or_insert_with(Vec::new);
+                            if !stop_sequences.iter().any(|s| s == &sequence) {
+                                stop_sequences.push(sequence.clone());
+                            }
+                            terminal
+                                .print_info(&context, &format!("Added stop sequence: {sequence}"));
+                        }
+                        ChatCommand::ClearStopSequences => {
+                            session.template_mut().stop_sequences = None;
+                            terminal.print_info(&context, "Stop sequences cleared.");
+                        }
+                        ChatCommand::ListStopSequences => {
+                            let sequences =
+                                session.template().stop_sequences.as_deref().unwrap_or(&[]);
+                            print_stop_sequences(sequences);
+                        }
+                        ChatCommand::Thinking(budget) => {
+                            session.config_mut().set_thinking_budget(budget);
+                            match budget {
+                                Some(tokens) => {
+                                    terminal.print_info(
+                                        &context,
+                                        &format!(
+                                            "Extended thinking enabled with {} token budget.",
+                                            tokens
+                                        ),
+                                    );
+                                }
+                                None => {
+                                    terminal.print_info(&context, "Extended thinking disabled.");
+                                }
+                            }
+                        }
+                        ChatCommand::ThinkingAdaptive => {
+                            let effort = session.config().effort();
+                            session.config_mut().set_thinking_adaptive(effort);
+                            terminal.print_info(&context, "Adaptive thinking enabled.");
+                        }
+                        ChatCommand::Effort(effort) => {
+                            session.config_mut().set_effort(Some(effort));
+                            let label = describe_effort(effort);
+                            terminal.print_info(&context, &format!("Effort level set to {label}."));
+                        }
+                        ChatCommand::ClearEffort => {
+                            session.config_mut().set_effort(None);
+                            terminal.print_info(&context, "Effort level cleared.");
+                        }
+                        ChatCommand::Spend(dollars) => {
+                            session.set_session_spend(Some(dollars));
+                            terminal.print_info(
+                                &context,
+                                &format!("Session spend limit set to ${dollars:.2}."),
+                            );
+                        }
+                        ChatCommand::ClearSpend => {
+                            session.set_session_spend(None);
+                            terminal.print_info(&context, "Session spend limit cleared.");
+                        }
+                        ChatCommand::Caching(enabled) => {
+                            session.config_mut().caching_enabled = enabled;
+                            if enabled {
+                                terminal.print_info(&context, "Prompt caching enabled.");
+                            } else {
+                                terminal.print_info(&context, "Prompt caching disabled.");
+                            }
+                        }
+                        ChatCommand::TranscriptPath(path) => {
+                            session.config_mut().transcript_path = Some(PathBuf::from(&path));
+                            terminal.print_info(
+                                &context,
+                                &format!("Transcript auto-save set to {}", path),
+                            );
+                        }
+                        ChatCommand::ClearTranscriptPath => {
+                            session.config_mut().transcript_path = None;
+                            terminal.print_info(&context, "Transcript auto-save disabled.");
+                        }
+                        ChatCommand::SaveTranscript(path) => {
+                            match session.save_transcript_to(&path) {
+                                Ok(_) => terminal
+                                    .print_info(&context, &format!("Transcript saved to {}", path)),
+                                Err(err) => terminal.print_error(
+                                    &context,
+                                    &format!("Failed to save transcript: {}", err),
+                                ),
+                            }
+                        }
+                        ChatCommand::LoadTranscript(path) => {
+                            match session.load_transcript_from(&path) {
+                                Ok(_) => terminal.print_info(
+                                    &context,
+                                    &format!("Transcript loaded from {}", path),
+                                ),
+                                Err(err) => terminal.print_error(
+                                    &context,
+                                    &format!("Failed to load transcript: {}", err),
+                                ),
+                            }
+                        }
+                        ChatCommand::Stats => {
+                            print_stats(&session);
+                        }
+                        ChatCommand::ShowConfig => {
+                            print_config(&session);
+                        }
+                        ChatCommand::Invalid(message) => {
+                            terminal.print_error(&context, &message);
+                        }
+                    }
+                    continue;
+                }
+
+                // Regular message - send to API
+                println!("Claude:");
+                let message = claudius::MessageParam::user(line);
+                if let Err(e) = session.send_message(message, &mut terminal).await {
+                    terminal.print_error(&context, &e.to_string());
+                }
+            }
+            Ok(OperatorLine::Interrupted) => {
+                // Ctrl+C at prompt - soft interrupt
+                println!();
+                continue;
+            }
+            Ok(OperatorLine::Eof) => {
+                // Ctrl+D - exit
+                println!("\nGoodbye!");
+                break;
+            }
+            Err(err) => {
+                terminal.print_error(&context, &format!("Input error: {}", err));
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_stats<A: ChatAgent>(session: &ChatSession<A>) {
+    let stats = session.stats();
+    println!("    Session Statistics:");
+    println!("      Model: {}", stats.model);
+    println!("      Messages: {}", stats.message_count);
+    println!("      Max tokens: {}", stats.max_tokens);
+    println!("      Temperature: {}", describe_float(stats.temperature));
+    println!("      Top-p: {}", describe_float(stats.top_p));
+    println!("      Top-k: {}", describe_top_k(stats.top_k));
+    if let Some(prompt) = stats.system_prompt.as_deref() {
+        println!("      System prompt: {}", prompt);
+    } else {
+        println!("      System prompt: (none)");
+    }
+    println!("      Thinking: {}", describe_thinking(&stats));
+    print_stop_sequences(&stats.stop_sequences);
+    println!(
+        "      Total tokens: {} in / {} out{} ({} requests)",
+        stats.total_input_tokens,
+        stats.total_output_tokens,
+        describe_thinking_token_suffix(stats.total_thinking_tokens),
+        stats.total_requests
+    );
+    if stats.caching_enabled {
+        println!(
+            "      Cache tokens: {} created / {} read",
+            stats.total_cache_creation_tokens, stats.total_cache_read_tokens
+        );
+    }
+    if let Some(input) = stats.last_turn_input_tokens {
+        let output = stats.last_turn_output_tokens.unwrap_or(0);
+        println!(
+            "      Last turn tokens: {input} in / {output} out{}",
+            describe_thinking_token_suffix(stats.last_turn_thinking_tokens)
+        );
+    }
+    if let Some(limit) = stats.session_spend_micro_cents {
+        let spent = stats.spend_used_micro_cents as f64 / 100_000_000.0;
+        let total = limit as f64 / 100_000_000.0;
+        let remaining = limit.saturating_sub(stats.spend_used_micro_cents) as f64 / 100_000_000.0;
+        println!("      Spend limit: ${spent:.4}/${total:.2} (${remaining:.4} remaining)");
+    } else {
+        println!("      Spend limit: (not set)");
+    }
+    match stats.transcript_path {
+        Some(ref path) => println!("      Transcript file: {}", path.display()),
+        None => println!("      Transcript file: (disabled)"),
+    }
+}
+
+fn print_config<A: ChatAgent>(session: &ChatSession<A>) {
+    let stats = session.stats();
+    println!("    Current Configuration:");
+    println!("      Model: {}", stats.model);
+    println!("      Max tokens: {}", stats.max_tokens);
+    println!("      Temperature: {}", describe_float(stats.temperature));
+    println!("      Top-p: {}", describe_float(stats.top_p));
+    println!("      Top-k: {}", describe_top_k(stats.top_k));
+    println!("      Thinking: {}", describe_thinking(&stats));
+    println!(
+        "      Caching: {}",
+        if stats.caching_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if let Some(prompt) = stats.system_prompt.as_deref() {
+        println!("      System prompt: {}", prompt);
+    } else {
+        println!("      System prompt: (none)");
+    }
+    print_stop_sequences(&stats.stop_sequences);
+    match stats.transcript_path {
+        Some(ref path) => println!("      Transcript file: {}", path.display()),
+        None => println!("      Transcript file: (disabled)"),
+    }
+}
+
+fn print_stop_sequences(stop_sequences: &[String]) {
+    if stop_sequences.is_empty() {
+        println!("      Stop sequences: (none)");
+    } else {
+        println!("      Stop sequences:");
+        for seq in stop_sequences {
+            println!("        - {}", seq);
+        }
+    }
+}
+
+fn describe_thinking(stats: &claudius::chat::SessionStats) -> String {
+    match stats.thinking_config {
+        Some(ThinkingConfig::Adaptive | ThinkingConfig::AdaptiveWithDisplay { .. }) => {
+            let effort = stats.effort.map(describe_effort).unwrap_or("default");
+            format!(
+                "adaptive (effort: {effort}{})",
+                describe_display(stats.thinking_config.and_then(|config| config.display()))
+            )
+        }
+        Some(
+            ThinkingConfig::Enabled { budget_tokens }
+            | ThinkingConfig::EnabledWithDisplay { budget_tokens, .. },
+        ) => {
+            format!(
+                "enabled ({budget_tokens} tokens{})",
+                describe_display(stats.thinking_config.and_then(|config| config.display()))
+            )
+        }
+        Some(ThinkingConfig::Disabled) | None => "disabled".to_string(),
+    }
+}
+
+fn describe_effort(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::XHigh => "xhigh",
+        Effort::Max => "max",
+    }
+}
+
+fn describe_display(display: Option<ThinkingDisplay>) -> &'static str {
+    match display {
+        Some(ThinkingDisplay::Summarized) => ", display: summarized",
+        Some(ThinkingDisplay::Omitted) => ", display: omitted",
+        Some(ThinkingDisplay::Updates) => ", display: updates",
+        None => "",
+    }
+}
+
+fn describe_thinking_token_suffix(thinking_tokens: Option<u64>) -> String {
+    thinking_tokens
+        .map(|tokens| format!(" ({tokens} thinking)"))
+        .unwrap_or_default()
+}
+
+fn describe_float(value: Option<f32>) -> String {
+    value
+        .map(|v| format!("{v:.2}"))
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn describe_top_k(value: Option<u32>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "default".to_string())
+}

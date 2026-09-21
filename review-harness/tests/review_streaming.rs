@@ -1,0 +1,83 @@
+use bytes::Bytes;
+use claudius::*;
+use futures::{StreamExt, stream};
+use serde_json::json;
+
+fn start() -> MessageStreamEvent {
+    MessageStreamEvent::MessageStart(MessageStartEvent::new(Message::new(
+        "msg_test".into(), vec![], Model::Custom("claude-test".into()), Usage::new(10, 0),
+    )))
+}
+fn text_start() -> MessageStreamEvent {
+    MessageStreamEvent::ContentBlockStart(ContentBlockStartEvent::new(ContentBlock::Text(TextBlock::new("partial")), 0))
+}
+
+#[tokio::test]
+async fn server_tool_json_deltas_must_be_accumulated() {
+    let events = vec![
+        Ok(start()),
+        Ok(MessageStreamEvent::ContentBlockStart(ContentBlockStartEvent::new(
+            ContentBlock::ServerToolUse(ServerToolUseBlock::new("srvtoolu_test", json!({}))), 0))),
+        Ok(MessageStreamEvent::ContentBlockDelta(ContentBlockDeltaEvent::new(
+            ContentBlockDelta::InputJsonDelta(InputJsonDelta::new(r#"{"query":"weather NYC today"}"#.into())), 0))),
+        Ok(MessageStreamEvent::ContentBlockStop(ContentBlockStopEvent::new(0))),
+        Ok(MessageStreamEvent::MessageDelta(MessageDeltaEvent::new(MessageDelta::new().with_stop_reason(StopReason::EndTurn), MessageDeltaUsage::new(20)))),
+        Ok(MessageStreamEvent::MessageStop(MessageStopEvent::new())),
+    ];
+    let (mut events, message) = AccumulatingStream::new(stream::iter(events));
+    while let Some(event) = events.next().await { event.unwrap(); }
+    let message = message.await.unwrap().unwrap();
+    assert_eq!(serde_json::to_value(&message.content[0]).unwrap()["input"], json!({"query":"weather NYC today"}));
+}
+
+#[tokio::test]
+async fn eof_without_message_stop_must_not_succeed() {
+    let (mut events, message) = AccumulatingStream::new(stream::iter(vec![Ok(start()), Ok(text_start())]));
+    while let Some(event) = events.next().await { event.unwrap(); }
+    let result = message.await.unwrap();
+    assert!(result.is_err(), "truncated response was accepted: {result:?}");
+}
+
+#[tokio::test]
+async fn stream_error_must_reach_final_message_receiver() {
+    let (mut events, message) = AccumulatingStream::new(stream::iter(vec![Ok(start()), Ok(text_start()), Err(Error::timeout("connection stalled", None))]));
+    while events.next().await.is_some() {}
+    let result = message.await.unwrap();
+    assert!(result.is_err(), "failed response was accepted: {result:?}");
+}
+
+#[tokio::test]
+async fn crlf_is_a_valid_sse_line_ending() {
+    let bytes = stream::iter(vec![Ok(Bytes::from_static(b"event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n"))]);
+    let events: Vec<_> = process_message_stream_sse(bytes).collect().await;
+    assert_eq!(events.len(), 1, "valid SSE frame silently discarded");
+    assert!(matches!(events[0], Ok(MessageStreamEvent::Ping)));
+}
+
+#[tokio::test]
+async fn incomplete_utf8_at_eof_must_terminate_after_error() {
+    let bytes = stream::iter(vec![Ok(Bytes::from_static(&[0xe2, 0x82]))]);
+    let events = process_sse(bytes);
+    futures::pin_mut!(events);
+    assert!(events.next().await.unwrap().is_err());
+    assert!(events.next().await.is_none(), "EOF error repeats indefinitely");
+}
+
+#[tokio::test]
+async fn oversized_buffer_must_terminate_after_error() {
+    let bytes = stream::iter(vec![Ok(Bytes::from(vec![b'x'; 1024 * 1024 + 1]))]);
+    let events = process_sse(bytes);
+    futures::pin_mut!(events);
+    assert!(events.next().await.unwrap().is_err());
+    assert!(events.next().await.is_none(), "buffer limit error repeats indefinitely");
+}
+
+#[tokio::test]
+async fn slow_consumer_must_still_receive_buffered_events() {
+    let bytes = stream::iter(vec![Ok(Bytes::from_static(b"event: ping\ndata: {}\n\nevent: ping\ndata: {}\n\n"))]);
+    let events = process_sse(bytes);
+    futures::pin_mut!(events);
+    assert!(events.next().await.unwrap().is_ok());
+    tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+    assert!(events.next().await.unwrap().is_ok(), "consumer processing time falsely treated as network inactivity");
+}

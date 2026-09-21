@@ -1,0 +1,62 @@
+[package]
+name = "claudius"
+version = "0.33.0"
+authors = ["Robert Escriva <robert@rescrv.net>"]
+edition = "2024"
+description = "SDK for the Anthropic API"
+license = "Apache-2.0"
+repository = "https://github.com/rescrv/claudius"
+
+[features]
+default = ["binaries", "native-tls"]
+
+binaries = []
+
+rustls-tls = ["reqwest/rustls"]
+native-tls = ["reqwest/native-tls"]
+
+[dependencies]
+async-trait = "0.1.89"
+base64 = "0.22.1"
+bytes = "1.11.1"
+ctrlc = { version = "3.5.2", features = ["termination"] }
+futures = "0.3.32"
+getopts = "0.2.24"
+libc = "0.2.186"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "stream"] }
+rustyline = "18.0.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
+serde_yaml = "0.9.34"
+time = { version = "0.3.47", features = ["serde", "macros", "formatting", "parsing"] }
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["codec"] }
+url = "2.5.8"
+
+arrrg = "0.10.0"
+arrrg_derive = "0.10.0"
+biometrics = "0.14.0"
+utf8path = "0.11.0"
+
+[[bin]]
+name = "median-text"
+path = "src/bin/median-text.rs"
+required-features=["binaries"]
+
+[[bin]]
+name = "claudius-prompt"
+path = "src/bin/claudius-prompt.rs"
+required-features=["binaries"]
+
+[[bin]]
+name = "claudius-chat"
+path = "src/bin/claudius-chat.rs"
+required-features=["binaries"]
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["full", "test-util", "macros"] }
+tokio-test = "0.4.5"
+
+[[example]]
+name = "retry_example"
+path = "examples/retry_example.rs"
