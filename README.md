@@ -1,697 +1,351 @@
 # Claudius
 
-![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
-![Version](https://img.shields.io/badge/version-0.33.0-green.svg)
-
-Claudius is a comprehensive Rust SDK for the Anthropic API, providing both low-level API access and a 
-powerful agent framework for building AI-powered applications. This library enables seamless integration 
-with Claude through direct API calls, streaming responses, and high-level agent abstractions with built-in 
-tool support for filesystem operations, shell commands, and custom integrations.
-
-## Quick Example
-
-```rust
-use claudius::{
-    Anthropic, ContentBlock, KnownModel, MessageCreateParams, 
-    MessageParam, MessageRole, Model, TextBlock,
-};
-use tokio;
-
-#[tokio::main]
-async fn main() -> claudius::Result<()> {
-    // Initialize the client (uses CLAUDIUS_API_KEY or ANTHROPIC_API_KEY environment variable)
-    let client = Anthropic::new(None)?;
-
-    // Create a message from the user
-    let message = MessageParam::new_with_string(
-        "Explain the significance of the name 'Claudius' in Roman history.",
-        MessageRole::User,
-    );
-
-    // Set up request parameters
-    let params = MessageCreateParams::new(
-        1000, // max tokens
-        vec![message],
-        Model::Known(KnownModel::ClaudeOpus5),
-    )
-    .with_system_string("You are Claude, an AI assistant made by Anthropic.".to_string());
-
-    // Send the request
-    let response = client.send(params).await?;
-
-    // Process the response
-    if let Some(content) = response.content.first() {
-        match content {
-            ContentBlock::Text(TextBlock { text, .. }) => {
-                println!("Claude's response: {}", text);
-            }
-            _ => println!("Received non-text content block"),
-        }
-    }
-
-    Ok(())
-}
-```
-
-## Features
-
-- **Complete API Coverage**: Access all of Anthropic's AI capabilities through Claude
-- **Agent Framework**: High-level abstractions for building AI-powered applications with state management
-- **Built-in Tools**: Filesystem operations, shell commands, text editing, and web search capabilities
-- **Budget System**: Token allocation and tracking for cost control and resource management
-- **Streaming Support**: Real-time streaming for conversational applications
-- **Prompt Testing Framework**: Comprehensive testing utilities for prompts with assertions and configurable test vectors
-- **Command Line Tools**: Ready-to-use binaries for prompt testing and text processing
-- **Strongly Typed**: Take advantage of Rust's type system for predictable API interactions
-- **Async First**: Built with async/await for efficient I/O operations
-- **Error Handling**: Comprehensive error types for robust application development
-- **Extensible**: Modular design with builder patterns and trait-based tool system
-
-## Installation
-
-Add Claudius to your `Cargo.toml`:
+A typed Rust client for the Anthropic Messages API: requests and responses for the current
+Claude models, streaming, tools (including server-side web search), prompt caching, Message
+Batches, files, cost accounting, and monitoring.
 
 ```toml
 [dependencies]
-claudius = "0.33.0"
+claudius = { version = "0.33.0", default-features = false, features = ["rustls-tls"] }
 ```
 
-## Authentication
+The default feature is `native-tls`; pick `rustls-tls` instead to avoid OpenSSL.
 
-Claudius uses the Anthropic API key for authentication. You can provide it in two ways:
+## Client
 
-1. Set the `ANTHROPIC_API_KEY` environment variable:
+`Anthropic::new(None)` reads `CLAUDIUS_API_KEY`, then `ANTHROPIC_API_KEY`. A value of the form
+`file:///path` is read from that file. The base URL comes from `CLAUDIUS_BASE_URL` or
+`ANTHROPIC_BASE_URL` when set; pass it without the `/v1/` suffix.
 
-```bash
-export ANTHROPIC_API_KEY="your-api-key"
-```
+```rust,no_run
+use std::time::Duration;
 
-2. Provide it directly when creating the client:
+use claudius::{Anthropic, KnownModel, MessageCreateParams};
 
-```rust
-let client = Anthropic::new(Some("your-api-key".to_string()))?;
-```
+#[tokio::main]
+async fn main() -> claudius::Result<()> {
+    let client = Anthropic::new(None)?
+        .with_max_retries(3)
+        .with_timeout(Duration::from_secs(120))?;
 
-## Usage
+    let params = MessageCreateParams::simple("Name three Roman emperors.", KnownModel::ClaudeHaiku55)
+        .with_system("Answer in one line.");
+    let message = client.send(params).await?;
 
-### Basic Chat
-
-```rust
-// Create a client
-let client = Anthropic::new(None)?; // Uses CLAUDIUS_API_KEY env var and falls back to ANTHROPIC_API_KEY
-
-// Create a user message
-let message = MessageParam::new_with_string(
-    "What are three interesting facts about rust programming language?",
-    MessageRole::User,
-);
-
-// Set up request parameters
-let params = MessageCreateParams::new(
-    1000, // max_tokens
-    vec![message],
-    Model::Known(KnownModel::ClaudeOpus5),
-)
-.with_system_string("Be concise and informative.".to_string());
-
-// Send the request and get the response
-let response = client.send(params).await?;
-
-// Process the response
-for content in response.content {
-    match content {
-        ContentBlock::Text(text_block) => {
-            println!("{}", text_block.text);
+    for block in &message.content {
+        if let Some(text) = block.as_text() {
+            println!("{}", text.text);
         }
-        _ => println!("Received non-text content block"),
     }
+    println!("{:?}, {} output tokens", message.stop_reason, message.usage.output_tokens);
+    Ok(())
 }
 ```
 
-### Streaming Responses
+## Models
+
+`KnownModel` covers the current models: `ClaudeOpus55`, `ClaudeSonnet55`, `ClaudeHaiku55` and
+`ClaudeFable51`. Any other model ID parses to `Model::Custom`:
 
 ```rust
-// Create streaming request parameters
-let params = MessageCreateParams::new_streaming(
-    1000, // max_tokens
-    vec![message],
-    Model::Known(KnownModel::ClaudeOpus5),
-);
+use claudius::{KnownModel, Model};
 
-// Get a stream of events
-let stream = client.stream(params).await?;
+let model: Model = "claude-opus-5-5".parse().unwrap_or_else(|()| Model::Custom("claude-opus-5-5".into()));
+assert_eq!(model, Model::Known(KnownModel::ClaudeOpus55));
+```
 
-// Pin the stream so it can be polled
+Current models (Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1) reject `thinking: {"type":"enabled"}`. Opus 5.5, Sonnet 5.5 and Fable 5.1 also reject `"disabled"`; Haiku 5.5 rejects it at effort `xhigh` or `max`. `temperature` only accepts 1.0, `top_p` only values >= 0.99, and `top_k` is rejected at any value.
+
+## Streaming
+
+`client.stream` returns raw server-sent events. Wrap them in `AccumulatingStream` to print
+deltas as they arrive and still get the assembled `Message` at the end:
+
+```rust,no_run
+use std::io::Write;
+
+use claudius::{
+    AccumulatingStream, Anthropic, ContentBlockDelta, Error, KnownModel, Message,
+    MessageCreateParams, MessageParam, MessageStreamEvent, Model,
+};
 use futures::StreamExt;
-use tokio::pin;
-pin!(stream);
 
-// Process the stream events
-while let Some(event) = stream.next().await {
-    match event {
-        Ok(event) => {
-            // Handle different event types
-            match event {
-                MessageStreamEvent::ContentBlockDelta(delta) => {
-                    // Process incremental text updates
-                    // ...
-                }
-                // Handle other event types
-                _ => {}
+async fn stream_reply(client: &Anthropic, prompt: &str) -> claudius::Result<Message> {
+    let params = MessageCreateParams::new_streaming(
+        4096,
+        vec![MessageParam::user(prompt)],
+        Model::Known(KnownModel::ClaudeSonnet55),
+    );
+    let events = client.stream(&params).await?;
+    let (mut events, done) = AccumulatingStream::new(events);
+    while let Some(event) = events.next().await {
+        if let MessageStreamEvent::ContentBlockDelta(delta) = event? {
+            if let ContentBlockDelta::TextDelta(text) = delta.delta {
+                print!("{}", text.text);
+                std::io::stdout().flush()?;
             }
         }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-        }
     }
+    done.await
+        .map_err(|_| Error::streaming("stream ended without a final message", None))?
 }
 ```
 
-### Model Selection
+Check `message.stop_reason == Some(StopReason::MaxTokens)` to detect a reply cut off at `max_tokens`.
 
-Claudius supports all Anthropic models via a typed enum:
+## Tools
+
+Custom tools are `ToolUnionParam::CustomTool(ToolParam)` with a JSON schema; the model's calls come
+back as `ContentBlock::ToolUse` and you answer with `ContentBlock::ToolResult`. Set
+`ToolParam::with_strict(true)` to have the input validated against the schema. See
+`examples/streaming-tool-use.rs` for the full loop.
+
+Web search runs on Anthropic's side, so one request returns the searches, their results and the
+cited answer:
 
 ```rust
-// Use a current general-purpose model
-let model = Model::Known(KnownModel::ClaudeOpus5);
+use claudius::{KnownModel, MessageCreateParams, ToolUnionParam, WebSearchTool};
 
-// Use the current speed/intelligence balance
-let model = Model::Known(KnownModel::ClaudeSonnet5);
-
-// Use the newest long-horizon reasoning model
-let model = Model::Known(KnownModel::ClaudeFable51);
-
-// Use a custom model identifier
-let model = Model::Custom("custom-model-identifier".to_string());
+let search = WebSearchTool::new().with_max_uses(5);
+let params = MessageCreateParams::simple_streaming("What changed in Rust 1.90?", KnownModel::ClaudeSonnet55)
+    .with_tools(vec![ToolUnionParam::WebSearch20260318(search)]);
 ```
 
-### Advanced Configuration
+`WebSearchTool20250305` and `ToolUnionParam::WebSearch20250305` remain for callers on the older
+tool version. Web fetch is `ToolUnionParam::WebFetch20260318(WebFetchTool::new())`, with
+`with_response_inclusion(ResponseInclusion::Full)` to control what comes back. Code execution is
+`ToolUnionParam::CodeExecution20260521(CodeExecutionTool::new())`. `examples/server_tools.rs`
+uses all three in one request.
+
+## Structured outputs
+
+`OutputFormat::json_schema` constrains the reply to a JSON schema. Set it through `OutputConfig`;
+no beta header is needed.
 
 ```rust
-// Customize the client
-let client = Anthropic::new(Some("your-api-key".to_string()))?
-    .with_base_url("https://custom-api.example.com".to_string())
-    .with_timeout(std::time::Duration::from_secs(60))?;
+use claudius::{KnownModel, MessageCreateParams, OutputConfig, OutputFormat};
+use serde_json::json;
 
-// Use with Minimax (international)
-let client = Anthropic::new(Some("your-api-key".to_string()))?
-    .with_base_url("https://api.minimax.io/anthropic".to_string());
-
-// Use with Minimax (China)
-let client = Anthropic::new(Some("your-api-key".to_string()))?
-    .with_base_url("https://api.minimaxi.com/anthropic".to_string());
-
-// Configure request parameters
-let params = MessageCreateParams::new(
-    1000, // max_tokens
-    vec![message],
-    model,
-)
-.with_system_string("You are Claude, an AI assistant...".to_string())
-.with_temperature(0.7)
-.with_top_p(0.9)
-.with_top_k(40)
-.with_stop_sequences(vec!["END".to_string()]);
+let schema = json!({"type": "object", "properties": {"summary": {"type": "string"}},
+                    "required": ["summary"], "additionalProperties": false});
+let params = MessageCreateParams::simple("Summarise Rust in one line.", KnownModel::ClaudeHaiku55)
+    .with_output_config(OutputConfig::new().with_format(OutputFormat::json_schema(schema)));
+assert!(params.output_config.is_some());
 ```
 
-## Agent Framework
+## Prompt caching
 
-Claudius provides a powerful agent framework that abstracts away message management, tool integration, and resource budgeting. Agents can be customized with filesystem access, shell commands, and custom tools.
-
-### Basic Agent Usage
+Mark a block with `cache_control` to cache everything up to it, or set top-level `cache_control`
+to let the API place the breakpoint on the last cacheable block (automatic caching).
+`CacheControlEphemeral::new()` lives five minutes; `CacheControlEphemeral::one_hour()` lives an hour:
 
 ```rust
-use claudius::{Agent, Anthropic, Budget, MessageParam, MessageParamContent, MessageRole};
-use std::sync::Arc;
+use claudius::{CacheControlEphemeral, KnownModel, MessageCreateParams, SystemPrompt, TextBlock};
 
-#[tokio::main]
-async fn main() -> claudius::Result<()> {
-    let client = Anthropic::new(None)?;
-    let budget = Arc::new(Budget::new(2048)); // 2048 token budget
-    
-    // Use the unit type as a basic agent
-    let agent = ();
-    
-    // Initialize conversation
-    let mut messages = vec![MessageParam {
-        role: MessageRole::User,
-        content: MessageParamContent::String("Hello! How can you help me today?".to_string()),
-    }];
-    
-    // Let the agent take a turn
-    agent.take_turn(&client, &mut messages, &budget).await?;
-    
-    // Messages now contain the full conversation history
-    println!("Conversation has {} messages", messages.len());
-    
-    Ok(())
-}
+let long_instructions = "...".repeat(2000);
+
+// Explicit breakpoint on the system prompt, kept for one hour.
+let system = SystemPrompt::from_blocks(vec![
+    TextBlock::new(long_instructions).with_cache_control(CacheControlEphemeral::one_hour()),
+]);
+let explicit = MessageCreateParams::simple("Summarise the rules.", KnownModel::ClaudeHaiku55)
+    .with_system(system);
+
+// Automatic caching.
+let automatic = MessageCreateParams::simple("Continue.", KnownModel::ClaudeHaiku55)
+    .with_cache_control(CacheControlEphemeral::new());
 ```
 
-### Custom Agent with Filesystem
+`Usage::cache_creation_input_tokens` and `Usage::cache_read_input_tokens` report writes and hits.
+`Usage::cache_creation` splits the writes into `ephemeral_5m_input_tokens` and
+`ephemeral_1h_input_tokens`, which are priced separately. Reads are billed at the model's
+`TokenRates::cache_read`, a small fraction of the input rate. `examples/cache.rs` checks both
+against the live API.
 
-```rust
-use claudius::{Agent, FileSystem, Anthropic, Budget};
-use utf8path::Path;
+To learn why a request missed the cache, send `with_diagnostics(DiagnosticsRequest::first_turn())`
+and then `DiagnosticsRequest::after(previous_id)` on later turns. The response's
+`diagnostics.cache_miss_reason` names the earliest divergence (`CacheMissReason::is_changed`).
 
-struct MyAgent {
-    root: Path<'static>,
-}
+## Message Batches
 
-#[async_trait::async_trait]
-impl Agent for MyAgent {
-    async fn filesystem(&self) -> Option<&dyn FileSystem> {
-        Some(&self.root) // Path implements FileSystem
-    }
-    
-    async fn system(&self) -> Option<SystemPrompt> {
-        Some(SystemPrompt::from_string(
-            "You are a helpful assistant with access to the filesystem.".to_string()
-        ))
-    }
-}
+Batches cost half as much and finish within 24 hours:
 
-#[tokio::main]
-async fn main() -> claudius::Result<()> {
-    let agent = MyAgent {
-        root: Path::from("./workspace"),
+```rust,no_run
+use claudius::{
+    Anthropic, KnownModel, MessageBatchCreateParams, MessageBatchCreateRequest,
+    MessageBatchProcessingStatus, MessageCreateParams,
+};
+use futures::StreamExt;
+
+async fn run_batch(client: &Anthropic) -> claudius::Result<()> {
+    let ask = |id: &str, q: &str| {
+        MessageBatchCreateRequest::new(id, MessageCreateParams::simple(q, KnownModel::ClaudeHaiku55))
     };
-    
-    let client = Anthropic::new(None)?;
-    let budget = Arc::new(Budget::new(4096));
-    
-    let mut messages = vec![MessageParam {
-        role: MessageRole::User,
-        content: MessageParamContent::String(
-            "Can you search for any .rs files and show me their contents?".to_string()
-        ),
-    }];
-    
-    agent.take_turn(&client, &mut messages, &budget).await?;
-    
+    let requests = vec![ask("a", "2+2?"), ask("b", "3+3?")];
+    let batch = client.create_message_batch(MessageBatchCreateParams::new(requests)).await?;
+
+    while client.retrieve_message_batch(&batch.id).await?.processing_status
+        != MessageBatchProcessingStatus::Ended
+    {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+
+    let results = client.stream_message_batch_results(&batch.id).await?;
+    futures::pin_mut!(results);
+    while let Some(result) = results.next().await {
+        let result = result?;
+        println!("{}: {:?}", result.custom_id, result.result);
+    }
     Ok(())
 }
 ```
 
-### Budget Management
+`KnownModel::cost_micro_cents` applies the 50% batch rate when a result's `usage.service_tier` is
+`batch`. `TokenRates::batch()` is there to price a result by hand.
 
-The budget system provides token allocation and tracking:
+## Usage and cost
 
-```rust
-use claudius::Budget;
-use std::sync::Arc;
-
-// Create a budget with 1000 tokens
-let budget = Arc::new(Budget::new(1000));
-
-// Allocate tokens for a request
-if let Some(mut allocation) = budget.allocate(500) {
-    // Use tokens as needed
-    let consumed = allocation.consume(200); // Returns true if successful
-    println!("Consumed 200 tokens: {}", consumed);
-    
-    // Remaining tokens are automatically returned when allocation is dropped
-}
-
-// Check remaining budget (approximately, due to concurrent access)
-```
-
-## Built-in Tools
-
-Agents can use built-in tools for common operations:
-
-### Filesystem Operations
+Rates are integer nano-cents per token (`TokenRates`); costs are micro-cents, rounded up
+(1 dollar = 100,000,000 micro-cents). `KnownModel::cost_micro_cents` prices one response's
+`Usage`, including Haiku 5.5's long-prompt tier.
 
 ```rust
-// Through the FileSystem trait, agents can:
-agent.search("function").await?;           // Search for text in files
-agent.view("src/main.rs", None).await?;    // View file contents
-agent.str_replace("config.toml", "old", "new").await?; // Replace text
-agent.insert("notes.txt", 5, "New line").await?;       // Insert at line
+use claudius::{KnownModel, Usage};
+
+let usage = Usage::new(10_000, 2_000).with_cache_read_input_tokens(50_000);
+let micro_cents = KnownModel::ClaudeSonnet55.cost_micro_cents(&usage);
+// 10,000 × $2/MTok + 2,000 × $10/MTok + 50,000 × $0.10/MTok = $0.045
+assert_eq!(micro_cents, 4_500_000);
 ```
 
-### Text Editor Tool
+`with_service_tier(ServiceTierChoice::Auto)` lets a request use Priority Tier capacity, and
+`Usage::service_tier` reports the tier that served it. Fast mode (`with_speed(InferenceSpeed::Fast)`)
+exists on Opus 5.5 only and is priced from `KnownModel::fast_token_rates`. `with_inference_geo("us")`
+pins inference to the US at 1.1x. `cost_micro_cents` reads all three from `Usage`, so the price
+stays right without extra code.
 
-```rust
-use claudius::{ToolTextEditor20250429, Tool};
+Web search requests are billed at one cent each and included by `cost_micro_cents`.
+`cost_micro_cents` prices a single response: sum the costs of responses rather than summing
+`Usage` first, because a summed usage can lose the tier, speed and geo modifiers or wrongly
+extend one response's modifiers to another's tokens.
 
-// The text editor tool provides structured file editing
-let editor = ToolTextEditor20250429::new();
-// Can be used within agent tool integrations
-```
+## Monitoring
 
-### Bash Tool
+`Anthropic::last_rate_limits()` returns the rate-limit headers of the latest response
+that carried any `anthropic-ratelimit-*`, `anthropic-priority-*`, `anthropic-fast-*` or
+`retry-after` header as `RateLimits` (`None` before the first); responses without them, such as a
+proxy's error page, leave it unchanged. The windows `requests`, `tokens`, `input_tokens`,
+`output_tokens`, `priority_input_tokens`, `priority_output_tokens`, `fast_input_tokens` and
+`fast_output_tokens` each hold `limit`, `remaining` and `reset`.
 
-```rust
-use claudius::{ToolBash20250124, Tool};
+Every API call runs in a `claudius.request` tracing span. On `send` and `stream` it records
+`request_id`, `http.status_code`, `attempts`, the token counts and `cost_micro_cents`. The crate
+also emits plain tracing events; aggregate them with any subscriber (durations in seconds):
 
-// Execute shell commands
-let bash_tool = ToolBash20250124::new();
-// Integrated into agent workflows
-```
+| Target | Level | Message | Fields |
+|---|---|---|---|
+| `claudius::usage` | `INFO` | `usage` | `model`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `cost_micro_cents` (`None` for unknown models) |
+| `claudius::client` | `DEBUG` | `request_completed` | `duration_seconds`, `ok` |
+| `claudius::client` | `DEBUG` | `retry` | `backoff_seconds` |
+| `claudius::stream` | `TRACE` | `event` | (none) |
+| `claudius::stream` | `TRACE` | `bytes` | `bytes` |
+| `claudius::stream` | `DEBUG` | `first_byte` | `ttfb_seconds` |
+| `claudius::stream` | `DEBUG` | `completed` | `duration_seconds` |
+| `claudius::stream` | `DEBUG` | `error` | (none) |
 
-## Command Line Tools
+`claudius::usage` fires once per completed `send` and once per stream that reaches `message_stop`.
 
-Claudius includes several command-line tools for working with the Anthropic API:
+The Admin API reports organization-wide usage and cost. It needs an Admin key, passed as
+`Anthropic::new(Some(admin_key))`:
 
-### median-text
+```rust,no_run
+use claudius::{Anthropic, BucketWidth, CostGroupBy, CostReportParams, UsageGroupBy, UsageReportParams};
+use time::{Duration, OffsetDateTime};
 
-The `median-text` binary is designed for document transcription improvement. Given multiple transcriptions of the same document, it uses Claude to select and provide the best unified transcription.
-
-```bash
-# Provide the best transcription from multiple files
-cargo run --bin median-text -- transcription1.txt transcription2.txt transcription3.txt
-
-# The tool will output the improved/unified transcription to stdout
-```
-
-This tool is particularly useful for:
-- Improving OCR results by comparing multiple scans
-- Consolidating different transcription attempts
-- Cleaning up and unifying document content
-
-The tool uses Claude Opus with thinking enabled to analyze the provided documents and output a single, improved transcription.
-
-## Prompt Testing Framework
-
-Claudius includes a comprehensive prompt testing framework that allows you to test prompts against the Anthropic API with configurable assertions and test vectors. This is especially useful for ensuring prompt reliability, regression testing, and CI/CD integration.
-
-### Using the claudius-prompt Binary
-
-The `claudius-prompt` binary provides a command-line interface for running prompt tests:
-
-```bash
-# Run a simple text prompt file
-cargo run --bin claudius-prompt -- prompts/basic_hello.txt
-
-# Run a YAML configuration with assertions
-cargo run --bin claudius-prompt -- prompts/simple_math.yaml
-
-# Run multiple tests
-cargo run --bin claudius-prompt -- prompts/test1.yaml prompts/test2.yaml
-
-# Test mode with exit codes (useful for CI/CD)
-cargo run --bin claudius-prompt -- --test prompts/*.yaml
-
-# Get verbose output with timing and token information
-cargo run --bin claudius-prompt -- --verbose prompts/simple_math.yaml
-
-# Output in different formats
-cargo run --bin claudius-prompt -- --format json prompts/test.yaml
-cargo run --bin claudius-prompt -- --format yaml prompts/test.yaml
-```
-
-### Prompt Test Configuration
-
-Test configurations can be written in YAML format with comprehensive assertion support:
-
-```yaml
-name: "Simple Math Test"
-prompt: "What is 2 + 2? Please respond with just the number."
-model: "claude-haiku-4-5"
-max_tokens: 50
-temperature: 0.0
-system: "You are a helpful math assistant."
-
-# Assertion configuration
-expected_contains:
-  - "4"
-expected_not_contains:
-  - "5"
-  - "3"
-min_response_length: 1
-max_response_length: 10
-```
-
-Advanced configurations support multi-turn conversations, tool usage, and inheritance:
-
-```yaml
-name: "Multi-turn Conversation Test"
-messages:
-  - role: "user"
-    content: "I'm learning Rust programming."
-  - role: "assistant"
-    content: "That's great! What would you like to learn about first?"
-  - role: "user"
-    content: "Tell me about ownership and borrowing."
-system: "You are a helpful Rust programming tutor."
-model: "claude-haiku-4-5"
-max_tokens: 400
-temperature: 0.3
-expected_contains:
-  - "ownership"
-  - "borrowing"
-expected_not_contains:
-  - "garbage collection"
-min_response_length: 100
-```
-
-Configuration inheritance allows for reusable base configurations:
-
-```yaml
-# base.yaml
-name: "Base Configuration"
-model: "claude-haiku-4-5"
-max_tokens: 100
-temperature: 0.5
-system: "You are a helpful assistant."
-
-# specific_test.yaml
-inherits: "../base.yaml"
-name: "Specific Test"
-prompt: "What is the capital of France?"
-expected_contains:
-  - "Paris"
-```
-
-File references enable modular prompt and system configurations:
-
-```yaml
-# Using external files for prompt and system content
-name: "File Reference Test"
-prompt: "prompt.yaml"      # Contents loaded from prompt.yaml
-system: "system.md"        # Contents loaded from system.md
-model: "claude-haiku-4-5"
-max_tokens: 400
-expected_contains:
-  - "helpful"
-```
-
-File references support relative paths and work with configuration inheritance:
-
-```yaml
-# In subdirectory: prompts/test.yaml
-name: "Modular Configuration"
-prompt: "prompt.yaml"           # Loaded from prompts/prompt.yaml
-system: "../common/system.md"  # Loaded from common/system.md
-inherits: "../base.yaml"        # Configuration inheritance
-```
-
-### Programmatic Testing
-
-You can also use the testing framework programmatically in Rust:
-
-```rust
-use claudius::{Anthropic, PromptTestConfig};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Anthropic::new(None)?;
-
-    // Create a test configuration
-    let config = PromptTestConfig::new("What is 2 + 2?")
-        .with_name("Simple Math Test")
-        .with_model("claude-haiku-4-5")
-        .with_max_tokens(50)
-        .with_temperature(0.0)
-        .expect_contains("4")
-        .expect_not_contains("5")
-        .with_min_length(1)
-        .with_max_length(10);
-
-    // Run the test
-    let result = config.run(&client).await?;
-
-    // Check results
-    println!("Response: {}", result.response);
-    println!("Assertions passed: {}", result.assertions_passed);
-    println!("Duration: {:?}", result.duration);
-    println!("Input tokens: {}", result.input_tokens);
-    println!("Output tokens: {}", result.output_tokens);
-
-    if !result.assertions_passed {
-        for failure in &result.assertion_failures {
-            eprintln!("Assertion failed: {}", failure);
+async fn report(admin_key: String) -> claudius::Result<()> {
+    let admin = Anthropic::new(Some(admin_key))?;
+    let since = OffsetDateTime::now_utc() - Duration::days(7);
+    let usage = UsageReportParams::new(since)
+        .with_bucket_width(BucketWidth::OneDay)
+        .group_by(UsageGroupBy::Model);
+    for bucket in admin.usage_report(usage).await?.data {
+        for r in bucket.results {
+            println!("{} {:?}: {} output tokens", bucket.starting_at.date(), r.model, r.output_tokens);
         }
     }
-
+    let cost = CostReportParams::new(since).group_by(CostGroupBy::Description);
+    for bucket in admin.cost_report(cost).await?.data {
+        for r in bucket.results {
+            println!("{:?}: {} {} cents", r.description, r.amount, r.currency);
+        }
+    }
     Ok(())
 }
 ```
 
-### Assertion Types
+`examples/usage_monitoring.rs` prints one response's usage, cost and rate limits, then both reports.
 
-The testing framework supports several types of assertions:
+## Files
 
-- **Content assertions**: `expected_contains` and `expected_not_contains` check for specific text in responses
-- **Length assertions**: `min_response_length` and `max_response_length` validate response size
-- **Tool call assertions**: `expected_tool_calls` verifies that specific tools were called (when tools are configured)
-- **Error assertions**: `expect_error` and `expected_error_message` test error handling
+`upload_file` stores a file once, `DocumentBlock::from_file_id` references it in later requests,
+and `delete_file` removes it. See `examples/files.rs`.
 
-### File References
+```rust,no_run
+use claudius::{Anthropic, ContentBlock, DocumentBlock, KnownModel, MessageCreateParams};
+use claudius::{MessageParam, MessageParamContent, MessageRole, TextBlock};
 
-The framework supports loading content from external files to enable modular configurations:
-
-- **Prompt files**: Use `prompt: "prompt.yaml"` to load prompt content from external files
-- **System files**: Use `system: "system.md"` to load system prompts from external files
-- **Relative paths**: File references are resolved relative to the configuration file's directory
-- **Security**: Only files named exactly `prompt.yaml` or `system.md` are automatically resolved
-- **Compatibility**: File references work seamlessly with configuration inheritance
-
-### CI/CD Integration
-
-The `claudius-prompt` binary is designed for CI/CD integration:
-
-```yaml
-# .github/workflows/prompt-tests.yml
-- name: Run prompt tests
-  run: |
-    cargo run --bin claudius-prompt -- --test --verbose prompts/*.yaml
-  env:
-    CLAUDIUS_API_KEY: ${{ secrets.CLAUDIUS_API_KEY }}
-```
-
-The binary exits with status code 0 on success and 1 on failure when using the `--test` flag, making it suitable for automated testing pipelines.
-
-## Custom Tools
-
-Create custom tools by implementing the `Tool` trait:
-
-```rust
-use claudius::{Tool, ToolUnionParam, ToolResultCallback, Agent};
-
-struct MyCustomTool;
-
-impl<A: Agent> Tool<A> for MyCustomTool {
-    fn name(&self) -> String {
-        "my_custom_tool".to_string()
-    }
-    
-    fn callback(&self) -> ToolResultCallback<A> {
-        Box::new(|tool_use| {
-            Box::pin(async move {
-                // Your tool implementation here
-                // Return a ToolResultApplier
-            })
-        })
-    }
-    
-    fn to_param(&self) -> ToolUnionParam {
-        // Define the tool's parameter schema
-    }
+async fn summarise(client: &Anthropic, text: &str) -> claudius::Result<()> {
+    let file = client.upload_file("notes.txt", "text/plain", text.as_bytes().to_vec(), None).await?;
+    let content = MessageParamContent::Array(vec![
+        ContentBlock::Document(DocumentBlock::from_file_id(&file.id)),
+        ContentBlock::Text(TextBlock::new("Summarise this document in one sentence.")),
+    ]);
+    let messages = vec![MessageParam::new(content, MessageRole::User)];
+    let params = MessageCreateParams::new(512, messages, KnownModel::ClaudeHaiku55.into());
+    let answer = client.send(params).await;
+    client.delete_file(&file.id).await?;
+    println!("{:?}", answer?.stop_reason);
+    Ok(())
 }
 ```
 
-## Error Handling
+## Errors and retries
 
-Claudius provides a robust error system:
+Every call returns `claudius::Result<T>`. Rate limits, overloads, server errors, timeouts and
+connection failures are retried up to `with_max_retries` times (default 3) with exponential
+backoff from 0.5 s capped at 8 s, or the server's `retry-after` when longer; a `retry-after`
+above 60 s is returned immediately. Errors carry the HTTP status and request ID:
 
-```rust
-match client.send(params).await {
-    Ok(response) => {
-        // Process successful response
-    }
-    Err(err) => {
-        if err.is_authentication() {
-            // Handle authentication error
-        } else if err.is_rate_limit() {
-            // Handle rate limiting
-            let retry_after = match &err {
-                Error::RateLimit { retry_after, .. } => retry_after,
-                _ => None,
-            };
-            // Implement backoff strategy
-        } else if err.is_todo() {
-            // Handle unimplemented functionality
-        } else {
-            // Handle other errors
-            eprintln!("Error: {}", err);
-        }
+```rust,no_run
+use claudius::{Anthropic, Error, MessageCreateParams};
+
+async fn send(client: &Anthropic, params: MessageCreateParams) {
+    match client.send(params).await {
+        Ok(message) => println!("{}", message.id),
+        Err(err) if err.is_rate_limit() => eprintln!("rate limited, retry after {:?}", err.retry_after()),
+        Err(err @ Error::Authentication { .. }) => eprintln!("check the API key: {err}"),
+        Err(err) => eprintln!("{err}; {:?}", err.metadata()),
     }
 }
 ```
 
 ## Examples
 
-The repository includes several examples:
-
-- `basic_chat.rs`: Simple request and response with Claude
-- `streaming.rs`: Streaming response handling  
-- `agent.rs`: Agent framework with filesystem operations
-- `models_example.rs`: Model listing and information retrieval
-- `retry_example.rs`: Error handling and retry logic
-
-Run examples with:
+Each needs an API key in the environment:
 
 ```bash
-# Set your API key
-export CLAUDIUS_API_KEY="your-api-key"
-
-# Run the basic chat example
 cargo run --example basic_chat
-
-# Run the streaming example
-cargo run --example streaming
-
-# Run the agent framework example
-cargo run --example agent
-
-# Run the models example
+cargo run --example batch
+cargo run --example cache
+cargo run --example files
 cargo run --example models_example
-
-# Run the retry example
 cargo run --example retry_example
+cargo run --example server_tools
+cargo run --example streaming
+cargo run --example streaming-tool-use
+cargo run --example usage_monitoring
 ```
-
-## Breaking Changes
-
-### v0.17.0
-
-**TextEditor::insert off-by-one corrected**:  The text editor tool's `insert` command now uses 1-based line numbers. `insert_line = 0` or values greater than the line count + 1 now return an error. To append, use `line_count + 1`.
-
-**Base URL format change**: The `with_base_url()` method now expects the base URL *without* the `/v1/` suffix. The client automatically appends `/v1/` when constructing endpoint URLs.
-
-Before (v0.16.0 and earlier):
-```rust
-// Old format - required /v1/ suffix
-let client = Anthropic::new(None)?
-    .with_base_url("https://api.anthropic.com/v1/".to_string());
-```
-
-After (v0.17.0+):
-```rust
-// New format - base URL only, /v1/ is added automatically
-let client = Anthropic::new(None)?
-    .with_base_url("https://api.anthropic.com".to_string());
-```
-
-This change enables proper support for third-party API providers like Minimax that use a different base path:
-```rust
-// Now works correctly with Minimax
-let client = Anthropic::new(None)?
-    .with_base_url("https://api.minimax.io/anthropic".to_string());
-// Requests go to: https://api.minimax.io/anthropic/v1/messages
-```
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the LICENSE file for details.
-
-## Acknowledgments
-
-- Thanks to Anthropic for creating Claude and providing the API that powers this SDK
-- This project is not officially affiliated with Anthropic
+Apache-2.0.

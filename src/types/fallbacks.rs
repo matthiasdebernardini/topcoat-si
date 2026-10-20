@@ -10,6 +10,11 @@ pub enum InferenceSpeed {
     Standard,
     /// Fast inference mode, where supported.
     Fast,
+    /// A speed this crate does not know.
+    ///
+    /// Never send it; it only models values this crate does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Configuration for one named server-side fallback attempt.

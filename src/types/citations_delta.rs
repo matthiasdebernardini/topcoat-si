@@ -1,12 +1,14 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
+use crate::types::open_union::{from_value, type_tag};
 use crate::types::{
     CitationCharLocation, CitationContentBlockLocation, CitationPageLocation,
-    CitationWebSearchResultLocation,
+    CitationSearchResultLocation, CitationWebSearchResultLocation,
 };
 
 /// Represents a citation object that could be any of the supported citation types
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum Citation {
     /// Citation referencing a character location in source text.
@@ -24,6 +26,33 @@ pub enum Citation {
     /// Citation referencing a web search result location.
     #[serde(rename = "web_search_result_location")]
     WebSearchResultLocation(CitationWebSearchResultLocation),
+
+    /// Citation referencing a search result location.
+    #[serde(rename = "search_result_location")]
+    SearchResultLocation(CitationSearchResultLocation),
+
+    /// A citation of a type this crate does not know, kept verbatim.
+    #[serde(untagged)]
+    Unknown(Value),
+}
+
+impl<'de> Deserialize<'de> for Citation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match type_tag::<D::Error>(&value)?.as_str() {
+            "char_location" => from_value(value).map(Citation::CharLocation),
+            "page_location" => from_value(value).map(Citation::PageLocation),
+            "content_block_location" => from_value(value).map(Citation::ContentBlockLocation),
+            "web_search_result_location" => {
+                from_value(value).map(Citation::WebSearchResultLocation)
+            }
+            "search_result_location" => from_value(value).map(Citation::SearchResultLocation),
+            _ => Ok(Citation::Unknown(value)),
+        }
+    }
 }
 
 /// A delta representing a new citation in a streaming response
@@ -75,6 +104,7 @@ mod tests {
             document_title: Some("Document Title".to_string()),
             end_char_index: 12,
             start_char_index: 0,
+            file_id: None,
         };
 
         let delta = CitationsDelta::with_char_location(char_location);
@@ -93,6 +123,7 @@ mod tests {
             document_title: Some("Document Title".to_string()),
             end_page_number: 5,
             start_page_number: 3,
+            file_id: None,
         };
 
         let delta = CitationsDelta::with_page_location(page_location);
@@ -111,6 +142,7 @@ mod tests {
             document_title: Some("Document Title".to_string()),
             end_block_index: 3,
             start_block_index: 1,
+            file_id: None,
         };
 
         let delta = CitationsDelta::with_content_block_location(content_block_location);

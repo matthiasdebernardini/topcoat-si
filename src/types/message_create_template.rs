@@ -16,15 +16,12 @@ use crate::types::{
 /// ```
 /// # use claudius::{MessageCreateTemplate, MessageCreateParams, KnownModel};
 /// let template = MessageCreateTemplate::new()
-///     .with_max_tokens(2048)
-///     .with_temperature(0.7)
-///     .unwrap();
+///     .with_max_tokens(2048);
 ///
-/// let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet5);
+/// let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet55);
 /// let params = template.apply(params);
 ///
 /// assert_eq!(params.max_tokens, 2048);
-/// assert_eq!(params.temperature, Some(0.7));
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct MessageCreateTemplate {
@@ -330,7 +327,7 @@ mod tests {
 
     #[test]
     fn template_with_model() {
-        let template = MessageCreateTemplate::new().with_model(KnownModel::Claude37SonnetLatest);
+        let template = MessageCreateTemplate::new().with_model(KnownModel::ClaudeSonnet55);
 
         assert!(template.model.is_some());
     }
@@ -399,7 +396,7 @@ mod tests {
             .unwrap()
             .with_stream(true);
 
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest);
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet55);
         let params = template.apply(params);
 
         assert_eq!(params.max_tokens, 2048);
@@ -411,7 +408,7 @@ mod tests {
     fn template_apply_preserves_unset_fields() {
         let template = MessageCreateTemplate::new().with_max_tokens(2048);
 
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet55)
             .with_system("System prompt");
         let params = template.apply(params);
 
@@ -423,7 +420,7 @@ mod tests {
     fn template_merge_overrides_fields() {
         let base = MessageCreateTemplate::new()
             .with_max_tokens(1024)
-            .with_model(KnownModel::Claude37SonnetLatest)
+            .with_model(KnownModel::ClaudeSonnet55)
             .with_stream(false);
         let override_template = MessageCreateTemplate::new()
             .with_max_tokens(2048)
@@ -438,21 +435,21 @@ mod tests {
 
     #[test]
     fn template_apply_overrides_model() {
-        let template = MessageCreateTemplate::new().with_model(KnownModel::ClaudeHaiku45);
+        let template = MessageCreateTemplate::new().with_model(KnownModel::ClaudeHaiku55);
 
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest);
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet55);
         let original_model = params.model.clone();
         let params = template.apply(params);
 
         assert_ne!(params.model, original_model);
-        assert_eq!(params.model, Model::Known(KnownModel::ClaudeHaiku45));
+        assert_eq!(params.model, Model::Known(KnownModel::ClaudeHaiku55));
     }
 
     #[test]
     fn template_chained_builders() {
         let template = MessageCreateTemplate::new()
             .with_max_tokens(4096)
-            .with_model(KnownModel::Claude37SonnetLatest)
+            .with_model(KnownModel::ClaudeSonnet55)
             .with_system("Be concise.")
             .with_top_k(40)
             .with_stream(false);

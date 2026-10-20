@@ -53,14 +53,14 @@ async fn create_demo_batch(client: &Anthropic) -> Result<MessageBatch> {
             "batch-example-summary",
             MessageCreateParams::simple(
                 "Explain message batch processing in one sentence.",
-                KnownModel::ClaudeHaiku45,
+                KnownModel::ClaudeHaiku55,
             ),
         ),
         MessageBatchCreateRequest::new(
             "batch-example-list",
             MessageCreateParams::simple(
                 "List three practical use cases for asynchronous batch processing.",
-                KnownModel::ClaudeHaiku45,
+                KnownModel::ClaudeHaiku55,
             ),
         ),
     ];

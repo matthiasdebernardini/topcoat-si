@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    ToolBash20241022, ToolBash20250124, ToolParam, ToolTextEditor20250124, ToolTextEditor20250429,
-    ToolTextEditor20250728, WebSearchTool20250305,
+    CodeExecutionTool, McpToolset, MemoryTool, ToolBash20241022, ToolBash20250124, ToolParam,
+    ToolSearchTool, ToolTextEditor20250124, ToolTextEditor20250429, ToolTextEditor20250728,
+    WebFetchTool, WebSearchTool,
 };
 
 /// Union type for different tool parameter types.
@@ -11,7 +12,9 @@ use crate::types::{
 /// - Custom tools
 /// - Bash tools
 /// - Text editor tools
-/// - Web search tools
+/// - Server tools (web search, web fetch, code execution, tool search)
+/// - The client-side memory tool
+/// - MCP toolsets
 ///
 /// The API accepts any of these tool types when tools are provided to Claude.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -43,7 +46,59 @@ pub enum ToolUnionParam {
 
     /// A web search tool for retrieving information from the internet
     #[serde(rename = "web_search_20250305")]
-    WebSearch20250305(WebSearchTool20250305),
+    WebSearch20250305(WebSearchTool),
+
+    /// A web search tool (version 20260209)
+    #[serde(rename = "web_search_20260209")]
+    WebSearch20260209(WebSearchTool),
+
+    /// A web search tool (version 20260318)
+    #[serde(rename = "web_search_20260318")]
+    WebSearch20260318(WebSearchTool),
+
+    /// A web fetch tool (version 20250910)
+    #[serde(rename = "web_fetch_20250910")]
+    WebFetch20250910(WebFetchTool),
+
+    /// A web fetch tool (version 20260209)
+    #[serde(rename = "web_fetch_20260209")]
+    WebFetch20260209(WebFetchTool),
+
+    /// A web fetch tool (version 20260309)
+    #[serde(rename = "web_fetch_20260309")]
+    WebFetch20260309(WebFetchTool),
+
+    /// A web fetch tool (version 20260318)
+    #[serde(rename = "web_fetch_20260318")]
+    WebFetch20260318(WebFetchTool),
+
+    /// A code execution tool (version 20250825)
+    #[serde(rename = "code_execution_20250825")]
+    CodeExecution20250825(CodeExecutionTool),
+
+    /// A code execution tool (version 20260120)
+    #[serde(rename = "code_execution_20260120")]
+    CodeExecution20260120(CodeExecutionTool),
+
+    /// A code execution tool (version 20260521)
+    #[serde(rename = "code_execution_20260521")]
+    CodeExecution20260521(CodeExecutionTool),
+
+    /// A regex-based tool search tool
+    #[serde(rename = "tool_search_tool_regex_20251119")]
+    ToolSearchToolRegex20251119(ToolSearchTool),
+
+    /// A BM25-based tool search tool
+    #[serde(rename = "tool_search_tool_bm25_20251119")]
+    ToolSearchToolBm2520251119(ToolSearchTool),
+
+    /// The client-side memory tool
+    #[serde(rename = "memory_20250818")]
+    Memory20250818(MemoryTool),
+
+    /// A toolset exposing the tools of an MCP server
+    #[serde(rename = "mcp_toolset")]
+    McpToolset(McpToolset),
 }
 
 impl ToolUnionParam {
@@ -77,9 +132,73 @@ impl ToolUnionParam {
         Self::TextEditor20250728(ToolTextEditor20250728::new())
     }
 
-    /// Creates a new web search tool
+    /// Creates a new web search tool (version 20260318)
     pub fn new_web_search_tool() -> Self {
-        Self::WebSearch20250305(WebSearchTool20250305::new())
+        Self::WebSearch20260318(WebSearchTool::new())
+    }
+
+    /// Creates a new web fetch tool (version 20260318)
+    pub fn new_web_fetch_tool() -> Self {
+        Self::WebFetch20260318(WebFetchTool::new())
+    }
+
+    /// Creates a new code execution tool (version 20260521)
+    pub fn new_code_execution_tool() -> Self {
+        Self::CodeExecution20260521(CodeExecutionTool::new())
+    }
+
+    /// Creates a new regex tool search tool
+    pub fn new_tool_search_regex_tool() -> Self {
+        Self::ToolSearchToolRegex20251119(ToolSearchTool::regex())
+    }
+
+    /// Creates a new BM25 tool search tool
+    pub fn new_tool_search_bm25_tool() -> Self {
+        Self::ToolSearchToolBm2520251119(ToolSearchTool::bm25())
+    }
+
+    /// Creates a new memory tool.
+    ///
+    /// This is a client-side tool: the application implements the memory commands.
+    pub fn new_memory_tool() -> Self {
+        Self::Memory20250818(MemoryTool::new())
+    }
+
+    /// Creates a toolset exposing the tools of the named MCP server
+    pub fn new_mcp_toolset(server_name: impl Into<String>) -> Self {
+        Self::McpToolset(McpToolset::new(server_name))
+    }
+
+    /// Validate tool-specific constraints.
+    ///
+    /// `allowed_domains` and `blocked_domains` are mutually exclusive on web search and
+    /// web fetch tools.
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        let (name, allowed, blocked) = match self {
+            Self::WebSearch20250305(tool)
+            | Self::WebSearch20260209(tool)
+            | Self::WebSearch20260318(tool) => (
+                &tool.name,
+                tool.allowed_domains.is_some(),
+                tool.blocked_domains.is_some(),
+            ),
+            Self::WebFetch20250910(tool)
+            | Self::WebFetch20260209(tool)
+            | Self::WebFetch20260309(tool)
+            | Self::WebFetch20260318(tool) => (
+                &tool.name,
+                tool.allowed_domains.is_some(),
+                tool.blocked_domains.is_some(),
+            ),
+            _ => return Ok(()),
+        };
+        if allowed && blocked {
+            return Err(crate::Error::validation(
+                format!("tool {name}: allowed_domains and blocked_domains are mutually exclusive"),
+                Some("tools".to_string()),
+            ));
+        }
+        Ok(())
     }
 
     /// Check if this tool has strict mode enabled.
@@ -95,7 +214,20 @@ impl ToolUnionParam {
             | Self::TextEditor20250124(_)
             | Self::TextEditor20250429(_)
             | Self::TextEditor20250728(_)
-            | Self::WebSearch20250305(_) => false,
+            | Self::WebSearch20250305(_)
+            | Self::WebSearch20260209(_)
+            | Self::WebSearch20260318(_)
+            | Self::WebFetch20250910(_)
+            | Self::WebFetch20260209(_)
+            | Self::WebFetch20260309(_)
+            | Self::WebFetch20260318(_)
+            | Self::CodeExecution20250825(_)
+            | Self::CodeExecution20260120(_)
+            | Self::CodeExecution20260521(_)
+            | Self::ToolSearchToolRegex20251119(_)
+            | Self::ToolSearchToolBm2520251119(_)
+            | Self::Memory20250818(_)
+            | Self::McpToolset(_) => false,
         }
     }
 }
@@ -246,7 +378,7 @@ mod tests {
             .with_city("San Francisco")
             .with_country("US");
 
-        let web_search_tool = WebSearchTool20250305::new()
+        let web_search_tool = WebSearchTool::new()
             .with_allowed_domains(vec!["example.com".to_string(), "example.org".to_string()])
             .with_max_uses(5)
             .with_user_location(user_location)
@@ -328,5 +460,80 @@ mod tests {
             }
             _ => panic!("Expected Bash20250124 variant"),
         }
+    }
+
+    #[test]
+    fn server_and_client_tool_variants() {
+        let cases = [
+            (
+                ToolUnionParam::WebSearch20260209(WebSearchTool::new()),
+                json!({"type": "web_search_20260209", "name": "web_search"}),
+            ),
+            (
+                ToolUnionParam::new_web_search_tool(),
+                json!({"type": "web_search_20260318", "name": "web_search"}),
+            ),
+            (
+                ToolUnionParam::WebFetch20250910(WebFetchTool::new()),
+                json!({"type": "web_fetch_20250910", "name": "web_fetch"}),
+            ),
+            (
+                ToolUnionParam::WebFetch20260209(WebFetchTool::new()),
+                json!({"type": "web_fetch_20260209", "name": "web_fetch"}),
+            ),
+            (
+                ToolUnionParam::WebFetch20260309(WebFetchTool::new().with_use_cache(true)),
+                json!({"type": "web_fetch_20260309", "name": "web_fetch", "use_cache": true}),
+            ),
+            (
+                ToolUnionParam::new_web_fetch_tool(),
+                json!({"type": "web_fetch_20260318", "name": "web_fetch"}),
+            ),
+            (
+                ToolUnionParam::CodeExecution20250825(CodeExecutionTool::new()),
+                json!({"type": "code_execution_20250825", "name": "code_execution"}),
+            ),
+            (
+                ToolUnionParam::CodeExecution20260120(CodeExecutionTool::new()),
+                json!({"type": "code_execution_20260120", "name": "code_execution"}),
+            ),
+            (
+                ToolUnionParam::new_code_execution_tool(),
+                json!({"type": "code_execution_20260521", "name": "code_execution"}),
+            ),
+            (
+                ToolUnionParam::new_tool_search_regex_tool(),
+                json!({"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}),
+            ),
+            (
+                ToolUnionParam::new_tool_search_bm25_tool(),
+                json!({"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"}),
+            ),
+            (
+                ToolUnionParam::new_memory_tool(),
+                json!({"type": "memory_20250818", "name": "memory"}),
+            ),
+            (
+                ToolUnionParam::new_mcp_toolset("docs"),
+                json!({"type": "mcp_toolset", "mcp_server_name": "docs"}),
+            ),
+        ];
+        for (tool, expected) in cases {
+            assert_eq!(to_value(&tool).unwrap(), expected);
+            let parsed: ToolUnionParam = serde_json::from_value(expected).unwrap();
+            assert_eq!(parsed, tool);
+            assert!(!tool.is_strict());
+        }
+    }
+
+    #[test]
+    fn validate_rejects_both_domain_lists() {
+        let mut tool = WebSearchTool::new().with_allowed_domains(vec!["a.com".to_string()]);
+        tool.blocked_domains = Some(vec!["b.com".to_string()]);
+        let err = ToolUnionParam::WebSearch20260318(tool)
+            .validate()
+            .unwrap_err();
+        assert!(err.is_validation());
+        assert!(ToolUnionParam::new_web_fetch_tool().validate().is_ok());
     }
 }

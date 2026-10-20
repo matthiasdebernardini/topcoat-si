@@ -7,6 +7,14 @@ use serde::{Deserialize, Serialize};
 pub struct ServerToolUsage {
     /// The number of web search tool requests.
     pub web_search_requests: i32,
+
+    /// The number of web fetch tool requests (omitted when serializing if zero).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub web_fetch_requests: i32,
+}
+
+fn is_zero(value: &i32) -> bool {
+    *value == 0
 }
 
 impl ServerToolUsage {
@@ -14,7 +22,14 @@ impl ServerToolUsage {
     pub fn new(web_search_requests: i32) -> Self {
         Self {
             web_search_requests,
+            web_fetch_requests: 0,
         }
+    }
+
+    /// Set the number of web fetch tool requests.
+    pub fn with_web_fetch_requests(mut self, web_fetch_requests: i32) -> Self {
+        self.web_fetch_requests = web_fetch_requests;
+        self
     }
 }
 
@@ -24,6 +39,7 @@ impl Add for ServerToolUsage {
     fn add(self, rhs: Self) -> Self::Output {
         Self {
             web_search_requests: self.web_search_requests + rhs.web_search_requests,
+            web_fetch_requests: self.web_fetch_requests + rhs.web_fetch_requests,
         }
     }
 }
@@ -63,5 +79,15 @@ mod tests {
         let result = usage1 + usage2;
 
         assert_eq!(result.web_search_requests, 8);
+    }
+
+    #[test]
+    fn add_server_tool_usage_includes_web_fetch() {
+        let usage1 = ServerToolUsage::new(1).with_web_fetch_requests(2);
+        let usage2 = ServerToolUsage::new(3).with_web_fetch_requests(4);
+        let result = usage1 + usage2;
+
+        assert_eq!(result.web_search_requests, 4);
+        assert_eq!(result.web_fetch_requests, 6);
     }
 }

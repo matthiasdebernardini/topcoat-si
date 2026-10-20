@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Structured outputs constrain Claude's responses to follow a specific schema,
 /// ensuring valid, parseable output for downstream processing.
 ///
-/// This feature requires the beta header `structured-outputs-2025-11-13`.
+/// This feature needs no beta header. Set it as `OutputConfig::format`.
 ///
 /// # Example
 ///

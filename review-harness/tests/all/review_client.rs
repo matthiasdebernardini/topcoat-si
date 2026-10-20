@@ -61,7 +61,7 @@ fn client(url: String) -> Anthropic {
         .unwrap()
 }
 fn params() -> MessageCreateParams {
-    MessageCreateParams::simple("hello", KnownModel::ClaudeHaiku45)
+    MessageCreateParams::simple("hello", KnownModel::ClaudeHaiku55)
 }
 
 #[tokio::test]

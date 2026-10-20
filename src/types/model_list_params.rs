@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::types::ModelLifecycle;
+
 /// Parameters for listing models.
 ///
 /// This struct contains the parameters that can be passed when listing models
@@ -26,6 +28,13 @@ pub struct ModelListParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 
+    /// Only return models in these lifecycle states.
+    ///
+    /// Sent as repeated `lifecycle[]=<value>` query pairs. When omitted, the API
+    /// returns active and deprecated models.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifecycle: Vec<ModelLifecycle>,
+
     /// Optional header to specify the beta version(s) you want to use.
     ///
     /// These are sent as the `anthropic-beta` HTTP header, not as query
@@ -38,6 +47,32 @@ impl ModelListParams {
     /// Create a new, empty instance of ModelListParams.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Filter by lifecycle state; may be called repeatedly.
+    pub fn with_lifecycle(mut self, lifecycle: ModelLifecycle) -> Self {
+        self.lifecycle.push(lifecycle);
+        self
+    }
+
+    /// The query-string pairs for this request, with `lifecycle[]` repeated per value.
+    pub(crate) fn query_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        if let Some(after_id) = &self.after_id {
+            pairs.push(("after_id".to_string(), after_id.clone()));
+        }
+        if let Some(before_id) = &self.before_id {
+            pairs.push(("before_id".to_string(), before_id.clone()));
+        }
+        if let Some(limit) = self.limit {
+            pairs.push(("limit".to_string(), limit.to_string()));
+        }
+        pairs.extend(
+            self.lifecycle
+                .iter()
+                .map(|lifecycle| ("lifecycle[]".to_string(), lifecycle.as_str().to_string())),
+        );
+        pairs
     }
 
     /// Set the after_id parameter for pagination.
@@ -133,5 +168,32 @@ mod tests {
         assert_eq!(params.after_id, Some("model_123".to_string()));
         assert_eq!(params.limit, Some(50));
         assert_eq!(params.betas, None);
+    }
+
+    #[test]
+    fn lifecycle_is_sent_as_repeated_bracket_pairs() {
+        let params = ModelListParams::new()
+            .with_limit(5)
+            .with_lifecycle(ModelLifecycle::Active)
+            .with_lifecycle(ModelLifecycle::Retired);
+
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in params.query_pairs() {
+            query.append_pair(&key, &value);
+        }
+        assert_eq!(
+            query.finish(),
+            "limit=5&lifecycle%5B%5D=active&lifecycle%5B%5D=retired"
+        );
+    }
+
+    #[test]
+    fn lifecycle_omitted_by_default() {
+        let params = ModelListParams::new();
+        assert!(params.query_pairs().is_empty());
+        assert_eq!(
+            serde_json::to_value(&params).unwrap(),
+            serde_json::json!({})
+        );
     }
 }

@@ -1,46 +1,29 @@
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-//! Claudius: A Rust client for the Anthropic API.
+//! Claudius: A typed Rust client for the Anthropic API.
 //!
-//! This crate provides a comprehensive client implementation for interacting with
-//! Anthropic's Claude AI models, including support for streaming responses, tool use,
-//! and agent-based interactions.
-
-pub mod chat;
+//! This crate provides typed access to the Messages API (buffered and streaming), tool
+//! definitions, message batches, files, models, and admin usage and cost reports, with
+//! per-response pricing, rate-limit capture, and tracing.
 
 mod accumulating_stream;
-mod agent;
 mod backoff;
-mod cache_control;
 mod client;
 mod error;
-mod json_schema;
 mod observability;
-mod prompt;
-mod pty;
-mod render;
 mod sse;
 mod types;
 
 pub use accumulating_stream::AccumulatingStream;
-pub use agent::{
-    Agent, Budget, FileSystem, IntermediateToolResult, Mount, MountHierarchy, Permissions,
-    TokenKind, Tool, ToolCallback, ToolResult, ToolSearchFileSystem, TurnOutcome, TurnStep,
-};
-pub use chat::ThinkingMode;
 pub use client::Anthropic;
 pub use error::{Error, HttpMetadata, Result};
-pub use json_schema::JsonSchema;
-pub use observability::register_biometrics;
-pub use prompt::{
-    PromptTestConfig, PromptTestResult, assert_contains, assert_max_length, assert_min_length,
-    assert_not_contains, assert_test_passed, test_prompt,
-};
-pub use pty::{BashPtyConfig, BashPtyResult, BashPtySession};
-pub use render::{AgentStreamContext, OperatorLine, PlainTextRenderer, Renderer, StreamContext};
 pub use sse::{SseEvent, parse_message_stream_event, process_message_stream_sse, process_sse};
 pub use types::*;
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme {}
 
 /// Pushes a message to the messages vector, or merges it with the last message if they have the same role.
 ///

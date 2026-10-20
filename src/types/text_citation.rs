@@ -1,15 +1,17 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
+use crate::types::open_union::{from_value, type_tag};
 use crate::types::{
     CitationCharLocation, CitationContentBlockLocation, CitationPageLocation,
-    CitationWebSearchResultLocation,
+    CitationSearchResultLocation, CitationWebSearchResultLocation,
 };
 
 /// A citation reference in a TextBlock.
 ///
 /// This enum represents the different types of citations that can be included
 /// in a text block's content.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum TextCitation {
     /// A character-based location citation
@@ -27,6 +29,33 @@ pub enum TextCitation {
     /// A web search result location citation
     #[serde(rename = "web_search_result_location")]
     WebSearchResultLocation(CitationWebSearchResultLocation),
+
+    /// A search result location citation
+    #[serde(rename = "search_result_location")]
+    SearchResultLocation(CitationSearchResultLocation),
+
+    /// A citation of a type this crate does not know, kept verbatim.
+    #[serde(untagged)]
+    Unknown(Value),
+}
+
+impl<'de> Deserialize<'de> for TextCitation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match type_tag::<D::Error>(&value)?.as_str() {
+            "char_location" => from_value(value).map(TextCitation::CharLocation),
+            "page_location" => from_value(value).map(TextCitation::PageLocation),
+            "content_block_location" => from_value(value).map(TextCitation::ContentBlockLocation),
+            "web_search_result_location" => {
+                from_value(value).map(TextCitation::WebSearchResultLocation)
+            }
+            "search_result_location" => from_value(value).map(TextCitation::SearchResultLocation),
+            _ => Ok(TextCitation::Unknown(value)),
+        }
+    }
 }
 
 impl TextCitation {
@@ -44,6 +73,7 @@ impl TextCitation {
             document_title,
             end_char_index,
             start_char_index,
+            file_id: None,
         };
         Self::CharLocation(char_location)
     }
@@ -62,6 +92,7 @@ impl TextCitation {
             document_title,
             end_page_number,
             start_page_number,
+            file_id: None,
         };
         Self::PageLocation(page_location)
     }
@@ -80,6 +111,7 @@ impl TextCitation {
             document_title,
             end_block_index,
             start_block_index,
+            file_id: None,
         };
         Self::ContentBlockLocation(content_block_location)
     }
@@ -114,6 +146,7 @@ mod tests {
             document_title: Some("Document Title".to_string()),
             end_char_index: 12,
             start_char_index: 0,
+            file_id: None,
         };
 
         let citation = TextCitation::CharLocation(char_location);
@@ -139,6 +172,7 @@ mod tests {
             document_title: Some("Document Title".to_string()),
             end_page_number: 5,
             start_page_number: 3,
+            file_id: None,
         };
 
         let citation = TextCitation::PageLocation(page_location);
@@ -164,6 +198,7 @@ mod tests {
             document_title: Some("Document Title".to_string()),
             start_block_index: 1,
             end_block_index: 5,
+            file_id: None,
         };
 
         let citation = TextCitation::ContentBlockLocation(content_block_location);
@@ -332,5 +367,53 @@ mod tests {
         });
 
         assert_eq!(json_value, expected);
+    }
+
+    #[test]
+    fn search_result_location_round_trip() {
+        let json = json!({
+            "type": "search_result_location",
+            "cited_text": "text",
+            "search_result_index": 0,
+            "source": "https://example.com",
+            "title": "Example",
+            "start_block_index": 1,
+            "end_block_index": 2
+        });
+        let citation: TextCitation = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(citation, TextCitation::SearchResultLocation(_)));
+        assert_eq!(serde_json::to_value(&citation).unwrap(), json);
+    }
+
+    #[test]
+    fn char_location_with_file_id() {
+        let json = json!({
+            "type": "char_location",
+            "cited_text": "t",
+            "document_index": 0,
+            "end_char_index": 1,
+            "start_char_index": 0,
+            "file_id": "file_01"
+        });
+        let citation: TextCitation = serde_json::from_value(json.clone()).unwrap();
+        let TextCitation::CharLocation(location) = &citation else {
+            panic!("expected char_location");
+        };
+        assert_eq!(location.file_id.as_deref(), Some("file_01"));
+        assert_eq!(serde_json::to_value(&citation).unwrap(), json);
+    }
+
+    #[test]
+    fn unknown_citation_round_trips() {
+        let raw = r#"{"type":"future_location","a":{"b":[1,2]}}"#;
+        let citation: TextCitation = serde_json::from_str(raw).unwrap();
+        assert!(matches!(citation, TextCitation::Unknown(_)));
+        assert_eq!(serde_json::to_string(&citation).unwrap(), raw);
+    }
+
+    #[test]
+    fn malformed_known_citation_errors() {
+        let json = json!({"type": "char_location"});
+        assert!(serde_json::from_value::<TextCitation>(json).is_err());
     }
 }

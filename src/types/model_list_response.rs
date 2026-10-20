@@ -81,6 +81,10 @@ mod tests {
             display_name: "Claude 3.7 Sonnet".to_string(),
             max_input_tokens: None,
             max_tokens: None,
+            deprecated_at: None,
+            retires_at: None,
+            lifecycle: None,
+            line: None,
             r#type: ModelType::Model,
         };
 
@@ -137,6 +141,10 @@ mod tests {
             display_name: "Claude 3.7 Sonnet".to_string(),
             max_input_tokens: None,
             max_tokens: None,
+            deprecated_at: None,
+            retires_at: None,
+            lifecycle: None,
+            line: None,
             r#type: ModelType::Model,
         };
 

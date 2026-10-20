@@ -265,7 +265,7 @@ mod tests {
     fn message_param_from_message() {
         let text_block = TextBlock::new("Hello, I'm Claude.".to_string());
         let content = vec![ContentBlock::Text(text_block)];
-        let model = Model::Known(KnownModel::Claude37Sonnet20250219);
+        let model = Model::Known(KnownModel::ClaudeSonnet55);
         let usage = Usage::new(50, 100);
 
         let message = Message::new("msg_012345".to_string(), content, model, usage);

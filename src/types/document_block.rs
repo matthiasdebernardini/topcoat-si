@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    Base64PdfSource, CacheControlEphemeral, CitationsConfig, ContentBlockSourceParam,
+    Base64PdfSource, CacheControlEphemeral, CitationsConfig, ContentBlockSourceParam, FileSource,
     PlainTextSource, UrlPdfSource,
 };
 
@@ -24,6 +24,10 @@ pub enum DocumentSource {
     /// A URL PDF source.
     #[serde(rename = "url")]
     UrlPdf(UrlPdfSource),
+
+    /// A file uploaded through the Files API.
+    #[serde(rename = "file")]
+    File(FileSource),
 }
 
 impl From<Base64PdfSource> for DocumentSource {
@@ -41,6 +45,12 @@ impl From<PlainTextSource> for DocumentSource {
 impl From<ContentBlockSourceParam> for DocumentSource {
     fn from(source: ContentBlockSourceParam) -> Self {
         DocumentSource::ContentBlock(source)
+    }
+}
+
+impl From<FileSource> for DocumentSource {
+    fn from(source: FileSource) -> Self {
+        DocumentSource::File(source)
     }
 }
 
@@ -103,6 +113,11 @@ impl DocumentBlock {
     /// Create a new `DocumentBlock` with a URL PDF source.
     pub fn new_with_url_pdf(source: UrlPdfSource) -> Self {
         Self::new(DocumentSource::UrlPdf(source))
+    }
+
+    /// Create a new `DocumentBlock` referencing a file uploaded through the Files API.
+    pub fn from_file_id(file_id: impl Into<String>) -> Self {
+        Self::new(DocumentSource::File(FileSource::new(file_id)))
     }
 
     /// Add a cache control to this document block.
@@ -241,5 +256,17 @@ mod tests {
                 "title": "Document Title"
             })
         );
+    }
+
+    #[test]
+    fn document_block_with_file_source() {
+        let block = DocumentBlock::from_file_id("file_01");
+        let json = to_value(&block).unwrap();
+        assert_eq!(
+            json,
+            json!({"source": {"type": "file", "file_id": "file_01"}})
+        );
+        let parsed: DocumentBlock = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, block);
     }
 }

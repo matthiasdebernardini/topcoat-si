@@ -1,44 +1,91 @@
-use biometrics::{Collector, Counter, Moments};
+//! Tracing events that replace counters and timing metrics.
+//!
+//! Every event below is a plain `tracing` event; aggregate them with any subscriber or layer
+//! (for example, filter on target and sum the fields).  Durations are in seconds.
+//!
+//! | Target | Level | Message | Fields |
+//! |---|---|---|---|
+//! | `claudius::client` | `DEBUG` | `request_completed` | `duration_seconds: f64`, `ok: bool` |
+//! | `claudius::client` | `DEBUG` | `retry` | `backoff_seconds: f64` |
+//! | `claudius::stream` | `TRACE` | `event` | (none) |
+//! | `claudius::stream` | `TRACE` | `bytes` | `bytes: u64` |
+//! | `claudius::stream` | `DEBUG` | `first_byte` | `ttfb_seconds: f64` |
+//! | `claudius::stream` | `DEBUG` | `completed` | `duration_seconds: f64` |
+//! | `claudius::stream` | `DEBUG` | `error` | (none) |
+//! | `claudius::usage` | `INFO` | `usage` | `model`, `input_tokens: u64`, `output_tokens: u64`, `cache_read_input_tokens: u64`, `cache_creation_input_tokens: u64`, `cost_micro_cents: Option<u64>` (debug-formatted; `None` for unknown models) |
+//!
+//! `claudius::client` `request_completed` fires once per API call (after any retries).  The
+//! `claudius::usage` event fires once per completed `send` call and once per stream that
+//! reaches `message_stop`.
 
-pub(crate) static CLIENT_REQUESTS: Counter = Counter::new("claudius.client.requests");
-pub(crate) static CLIENT_REQUEST_ERRORS: Counter = Counter::new("claudius.client.request_errors");
-pub(crate) static CLIENT_REQUEST_RETRIES: Counter = Counter::new("claudius.client.retries");
-pub(crate) static CLIENT_REQUEST_DURATION: Moments =
-    Moments::new("claudius.client.request_duration_seconds");
-pub(crate) static CLIENT_RETRY_BACKOFF: Moments =
-    Moments::new("claudius.client.retry_backoff_seconds");
+use std::time::Duration;
 
-pub(crate) static STREAM_EVENTS: Counter = Counter::new("claudius.stream.events");
-pub(crate) static STREAM_ERRORS: Counter = Counter::new("claudius.stream.errors");
-pub(crate) static STREAM_BYTES: Counter = Counter::new("claudius.stream.bytes");
-pub(crate) static STREAM_TTFB: Moments = Moments::new("claudius.stream.ttfb_seconds");
-pub(crate) static STREAM_DURATION: Moments = Moments::new("claudius.stream.duration_seconds");
+/// One API call finished successfully after `duration`.
+pub(crate) fn request_succeeded(duration: Duration) {
+    tracing::debug!(
+        target: "claudius::client",
+        duration_seconds = duration.as_secs_f64(),
+        ok = true,
+        "request_completed"
+    );
+}
 
-pub(crate) static AGENT_TURN_DURATION: Moments =
-    Moments::new("claudius.agent.turn_duration_seconds");
-pub(crate) static AGENT_TURN_REQUESTS: Counter = Counter::new("claudius.agent.turn_requests");
-pub(crate) static AGENT_TOOL_CALLS: Counter = Counter::new("claudius.agent.tool_calls");
-pub(crate) static AGENT_TOOL_ERRORS: Counter = Counter::new("claudius.agent.tool_errors");
-pub(crate) static AGENT_TOOL_DURATION: Moments =
-    Moments::new("claudius.agent.tool_duration_seconds");
+/// One API call failed after `duration`.
+pub(crate) fn request_failed(duration: Duration) {
+    tracing::debug!(
+        target: "claudius::client",
+        duration_seconds = duration.as_secs_f64(),
+        ok = false,
+        "request_completed"
+    );
+}
 
-/// Register this crate's biometrics with the provided collector.
-pub fn register_biometrics(collector: &Collector) {
-    collector.register_counter(&CLIENT_REQUESTS);
-    collector.register_counter(&CLIENT_REQUEST_ERRORS);
-    collector.register_counter(&CLIENT_REQUEST_RETRIES);
-    collector.register_moments(&CLIENT_REQUEST_DURATION);
-    collector.register_moments(&CLIENT_RETRY_BACKOFF);
+/// One API call finished after `duration`; report it by the outcome in `result`.
+pub(crate) fn request_finished<T, E>(duration: Duration, result: &Result<T, E>) {
+    match result {
+        Ok(_) => request_succeeded(duration),
+        Err(_) => request_failed(duration),
+    }
+}
 
-    collector.register_counter(&STREAM_EVENTS);
-    collector.register_counter(&STREAM_ERRORS);
-    collector.register_counter(&STREAM_BYTES);
-    collector.register_moments(&STREAM_TTFB);
-    collector.register_moments(&STREAM_DURATION);
+/// One retry is about to sleep for `backoff`.
+pub(crate) fn retry(backoff: Duration) {
+    tracing::debug!(
+        target: "claudius::client",
+        backoff_seconds = backoff.as_secs_f64(),
+        "retry"
+    );
+}
 
-    collector.register_moments(&AGENT_TURN_DURATION);
-    collector.register_counter(&AGENT_TURN_REQUESTS);
-    collector.register_counter(&AGENT_TOOL_CALLS);
-    collector.register_counter(&AGENT_TOOL_ERRORS);
-    collector.register_moments(&AGENT_TOOL_DURATION);
+/// One SSE event was parsed.
+pub(crate) fn stream_event() {
+    tracing::trace!(target: "claudius::stream", "event");
+}
+
+/// One chunk of `bytes` bytes arrived on a stream.
+pub(crate) fn stream_bytes(bytes: u64) {
+    tracing::trace!(target: "claudius::stream", bytes, "bytes");
+}
+
+/// The first byte of a stream arrived `ttfb` after the stream started.
+pub(crate) fn stream_first_byte(ttfb: Duration) {
+    tracing::debug!(
+        target: "claudius::stream",
+        ttfb_seconds = ttfb.as_secs_f64(),
+        "first_byte"
+    );
+}
+
+/// A stream reached end of input after `duration`.
+pub(crate) fn stream_completed(duration: Duration) {
+    tracing::debug!(
+        target: "claudius::stream",
+        duration_seconds = duration.as_secs_f64(),
+        "completed"
+    );
+}
+
+/// A stream failed.
+pub(crate) fn stream_error() {
+    tracing::debug!(target: "claudius::stream", "error");
 }

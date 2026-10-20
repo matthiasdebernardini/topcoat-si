@@ -2,7 +2,10 @@ use std::ops::Add;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{OutputTokensDetails, ServerToolUsage, UsageIteration};
+use crate::types::{
+    CacheCreation, FallbackCredit, InferenceSpeed, OutputTokensDetails, ServerToolUsage,
+    ServiceTier, UsageIteration,
+};
 
 /// Usage information for API calls.
 ///
@@ -13,6 +16,10 @@ pub struct Usage {
     /// The number of input tokens used to create the cache entry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<i32>,
+
+    /// Breakdown of cache-creation input tokens by cache lifetime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreation>,
 
     /// The number of input tokens read from the cache.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,6 +42,24 @@ pub struct Usage {
     /// Per-model attempts made by fallback routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iterations: Option<Vec<UsageIteration>>,
+
+    /// The service tier that served the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTier>,
+
+    /// The geography where inference ran (for example `"global"` or `"us"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_geo: Option<String>,
+
+    /// The inference speed the request ran at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<InferenceSpeed>,
+
+    /// Fallback-credit outcome; present on the fallback-credit beta.  Its `status` is tagged
+    /// `"redeemed"` or `"not_applied"`.  Boxed to keep `Usage`, and the stream events and
+    /// batch results that embed it, small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_credit: Option<Box<FallbackCredit>>,
 }
 
 impl Usage {
@@ -42,18 +67,29 @@ impl Usage {
     pub fn new(input_tokens: i32, output_tokens: i32) -> Self {
         Self {
             cache_creation_input_tokens: None,
+            cache_creation: None,
             cache_read_input_tokens: None,
             input_tokens,
             output_tokens,
             output_tokens_details: None,
             server_tool_use: None,
             iterations: None,
+            service_tier: None,
+            inference_geo: None,
+            speed: None,
+            fallback_credit: None,
         }
     }
 
     /// Set the cache creation input tokens.
     pub fn with_cache_creation_input_tokens(mut self, tokens: i32) -> Self {
         self.cache_creation_input_tokens = Some(tokens);
+        self
+    }
+
+    /// Set the cache-creation breakdown by cache lifetime.
+    pub fn with_cache_creation(mut self, cache_creation: CacheCreation) -> Self {
+        self.cache_creation = Some(cache_creation);
         self
     }
 
@@ -79,6 +115,41 @@ impl Usage {
         self.server_tool_use = Some(server_tool_use);
         self
     }
+
+    /// Set the service tier.
+    pub fn with_service_tier(mut self, service_tier: ServiceTier) -> Self {
+        self.service_tier = Some(service_tier);
+        self
+    }
+
+    /// Set the inference geography.
+    pub fn with_inference_geo(mut self, inference_geo: impl Into<String>) -> Self {
+        self.inference_geo = Some(inference_geo.into());
+        self
+    }
+
+    /// Set the inference speed.
+    pub fn with_speed(mut self, speed: InferenceSpeed) -> Self {
+        self.speed = Some(speed);
+        self
+    }
+
+    /// Set the fallback-credit outcome.
+    pub fn with_fallback_credit(mut self, fallback_credit: FallbackCredit) -> Self {
+        self.fallback_credit = Some(Box::new(fallback_credit));
+        self
+    }
+
+    /// Total prompt tokens: input plus cache writes plus cache reads, each clamped at 0.
+    ///
+    /// This is the count Anthropic uses to pick Claude Haiku 5.5's pricing tier.
+    /// It describes a single request; summed usage across requests mis-tiers Claude Haiku 5.5.
+    pub fn prompt_tokens(&self) -> u64 {
+        let clamp = |tokens: i32| u64::try_from(tokens).unwrap_or(0);
+        clamp(self.input_tokens)
+            + clamp(self.cache_creation_input_tokens.unwrap_or(0))
+            + clamp(self.cache_read_input_tokens.unwrap_or(0))
+    }
 }
 
 /// Helper function to add two Option values where the contained type implements Add.
@@ -87,6 +158,16 @@ fn add_options<T: std::ops::Add<Output = T>>(left: Option<T>, right: Option<T>) 
         (Some(a), Some(b)) => Some(a + b),
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Adopt a value when only one side has it and keep it when both agree; a merged usage
+/// spanning different values has none.
+fn adopt_or_drop_conflict<T: PartialEq>(left: Option<T>, right: Option<T>) -> Option<T> {
+    match (left, right) {
+        (Some(left), Some(right)) => (left == right).then_some(left),
+        (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
     }
 }
@@ -100,6 +181,7 @@ impl Add for Usage {
                 self.cache_creation_input_tokens,
                 rhs.cache_creation_input_tokens,
             ),
+            cache_creation: add_options(self.cache_creation, rhs.cache_creation),
             cache_read_input_tokens: add_options(
                 self.cache_read_input_tokens,
                 rhs.cache_read_input_tokens,
@@ -119,6 +201,10 @@ impl Add for Usage {
                 (Some(iterations), None) | (None, Some(iterations)) => Some(iterations),
                 (None, None) => None,
             },
+            service_tier: adopt_or_drop_conflict(self.service_tier, rhs.service_tier),
+            inference_geo: adopt_or_drop_conflict(self.inference_geo, rhs.inference_geo),
+            speed: adopt_or_drop_conflict(self.speed, rhs.speed),
+            fallback_credit: adopt_or_drop_conflict(self.fallback_credit, rhs.fallback_credit),
         }
     }
 }
@@ -126,6 +212,7 @@ impl Add for Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::FallbackCreditStatus;
     use serde_json::{json, to_value};
 
     #[test]
@@ -171,6 +258,25 @@ mod tests {
     }
 
     #[test]
+    fn usage_cache_creation_and_prompt_tokens() {
+        let usage = Usage::new(10, 5)
+            .with_cache_creation_input_tokens(5000)
+            .with_cache_creation(CacheCreation::new(2000, 3000))
+            .with_cache_read_input_tokens(400);
+        assert_eq!(usage.prompt_tokens(), 5410);
+
+        let json = to_value(&usage).unwrap();
+        assert_eq!(json["cache_creation"]["ephemeral_1h_input_tokens"], 3000);
+        let parsed: Usage = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, usage);
+
+        let sum = usage.clone() + usage;
+        assert_eq!(sum.cache_creation, Some(CacheCreation::new(4000, 6000)));
+
+        assert_eq!(Usage::new(-3, 1).prompt_tokens(), 0);
+    }
+
+    #[test]
     fn usage_deserialization() {
         let json = json!({
             "cache_creation_input_tokens": 20,
@@ -195,6 +301,89 @@ mod tests {
             Some(OutputTokensDetails::new(40))
         );
         assert_eq!(usage.server_tool_use, Some(ServerToolUsage::new(5)));
+    }
+
+    #[test]
+    fn usage_speed_deserializes_known_and_unknown() {
+        let usage: Usage = serde_json::from_value(
+            json!({"input_tokens": 1, "output_tokens": 2, "speed": "fast", "service_tier": "priority", "inference_geo": "us"}),
+        )
+        .unwrap();
+        assert_eq!(usage.speed, Some(InferenceSpeed::Fast));
+        assert_eq!(usage.service_tier, Some(ServiceTier::Priority));
+        assert_eq!(usage.inference_geo.as_deref(), Some("us"));
+
+        let usage: Usage = serde_json::from_value(
+            json!({"input_tokens": 1, "output_tokens": 2, "speed": "turbo"}),
+        )
+        .unwrap();
+        assert_eq!(usage.speed, Some(InferenceSpeed::Unknown));
+    }
+
+    #[test]
+    fn add_usage_keeps_equal_tier_speed_geo_and_drops_differing() {
+        let a = Usage::new(1, 1)
+            .with_service_tier(ServiceTier::Standard)
+            .with_speed(InferenceSpeed::Fast)
+            .with_inference_geo("us");
+        let b = Usage::new(1, 1)
+            .with_service_tier(ServiceTier::Standard)
+            .with_speed(InferenceSpeed::Standard)
+            .with_inference_geo("us");
+        let sum = a + b;
+        assert_eq!(sum.service_tier, Some(ServiceTier::Standard));
+        assert_eq!(sum.speed, None);
+        assert_eq!(sum.inference_geo.as_deref(), Some("us"));
+
+        let sum = Usage::new(1, 1).with_service_tier(ServiceTier::Batch) + Usage::new(1, 1);
+        assert_eq!(sum.service_tier, Some(ServiceTier::Batch));
+
+        let seeded = Usage::new(0, 0)
+            + Usage::new(1, 1)
+                .with_service_tier(ServiceTier::Priority)
+                .with_speed(InferenceSpeed::Fast)
+                .with_inference_geo("us");
+        assert_eq!(seeded.service_tier, Some(ServiceTier::Priority));
+        assert_eq!(seeded.speed, Some(InferenceSpeed::Fast));
+        assert_eq!(seeded.inference_geo.as_deref(), Some("us"));
+
+        let sum = Usage::new(1, 1).with_service_tier(ServiceTier::Batch)
+            + Usage::new(1, 1).with_service_tier(ServiceTier::Standard);
+        assert_eq!(sum.service_tier, None);
+    }
+
+    #[test]
+    fn fallback_credit_deserializes_and_add_keeps_equal() {
+        let usage: Usage = serde_json::from_value(json!({
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "fallback_credit": {"status": {"type": "redeemed"}}
+        }))
+        .unwrap();
+        assert_eq!(
+            usage.fallback_credit,
+            Some(Box::new(FallbackCredit::new(
+                FallbackCreditStatus::Redeemed
+            )))
+        );
+        assert_eq!(
+            to_value(&usage).unwrap()["fallback_credit"]["status"]["type"],
+            "redeemed"
+        );
+
+        let sum = usage.clone() + usage.clone();
+        assert_eq!(
+            sum.fallback_credit,
+            Some(Box::new(FallbackCredit::new(
+                FallbackCreditStatus::Redeemed
+            )))
+        );
+        let sum = usage.clone() + Usage::new(1, 1);
+        assert_eq!(sum.fallback_credit, usage.fallback_credit);
+        let sum = usage
+            + Usage::new(1, 1)
+                .with_fallback_credit(FallbackCredit::new(FallbackCreditStatus::Unknown));
+        assert_eq!(sum.fallback_credit, None);
     }
 
     #[test]

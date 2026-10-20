@@ -26,6 +26,13 @@ pub enum StopReason {
 
     /// The response stopped because it exceeded the model's context window
     ModelContextWindowExceeded,
+
+    /// The response stopped after producing a compaction block.
+    ///
+    /// The caller re-sends the conversation with the `compaction` block first in
+    /// `messages` and the summarized messages removed.
+    Compaction,
+
     /// A value introduced by a newer API version.
     #[serde(other)]
     Unknown,
@@ -42,6 +49,7 @@ impl fmt::Display for StopReason {
             StopReason::PauseTurn => write!(f, "pause_turn"),
             StopReason::Refusal => write!(f, "refusal"),
             StopReason::ModelContextWindowExceeded => write!(f, "model_context_window_exceeded"),
+            StopReason::Compaction => write!(f, "compaction"),
         }
     }
 }
@@ -76,6 +84,7 @@ impl FromStr for StopReason {
             "pause_turn" => Ok(StopReason::PauseTurn),
             "refusal" => Ok(StopReason::Refusal),
             "model_context_window_exceeded" => Ok(StopReason::ModelContextWindowExceeded),
+            "compaction" => Ok(StopReason::Compaction),
             _ => Err(StopReasonParseError {
                 invalid_value: s.to_string(),
             }),
@@ -136,5 +145,17 @@ mod tests {
     fn display_model_context_window_exceeded() {
         let reason = StopReason::ModelContextWindowExceeded;
         assert_eq!(reason.to_string(), "model_context_window_exceeded");
+    }
+
+    #[test]
+    fn compaction_round_trip() {
+        let reason: StopReason = serde_json::from_str(r#""compaction""#).unwrap();
+        assert_eq!(reason, StopReason::Compaction);
+        assert_eq!(serde_json::to_string(&reason).unwrap(), r#""compaction""#);
+        assert_eq!(reason.to_string(), "compaction");
+        assert_eq!(
+            "compaction".parse::<StopReason>().unwrap(),
+            StopReason::Compaction
+        );
     }
 }

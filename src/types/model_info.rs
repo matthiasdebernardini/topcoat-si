@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::types::ModelCapabilities;
+use crate::types::{ModelCapabilities, ModelLifecycle};
 
 /// Information about a specific model.
 ///
@@ -34,6 +34,30 @@ pub struct ModelInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
 
+    /// When the model was deprecated, if it has been.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub deprecated_at: Option<OffsetDateTime>,
+
+    /// When the model retires (or retired), if scheduled.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub retires_at: Option<OffsetDateTime>,
+
+    /// Lifecycle state of the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<ModelLifecycle>,
+
+    /// The model line this model belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+
     /// Object type.
     ///
     /// For Models, this is always `"model"`.
@@ -65,6 +89,10 @@ mod tests {
             display_name: "Claude 3.7 Sonnet".to_string(),
             max_input_tokens: None,
             max_tokens: None,
+            deprecated_at: None,
+            retires_at: None,
+            lifecycle: None,
+            line: None,
             r#type: ModelType::Model,
         };
 
@@ -97,7 +125,7 @@ mod tests {
     #[test]
     fn model_info_deserializes_current_capabilities_and_limits() {
         let json = serde_json::json!({
-            "id": "claude-opus-5",
+            "id": "claude-opus-5-5",
             "capabilities": {
                 "batch": { "supported": true },
                 "citations": { "supported": true },
@@ -138,5 +166,63 @@ mod tests {
         assert_eq!(model.max_input_tokens, Some(1_000_000));
         assert_eq!(model.max_tokens, Some(128_000));
         assert!(model.capabilities.unwrap().effort.max.supported);
+    }
+
+    #[test]
+    fn model_info_deserializes_lifecycle_and_server_tools() {
+        let json = serde_json::json!({
+            "id": "claude-old",
+            "capabilities": {
+                "batch": { "supported": true },
+                "citations": { "supported": true },
+                "code_execution": { "supported": true },
+                "context_management": { "supported": false },
+                "effort": {
+                    "high": { "supported": true },
+                    "low": { "supported": true },
+                    "max": { "supported": true },
+                    "medium": { "supported": true },
+                    "supported": true
+                },
+                "image_input": { "supported": true },
+                "pdf_input": { "supported": true },
+                "server_tools": {
+                    "supported": true,
+                    "code_execution": { "supported": true },
+                    "web_search": { "supported": false }
+                },
+                "structured_outputs": { "supported": true },
+                "thinking": {
+                    "supported": true,
+                    "types": {
+                        "adaptive": { "supported": true },
+                        "enabled": { "supported": true },
+                        "disabled": { "supported": true },
+                        "between_tools": { "supported": false }
+                    }
+                }
+            },
+            "created_at": "2025-02-19T00:00:00Z",
+            "display_name": "Claude Old",
+            "lifecycle": "deprecated",
+            "line": "sonnet",
+            "deprecated_at": "2026-09-01T00:00:00Z",
+            "retires_at": "2027-01-01T00:00:00Z",
+            "type": "model"
+        });
+
+        let model: ModelInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(model.lifecycle, Some(ModelLifecycle::Deprecated));
+        assert_eq!(model.line.as_deref(), Some("sonnet"));
+        assert_eq!(model.deprecated_at, Some(datetime!(2026-09-01 0:00:00 UTC)));
+        assert_eq!(model.retires_at, Some(datetime!(2027-01-01 0:00:00 UTC)));
+        let capabilities = model.capabilities.unwrap();
+        let server_tools = capabilities.server_tools.unwrap();
+        assert!(server_tools.supported);
+        assert_eq!(server_tools.code_execution.map(|c| c.supported), Some(true));
+        assert_eq!(server_tools.web_search.map(|c| c.supported), Some(false));
+        let types = capabilities.thinking.types;
+        assert_eq!(types.disabled.map(|c| c.supported), Some(true));
+        assert_eq!(types.between_tools.map(|c| c.supported), Some(false));
     }
 }

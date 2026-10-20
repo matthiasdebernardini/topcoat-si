@@ -88,6 +88,13 @@ impl MessageBatchCreateParams {
                 ));
             }
 
+            if request.params.speed.is_some() {
+                return Err(crate::Error::validation(
+                    "speed (fast mode) is not supported in message batch requests",
+                    Some(format!("requests[{i}].params.speed")),
+                ));
+            }
+
             request.params.validate().map_err(|err| match err {
                 crate::Error::Validation { message, param } => crate::Error::validation(
                     message,
@@ -172,7 +179,6 @@ impl Serialize for MessageBatchRequestParams<'_> {
         let mut len = 3;
         len += usize::from(params.cache_control.is_some());
         len += usize::from(params.metadata.is_some());
-        len += usize::from(params.output_format.is_some());
         len += usize::from(params.output_config.is_some());
         len += usize::from(params.stop_sequences.is_some());
         len += usize::from(params.system.is_some());
@@ -182,6 +188,13 @@ impl Serialize for MessageBatchRequestParams<'_> {
         len += usize::from(params.tools.is_some());
         len += usize::from(params.top_k.is_some());
         len += usize::from(params.top_p.is_some());
+        len += usize::from(params.service_tier.is_some());
+        len += usize::from(params.inference_geo.is_some());
+        len += usize::from(params.container.is_some());
+        len += usize::from(params.diagnostics.is_some());
+        len += usize::from(params.context_management.is_some());
+        len += usize::from(params.compaction.is_some());
+        len += usize::from(params.mcp_servers.is_some());
 
         let mut state = serializer.serialize_struct("MessageBatchRequestParams", len)?;
         state.serialize_field("max_tokens", &params.max_tokens)?;
@@ -192,9 +205,6 @@ impl Serialize for MessageBatchRequestParams<'_> {
         }
         if let Some(metadata) = &params.metadata {
             state.serialize_field("metadata", metadata)?;
-        }
-        if let Some(output_format) = &params.output_format {
-            state.serialize_field("output_format", output_format)?;
         }
         if let Some(output_config) = &params.output_config {
             state.serialize_field("output_config", output_config)?;
@@ -222,6 +232,27 @@ impl Serialize for MessageBatchRequestParams<'_> {
         }
         if let Some(top_p) = &params.top_p {
             state.serialize_field("top_p", top_p)?;
+        }
+        if let Some(service_tier) = &params.service_tier {
+            state.serialize_field("service_tier", service_tier)?;
+        }
+        if let Some(inference_geo) = &params.inference_geo {
+            state.serialize_field("inference_geo", inference_geo)?;
+        }
+        if let Some(container) = &params.container {
+            state.serialize_field("container", container)?;
+        }
+        if let Some(diagnostics) = &params.diagnostics {
+            state.serialize_field("diagnostics", diagnostics)?;
+        }
+        if let Some(context_management) = &params.context_management {
+            state.serialize_field("context_management", context_management)?;
+        }
+        if let Some(compaction) = &params.compaction {
+            state.serialize_field("compaction", compaction)?;
+        }
+        if let Some(mcp_servers) = &params.mcp_servers {
+            state.serialize_field("mcp_servers", mcp_servers)?;
         }
         state.end()
     }
@@ -401,6 +432,8 @@ pub struct MessageBatchResult {
 /// Result for a single request within a Message Batch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
+// `Message` carries the response fields the API added; results are consumed one at a time.
+#[allow(clippy::large_enum_variant)]
 pub enum MessageBatchResultVariant {
     /// The request completed successfully and produced a message.
     #[serde(rename = "succeeded")]
@@ -520,7 +553,7 @@ mod tests {
         MessageCreateParams::new(
             1024,
             vec![MessageParam::user("Hello, world")],
-            Model::Known(KnownModel::ClaudeOpus48),
+            Model::Known(KnownModel::ClaudeOpus55),
         )
     }
 
@@ -545,7 +578,7 @@ mod tests {
                             "role": "user",
                             "content": "Hello, world"
                         }],
-                        "model": "claude-opus-4-8"
+                        "model": "claude-opus-5-5"
                     }
                 }]
             })
@@ -602,6 +635,33 @@ mod tests {
         let err = params.validate().unwrap_err();
         assert!(err.is_validation());
         assert!(err.to_string().contains("stream"));
+    }
+
+    #[test]
+    fn batch_create_params_reject_speed() {
+        let mut request = valid_batch_request("fast");
+        request.params.speed = Some(crate::types::InferenceSpeed::Fast);
+        let params = MessageBatchCreateParams::new(vec![request]);
+        let err = params.validate().unwrap_err();
+        assert!(err.is_validation());
+        assert!(err.to_string().contains("speed"));
+    }
+
+    #[test]
+    fn batch_create_params_serialize_new_request_fields() {
+        let mut request = valid_batch_request("new-fields");
+        request.params.service_tier = Some(crate::types::ServiceTierChoice::StandardOnly);
+        request.params.inference_geo = Some("us".to_string());
+        request.params.compaction = Some(crate::types::CompactionRequest::new());
+        let json = serde_json::to_value(MessageBatchCreateParams::new(vec![request])).unwrap();
+        let params = &json["requests"][0]["params"];
+        assert_eq!(params["service_tier"], "standard_only");
+        assert_eq!(params["inference_geo"], "us");
+        assert_eq!(
+            params["compaction"],
+            serde_json::json!({"type": "summarize"})
+        );
+        assert!(params.get("speed").is_none());
     }
 
     #[test]
@@ -686,7 +746,7 @@ mod tests {
                     "id": "msg_123",
                     "type": "message",
                     "role": "assistant",
-                    "model": "claude-opus-4-8",
+                    "model": "claude-opus-5-5",
                     "content": [{"type": "text", "text": "Hello"}],
                     "stop_reason": "end_turn",
                     "stop_sequence": null,
@@ -789,7 +849,7 @@ mod tests {
         let message = Message::new(
             "msg_123".to_string(),
             vec![TextBlock::new("Hello").into()],
-            Model::Known(KnownModel::ClaudeOpus48),
+            Model::Known(KnownModel::ClaudeOpus55),
             Usage::new(1, 1),
         );
         let result = MessageBatchResult {

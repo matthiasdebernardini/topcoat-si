@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    CacheControlEphemeral, FallbackConfig, Fallbacks, MessageParam, Metadata, Model, OutputConfig,
-    OutputFormat, SystemPrompt, TextBlock, ThinkingConfig, ThinkingDisplay, ToolChoice,
-    ToolUnionParam,
+    CacheControlEphemeral, CompactionRequest, Container, ContextManagement, DiagnosticsRequest,
+    FallbackConfig, Fallbacks, InferenceSpeed, McpServer, MessageParam, Metadata, Model,
+    OutputConfig, ServiceTierChoice, SystemPrompt, TextBlock, ThinkingConfig, ThinkingDisplay,
+    ToolChoice, ToolUnionParam,
 };
 
 /// Security limits for DoS prevention
@@ -11,6 +12,9 @@ const MAX_MESSAGE_COUNT: usize = 1000;
 const MAX_STOP_SEQUENCES: usize = 100;
 const MAX_STOP_SEQUENCE_LENGTH: usize = 1000;
 const MAX_TOOLS_COUNT: usize = 100;
+const MAX_CONTAINER_SKILLS: usize = 20;
+/// Minimum `output_config.task_budget.total` accepted by the API.
+const MIN_TASK_BUDGET_TOTAL: u64 = 20_000;
 
 /// Parameters for creating messages.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -56,25 +60,11 @@ pub struct MessageCreateParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
 
-    /// Output format configuration for structured outputs.
+    /// Output configuration for structured outputs, effort control and task budgets.
     ///
-    /// When set, constrains Claude's response to follow a specific JSON schema,
-    /// ensuring valid, parseable output for downstream processing.
-    ///
-    /// This feature requires the beta header `structured-outputs-2025-11-13`.
-    ///
-    /// See
-    /// [structured outputs](https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs)
-    /// for details.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_format: Option<OutputFormat>,
-
-    /// Output configuration for structured outputs and effort control.
-    ///
-    /// This is the newer configuration format. When set, it takes precedence
-    /// over the deprecated `output_format` field for structured outputs.
-    /// Also supports the `effort` parameter for controlling thinking depth
-    /// with adaptive thinking.
+    /// `format` constrains Claude's response to a JSON schema (no beta header
+    /// needed), `effort` controls thinking depth with adaptive thinking, and
+    /// `task_budget` sets a token budget for the whole task.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<OutputConfig>,
 
@@ -100,20 +90,17 @@ pub struct MessageCreateParams {
 
     /// Amount of randomness injected into the response.
     ///
-    /// Defaults to `1.0`. Ranges from `0.0` to `1.0`. Use `temperature` closer to `0.0`
-    /// for analytical / multiple choice, and closer to `1.0` for creative and
-    /// generative tasks.
-    ///
-    /// Note that even with `temperature` of `0.0`, the results will not be fully
-    /// deterministic.
+    /// Defaults to `1.0`. Current models (Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1)
+    /// reject any other value; leave this unset for them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
 
-    /// Configuration for enabling Claude's extended thinking.
+    /// Configuration for Claude's extended thinking.
     ///
-    /// When enabled, responses include `thinking` content blocks showing Claude's
-    /// thinking process before the final answer. Requires a minimum budget of 1,024
-    /// tokens and counts towards your `max_tokens` limit.
+    /// When thinking is on, responses include `thinking` content blocks before the final
+    /// answer, and thinking tokens count towards `max_tokens`. Current models reject
+    /// `enabled`; use `adaptive`. Opus 5.5, Sonnet 5.5 and Fable 5.1 also reject
+    /// `disabled`; Haiku 5.5 rejects it at effort `xhigh` or `max`.
     ///
     /// See
     /// [extended thinking](https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking)
@@ -139,11 +126,8 @@ pub struct MessageCreateParams {
 
     /// Only sample from the top K options for each subsequent token.
     ///
-    /// Used to remove "long tail" low probability responses.
-    /// [Learn more technical details here](https://towardsdatascience.com/how-to-sample-from-language-models-682bceb97277).
-    ///
-    /// Recommended for advanced use cases only. You usually only need to use
-    /// `temperature`.
+    /// Current models (Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1) reject `top_k` at
+    /// any value; leave this unset for them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
 
@@ -151,11 +135,8 @@ pub struct MessageCreateParams {
     ///
     /// In nucleus sampling, we compute the cumulative distribution over all the options
     /// for each subsequent token in decreasing probability order and cut it off once it
-    /// reaches a particular probability specified by `top_p`. You should either alter
-    /// `temperature` or `top_p`, but not both.
-    ///
-    /// Recommended for advanced use cases only. You usually only need to use
-    /// `temperature`.
+    /// reaches a particular probability specified by `top_p`. Current models (Opus 5.5,
+    /// Sonnet 5.5, Haiku 5.5, Fable 5.1) only accept values >= 0.99.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
@@ -176,6 +157,64 @@ pub struct MessageCreateParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_credit_token: Option<String>,
 
+    /// Which service tier this request may use.
+    ///
+    /// Distinct from the response `ServiceTier`, which reports the tier used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTierChoice>,
+
+    /// Inference speed for this request.
+    ///
+    /// Fast mode is generally available on Opus 5.5 and needs no beta header. It
+    /// is not allowed in Message Batches; batch validation rejects it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<InferenceSpeed>,
+
+    /// Where inference runs: `"global"` or `"us"`.
+    ///
+    /// `"us"` is billed at 1.1x.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_geo: Option<String>,
+
+    /// Container to run code execution and skills in, either an existing
+    /// container id or a configuration with at most 20 skills.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<Container>,
+
+    /// Opt in to prompt-cache diagnostics.
+    ///
+    /// Send `previous_message_id: null` on the first turn and pass the previous
+    /// response `id` on later turns; the response `diagnostics` field then
+    /// reports the earliest divergence that caused a cache miss. Generally
+    /// available; no beta header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<DiagnosticsRequest>,
+
+    /// Server-side context management (tool-use clearing, thinking clearing,
+    /// compaction edits).
+    ///
+    /// Requires the `context-management-2025-06-27` beta, plus
+    /// `compact-2026-01-12` when a compact edit is present; both are added
+    /// automatically. Mutually exclusive with `compaction`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<ContextManagement>,
+
+    /// Compaction on demand.
+    ///
+    /// The response contains a `compaction` content block and
+    /// `stop_reason: "compaction"`; the caller must re-send with that block
+    /// first in `messages` and the summarized messages removed. Requires the
+    /// `compact-2026-09-04` beta, added automatically. Mutually exclusive with
+    /// `context_management`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionRequest>,
+
+    /// Remote MCP servers the API connects to.
+    ///
+    /// Requires the `mcp-client-2025-11-20` beta, added automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Vec<McpServer>>,
+
     /// Whether to incrementally stream the response using server-sent events.
     ///
     /// See [streaming](https://docs.anthropic.com/en/api/messages-streaming) for
@@ -184,8 +223,8 @@ pub struct MessageCreateParams {
 
     /// Beta feature headers to include with this request.
     ///
-    /// These are merged with any client-level default betas and the
-    /// auto-detected `structured-outputs-2025-11-13` beta. Duplicates are
+    /// These are merged with any client-level default betas and the betas
+    /// auto-detected from the features this request uses. Duplicates are
     /// removed before sending.
     #[serde(skip)]
     pub betas: Option<Vec<String>>,
@@ -221,7 +260,6 @@ impl MessageCreateParams {
             model,
             cache_control: None,
             metadata: None,
-            output_format: None,
             output_config: None,
             stop_sequences: None,
             system: None,
@@ -233,6 +271,14 @@ impl MessageCreateParams {
             top_p: None,
             fallbacks: None,
             fallback_credit_token: None,
+            service_tier: None,
+            speed: None,
+            inference_geo: None,
+            container: None,
+            diagnostics: None,
+            context_management: None,
+            compaction: None,
+            mcp_servers: None,
             stream: false,
             betas: None,
         }
@@ -246,7 +292,6 @@ impl MessageCreateParams {
             model,
             cache_control: None,
             metadata: None,
-            output_format: None,
             output_config: None,
             stop_sequences: None,
             system: None,
@@ -258,6 +303,14 @@ impl MessageCreateParams {
             top_p: None,
             fallbacks: None,
             fallback_credit_token: None,
+            service_tier: None,
+            speed: None,
+            inference_geo: None,
+            container: None,
+            diagnostics: None,
+            context_management: None,
+            compaction: None,
+            mcp_servers: None,
             stream: true,
             betas: None,
         }
@@ -277,38 +330,27 @@ impl MessageCreateParams {
         self
     }
 
-    /// Add output format for structured outputs.
+    /// Add output configuration.
     ///
-    /// When set, constrains Claude's response to follow a specific JSON schema,
-    /// ensuring valid, parseable output for downstream processing.
-    ///
-    /// This feature requires the beta header `structured-outputs-2025-11-13`.
+    /// Supports the structured output format, the effort parameter for adaptive
+    /// thinking, and a task budget. Structured outputs need no beta header.
     ///
     /// # Example
     ///
     /// ```
     /// use serde_json::json;
-    /// use claudius::{MessageCreateParams, OutputFormat, KnownModel};
+    /// use claudius::{MessageCreateParams, OutputConfig, OutputFormat, KnownModel};
     ///
-    /// let params = MessageCreateParams::simple("Extract info", KnownModel::ClaudeHaiku45)
-    ///     .with_output_format(OutputFormat::json_schema(json!({
+    /// let params = MessageCreateParams::simple("Extract info", KnownModel::ClaudeHaiku55)
+    ///     .with_output_config(OutputConfig::new().with_format(OutputFormat::json_schema(json!({
     ///         "type": "object",
     ///         "properties": {
     ///             "name": { "type": "string" }
     ///         },
     ///         "required": ["name"],
     ///         "additionalProperties": false
-    ///     })));
+    ///     }))));
     /// ```
-    pub fn with_output_format(mut self, output_format: OutputFormat) -> Self {
-        self.output_format = Some(output_format);
-        self
-    }
-
-    /// Add output configuration.
-    ///
-    /// This is the newer configuration format that supports both structured
-    /// output format and the effort parameter for adaptive thinking.
     pub fn with_output_config(mut self, output_config: OutputConfig) -> Self {
         self.output_config = Some(output_config);
         self
@@ -423,10 +465,58 @@ impl MessageCreateParams {
         self
     }
 
+    /// Choose the service tier for this request.
+    pub fn with_service_tier(mut self, service_tier: ServiceTierChoice) -> Self {
+        self.service_tier = Some(service_tier);
+        self
+    }
+
+    /// Set the inference speed (fast mode is not allowed in batches).
+    pub fn with_speed(mut self, speed: InferenceSpeed) -> Self {
+        self.speed = Some(speed);
+        self
+    }
+
+    /// Set the inference geography (`"global"` or `"us"`).
+    pub fn with_inference_geo(mut self, inference_geo: impl Into<String>) -> Self {
+        self.inference_geo = Some(inference_geo.into());
+        self
+    }
+
+    /// Set the container for code execution and skills.
+    pub fn with_container(mut self, container: Container) -> Self {
+        self.container = Some(container);
+        self
+    }
+
+    /// Opt in to cache diagnostics, comparing against the previous response.
+    pub fn with_diagnostics(mut self, diagnostics: DiagnosticsRequest) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    /// Set server-side context management.
+    pub fn with_context_management(mut self, context_management: ContextManagement) -> Self {
+        self.context_management = Some(context_management);
+        self
+    }
+
+    /// Request compaction on demand.
+    pub fn with_compaction(mut self, compaction: CompactionRequest) -> Self {
+        self.compaction = Some(compaction);
+        self
+    }
+
+    /// Set the remote MCP servers.
+    pub fn with_mcp_servers(mut self, mcp_servers: Vec<McpServer>) -> Self {
+        self.mcp_servers = Some(mcp_servers);
+        self
+    }
+
     /// Set the beta feature headers for this request.
     ///
-    /// These are merged with any client-level default betas and the
-    /// auto-detected `structured-outputs-2025-11-13` beta. Duplicates are
+    /// These are merged with any client-level default betas and the betas
+    /// auto-detected from the features this request uses. Duplicates are
     /// removed before sending.
     pub fn with_betas(mut self, betas: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.betas = Some(betas.into_iter().map(Into::into).collect());
@@ -508,6 +598,12 @@ impl MessageCreateParams {
         }
         if let Some(top_p) = self.top_p {
             Self::validate_float_range(top_p, "top_p")?;
+        }
+
+        if let Some(tools) = &self.tools {
+            for tool in tools {
+                tool.validate()?;
+            }
         }
 
         // Validate top_k is reasonable
@@ -599,6 +695,37 @@ impl MessageCreateParams {
             }
         }
 
+        if self.compaction.is_some() && self.context_management.is_some() {
+            return Err(crate::Error::validation(
+                "compaction and context_management are mutually exclusive",
+                Some("compaction".to_string()),
+            ));
+        }
+
+        if let Some(task_budget) = self.output_config.as_ref().and_then(|c| c.task_budget)
+            && task_budget.total < MIN_TASK_BUDGET_TOTAL
+        {
+            return Err(crate::Error::validation(
+                format!(
+                    "task_budget.total must be at least {MIN_TASK_BUDGET_TOTAL}, got {}",
+                    task_budget.total
+                ),
+                Some("output_config.task_budget.total".to_string()),
+            ));
+        }
+
+        if let Some(Container::Config { skills, .. }) = &self.container
+            && skills.len() > MAX_CONTAINER_SKILLS
+        {
+            return Err(crate::Error::validation(
+                format!(
+                    "container may contain at most {MAX_CONTAINER_SKILLS} skills, got {}",
+                    skills.len()
+                ),
+                Some("container.skills".to_string()),
+            ));
+        }
+
         // Validate thinking config with security checks
         if let Some(ref thinking) = self.thinking {
             match thinking {
@@ -635,8 +762,10 @@ impl MessageCreateParams {
                 ThinkingConfig::Disabled => {
                     // No validation needed for disabled state
                 }
-                ThinkingConfig::Adaptive | ThinkingConfig::AdaptiveWithDisplay { .. } => {
-                    // No validation needed for adaptive thinking
+                ThinkingConfig::Adaptive
+                | ThinkingConfig::AdaptiveWithDisplay { .. }
+                | ThinkingConfig::BetweenTools => {
+                    // No validation needed for adaptive or between-tools thinking
                 }
             }
         }
@@ -680,40 +809,6 @@ impl MessageCreateParams {
         self
     }
 
-    /// Check if this request requires the structured outputs beta header.
-    ///
-    /// Returns `true` if any of:
-    /// - `output_format` is set (for JSON outputs)
-    /// - `output_config.format` is set (for JSON outputs via new config)
-    /// - Any tool has `strict: true` (for strict tool use)
-    ///
-    /// When this returns `true`, the client should include the
-    /// `anthropic-beta: structured-outputs-2025-11-13` header.
-    pub fn requires_structured_outputs_beta(&self) -> bool {
-        // Check if output_format is set
-        if self.output_format.is_some() {
-            return true;
-        }
-
-        // Check if output_config has a format set
-        if let Some(ref config) = self.output_config
-            && config.format.is_some()
-        {
-            return true;
-        }
-
-        // Check if any tool has strict mode enabled
-        if let Some(ref tools) = self.tools {
-            for tool in tools {
-                if tool.is_strict() {
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
     /// Check whether this request uses the beta progress-update display mode.
     pub fn requires_thinking_display_updates_beta(&self) -> bool {
         self.thinking.as_ref().and_then(ThinkingConfig::display) == Some(ThinkingDisplay::Updates)
@@ -727,10 +822,9 @@ impl Default for MessageCreateParams {
         Self {
             max_tokens: 1024,
             messages: vec![],
-            model: Model::Known(KnownModel::Claude37SonnetLatest),
+            model: Model::Known(KnownModel::ClaudeSonnet55),
             cache_control: None,
             metadata: None,
-            output_format: None,
             output_config: None,
             stop_sequences: None,
             system: None,
@@ -742,6 +836,14 @@ impl Default for MessageCreateParams {
             top_p: None,
             fallbacks: None,
             fallback_credit_token: None,
+            service_tier: None,
+            speed: None,
+            inference_geo: None,
+            container: None,
+            diagnostics: None,
+            context_management: None,
+            compaction: None,
+            mcp_servers: None,
             stream: false,
             betas: None,
         }
@@ -752,7 +854,8 @@ impl Default for MessageCreateParams {
 mod tests {
     use super::*;
     use crate::types::{
-        ContentBlock, Effort, KnownModel, MessageRole, OutputConfig, ToolResultBlock,
+        CacheTtl, ContentBlock, ContextEdit, Effort, KnownModel, MessageRole, OutputConfig,
+        SkillRef, TaskBudget, ThinkingKeep, ToolResultBlock,
     };
     use serde_json::{json, to_value};
 
@@ -763,7 +866,7 @@ mod tests {
         let params = MessageCreateParams::new(
             1000,
             vec![message],
-            Model::Known(KnownModel::Claude37Sonnet20250219),
+            Model::Known(KnownModel::ClaudeSonnet55),
         )
         .with_system_string("You are a helpful assistant.".to_string())
         .with_temperature(0.125)
@@ -782,7 +885,7 @@ mod tests {
                         "content": "Hello, Claude"
                     }
                 ],
-                "model": "claude-3-7-sonnet-20250219",
+                "model": "claude-sonnet-5-5",
                 "system": "You are a helpful assistant.",
                 "temperature": 0.125,
                 "stream": false
@@ -797,7 +900,7 @@ mod tests {
         let params = MessageCreateParams::new_streaming(
             1000,
             vec![message],
-            Model::Known(KnownModel::Claude37Sonnet20250219),
+            Model::Known(KnownModel::ClaudeSonnet55),
         );
 
         let json = to_value(&params).unwrap();
@@ -813,7 +916,7 @@ mod tests {
                         "content": "Hello, Claude"
                     }
                 ],
-                "model": "claude-3-7-sonnet-20250219",
+                "model": "claude-sonnet-5-5",
                 "stream": true
             })
         );
@@ -826,7 +929,7 @@ mod tests {
         let params = MessageCreateParams::new(
             1000,
             vec![message],
-            Model::Known(KnownModel::Claude37Sonnet20250219),
+            Model::Known(KnownModel::ClaudeSonnet55),
         )
         .with_stream(true);
 
@@ -843,7 +946,7 @@ mod tests {
                         "content": "Hello, Claude"
                     }
                 ],
-                "model": "claude-3-7-sonnet-20250219",
+                "model": "claude-sonnet-5-5",
                 "stream": true
             })
         );
@@ -851,7 +954,7 @@ mod tests {
 
     #[test]
     fn message_create_params_simple() {
-        let params = MessageCreateParams::simple("Hello, world!", KnownModel::Claude37SonnetLatest);
+        let params = MessageCreateParams::simple("Hello, world!", KnownModel::ClaudeSonnet55);
 
         assert_eq!(params.max_tokens, 1024);
         assert_eq!(params.messages.len(), 1);
@@ -861,10 +964,8 @@ mod tests {
 
     #[test]
     fn message_create_params_simple_streaming() {
-        let params = MessageCreateParams::simple_streaming(
-            "Tell me a joke",
-            KnownModel::Claude37SonnetLatest,
-        );
+        let params =
+            MessageCreateParams::simple_streaming("Tell me a joke", KnownModel::ClaudeSonnet55);
 
         assert_eq!(params.max_tokens, 1024);
         assert_eq!(params.messages.len(), 1);
@@ -893,126 +994,15 @@ mod tests {
 
     #[test]
     fn message_create_params_ergonomic_system() {
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet55)
             .with_system("You are a helpful assistant.");
 
         assert!(params.system.is_some());
     }
 
     #[test]
-    fn requires_structured_outputs_beta_with_output_format() {
-        use crate::types::OutputFormat;
-
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
-            .with_output_format(OutputFormat::json_schema(json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" }
-                },
-                "required": ["name"],
-                "additionalProperties": false
-            })));
-
-        assert!(
-            params.requires_structured_outputs_beta(),
-            "params with output_format should require structured outputs beta"
-        );
-    }
-
-    #[test]
-    fn requires_structured_outputs_beta_with_strict_tool() {
-        use crate::types::{ToolParam, ToolUnionParam};
-
-        let tool = ToolParam::new(
-            "get_weather".to_string(),
-            json!({
-                "type": "object",
-                "properties": {
-                    "location": { "type": "string" }
-                },
-                "required": ["location"],
-                "additionalProperties": false
-            }),
-        )
-        .with_strict(true);
-
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
-            .with_tools(vec![ToolUnionParam::CustomTool(tool)]);
-
-        assert!(
-            params.requires_structured_outputs_beta(),
-            "params with strict tool should require structured outputs beta"
-        );
-    }
-
-    #[test]
-    fn requires_structured_outputs_beta_with_non_strict_tool() {
-        use crate::types::{ToolParam, ToolUnionParam};
-
-        let tool = ToolParam::new(
-            "get_weather".to_string(),
-            json!({
-                "type": "object",
-                "properties": {
-                    "location": { "type": "string" }
-                },
-                "required": ["location"]
-            }),
-        );
-
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
-            .with_tools(vec![ToolUnionParam::CustomTool(tool)]);
-
-        assert!(
-            !params.requires_structured_outputs_beta(),
-            "params with non-strict tool should not require structured outputs beta"
-        );
-    }
-
-    #[test]
-    fn requires_structured_outputs_beta_without_features() {
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest);
-
-        assert!(
-            !params.requires_structured_outputs_beta(),
-            "params without output_format or strict tools should not require structured outputs beta"
-        );
-    }
-
-    #[test]
-    fn requires_structured_outputs_beta_with_output_config() {
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
-            .with_output_config(OutputConfig::new().with_format(OutputFormat::json_schema(
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "name": { "type": "string" }
-                    },
-                    "required": ["name"],
-                    "additionalProperties": false
-                }),
-            )));
-
-        assert!(
-            params.requires_structured_outputs_beta(),
-            "params with output_config.format should require structured outputs beta"
-        );
-    }
-
-    #[test]
-    fn requires_structured_outputs_beta_with_output_config_effort_only() {
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
-            .with_output_config(OutputConfig::new().with_effort(Effort::High));
-
-        assert!(
-            !params.requires_structured_outputs_beta(),
-            "params with output_config effort only should not require structured outputs beta"
-        );
-    }
-
-    #[test]
     fn with_output_config_builder() {
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet55)
             .with_output_config(OutputConfig::new().with_effort(Effort::High));
 
         assert!(params.output_config.is_some());
@@ -1030,7 +1020,7 @@ mod tests {
         let params = MessageCreateParams::new(
             1000,
             vec![message],
-            Model::Known(KnownModel::Claude37Sonnet20250219),
+            Model::Known(KnownModel::ClaudeSonnet55),
         );
 
         let json = to_value(&params).unwrap();
@@ -1050,7 +1040,7 @@ mod tests {
                         ]
                     }
                 ],
-                "model": "claude-3-7-sonnet-20250219",
+                "model": "claude-sonnet-5-5",
                 "stream": false
             })
         );
@@ -1058,7 +1048,7 @@ mod tests {
 
     #[test]
     fn with_betas_sets_betas() {
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet55)
             .with_betas(["compact-2026-01-12", "some-other-beta"]);
 
         assert_eq!(
@@ -1072,7 +1062,7 @@ mod tests {
 
     #[test]
     fn with_beta_appends() {
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet55)
             .with_beta("compact-2026-01-12")
             .with_beta("some-other-beta");
 
@@ -1087,7 +1077,7 @@ mod tests {
 
     #[test]
     fn betas_not_serialized() {
-        let params = MessageCreateParams::simple("Hello", KnownModel::Claude37SonnetLatest)
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet55)
             .with_beta("compact-2026-01-12");
 
         let json = to_value(&params).unwrap();
@@ -1099,7 +1089,7 @@ mod tests {
 
     #[test]
     fn fallbacks_none_by_default() {
-        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable5);
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable51);
         assert_eq!(params.fallbacks, None);
 
         // Omitted from serialized JSON when unset.
@@ -1109,42 +1099,42 @@ mod tests {
 
     #[test]
     fn with_fallbacks_replaces() {
-        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable5)
-            .with_fallbacks([KnownModel::ClaudeSonnet45, KnownModel::ClaudeHaiku45]);
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable51)
+            .with_fallbacks([KnownModel::ClaudeSonnet55, KnownModel::ClaudeHaiku55]);
 
         assert_eq!(
             params.fallbacks,
             Some(Fallbacks::Models(vec![
-                FallbackConfig::new(KnownModel::ClaudeSonnet45),
-                FallbackConfig::new(KnownModel::ClaudeHaiku45),
+                FallbackConfig::new(KnownModel::ClaudeSonnet55),
+                FallbackConfig::new(KnownModel::ClaudeHaiku55),
             ]))
         );
     }
 
     #[test]
     fn with_fallback_appends_in_order() {
-        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable5)
-            .with_fallback(KnownModel::ClaudeSonnet45)
-            .with_fallback(KnownModel::ClaudeHaiku45);
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable51)
+            .with_fallback(KnownModel::ClaudeSonnet55)
+            .with_fallback(KnownModel::ClaudeHaiku55);
 
         assert_eq!(
             params.fallbacks,
             Some(Fallbacks::Models(vec![
-                FallbackConfig::new(KnownModel::ClaudeSonnet45),
-                FallbackConfig::new(KnownModel::ClaudeHaiku45),
+                FallbackConfig::new(KnownModel::ClaudeSonnet55),
+                FallbackConfig::new(KnownModel::ClaudeHaiku55),
             ]))
         );
     }
 
     #[test]
     fn fallbacks_serialization() {
-        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable5)
-            .with_fallbacks([KnownModel::ClaudeSonnet45]);
+        let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable51)
+            .with_fallbacks([KnownModel::ClaudeSonnet55]);
 
         let json = to_value(&params).unwrap();
         assert_eq!(
             json.get("fallbacks").unwrap(),
-            &json!([{ "model": "claude-sonnet-4-5" }])
+            &json!([{ "model": "claude-sonnet-5-5" }])
         );
     }
 
@@ -1153,11 +1143,11 @@ mod tests {
         let json = json!({
             "max_tokens": 1024,
             "messages": [{ "role": "user", "content": "Hello" }],
-            "model": "claude-fable-5",
+            "model": "claude-fable-5-1",
             "stream": false,
             "fallbacks": [
-                { "model": "claude-sonnet-4-5" },
-                { "model": "claude-haiku-4-5" }
+                { "model": "claude-sonnet-5-5" },
+                { "model": "claude-haiku-5-5" }
             ]
         });
 
@@ -1165,8 +1155,8 @@ mod tests {
         assert_eq!(
             params.fallbacks,
             Some(Fallbacks::Models(vec![
-                FallbackConfig::new(KnownModel::ClaudeSonnet45),
-                FallbackConfig::new(KnownModel::ClaudeHaiku45),
+                FallbackConfig::new(KnownModel::ClaudeSonnet55),
+                FallbackConfig::new(KnownModel::ClaudeHaiku55),
             ]))
         );
     }
@@ -1176,5 +1166,211 @@ mod tests {
         let params = MessageCreateParams::simple("Hello", KnownModel::ClaudeFable51)
             .with_default_fallbacks();
         assert_eq!(to_value(params).unwrap()["fallbacks"], json!("default"));
+    }
+
+    fn simple_params() -> MessageCreateParams {
+        MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet55)
+    }
+
+    #[test]
+    fn new_fields_omitted_by_default() {
+        let json = to_value(simple_params()).unwrap();
+        for key in [
+            "service_tier",
+            "speed",
+            "inference_geo",
+            "container",
+            "diagnostics",
+            "context_management",
+            "compaction",
+            "mcp_servers",
+            "output_format",
+        ] {
+            assert!(json.get(key).is_none(), "{key} should be omitted");
+        }
+    }
+
+    #[test]
+    fn cache_control_with_one_hour_ttl() {
+        let params = simple_params().with_cache_control(CacheControlEphemeral::one_hour());
+        assert_eq!(
+            to_value(params).unwrap()["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        assert_eq!(
+            CacheControlEphemeral::new()
+                .with_ttl(CacheTtl::FiveMinutes)
+                .ttl,
+            Some(CacheTtl::FiveMinutes)
+        );
+    }
+
+    #[test]
+    fn service_tier_speed_and_geo_serialize() {
+        let params = simple_params()
+            .with_service_tier(ServiceTierChoice::StandardOnly)
+            .with_speed(InferenceSpeed::Fast)
+            .with_inference_geo("us");
+        let json = to_value(params).unwrap();
+        assert_eq!(json["service_tier"], json!("standard_only"));
+        assert_eq!(json["speed"], json!("fast"));
+        assert_eq!(json["inference_geo"], json!("us"));
+    }
+
+    #[test]
+    fn diagnostics_first_turn_emits_null_previous_message_id() {
+        let params = simple_params().with_diagnostics(DiagnosticsRequest::first_turn());
+        let json = to_value(params).unwrap();
+        assert_eq!(json["diagnostics"], json!({"previous_message_id": null}));
+        assert!(
+            json["diagnostics"]
+                .as_object()
+                .unwrap()
+                .contains_key("previous_message_id")
+        );
+    }
+
+    #[test]
+    fn container_serializes_as_string_and_object() {
+        let by_id = simple_params().with_container(Container::id("container_011"));
+        assert_eq!(
+            to_value(by_id).unwrap()["container"],
+            json!("container_011")
+        );
+
+        let by_config = simple_params().with_container(Container::with_skills(vec![
+            SkillRef::anthropic("pptx").with_version("latest"),
+        ]));
+        assert_eq!(
+            to_value(by_config).unwrap()["container"],
+            json!({"skills": [{"type": "anthropic", "skill_id": "pptx", "version": "latest"}]})
+        );
+    }
+
+    #[test]
+    fn context_management_example_serializes() {
+        use crate::types::{ContextTrigger, KeepToolUses};
+        let params = simple_params().with_context_management(ContextManagement::new(vec![
+            ContextEdit::ClearToolUses20250919 {
+                trigger: Some(ContextTrigger::InputTokens { value: 100_000 }),
+                keep: Some(KeepToolUses { value: 3 }),
+                clear_at_least: Some(ContextTrigger::InputTokens { value: 5000 }),
+                exclude_tools: Some(vec!["web_search".to_string()]),
+                clear_tool_inputs: Some(true),
+            },
+        ]));
+        assert_eq!(
+            to_value(params).unwrap()["context_management"],
+            json!({"edits":[{"type":"clear_tool_uses_20250919","trigger":{"type":"input_tokens","value":100000},"keep":{"type":"tool_uses","value":3},"clear_at_least":{"type":"input_tokens","value":5000},"exclude_tools":["web_search"],"clear_tool_inputs":true}]})
+        );
+    }
+
+    #[test]
+    fn clear_thinking_keep_variants_serialize() {
+        let all = simple_params().with_context_management(ContextManagement::new(vec![
+            ContextEdit::ClearThinking20251015 {
+                keep: Some(ThinkingKeep::All),
+            },
+        ]));
+        assert_eq!(
+            to_value(all).unwrap()["context_management"],
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]})
+        );
+        let turns = simple_params().with_context_management(ContextManagement::new(vec![
+            ContextEdit::ClearThinking20251015 {
+                keep: Some(ThinkingKeep::Turns(2)),
+            },
+        ]));
+        assert_eq!(
+            to_value(turns).unwrap()["context_management"],
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": {"type": "thinking_turns", "value": 2}}]})
+        );
+    }
+
+    #[test]
+    fn compaction_request_serializes() {
+        let params = simple_params()
+            .with_compaction(CompactionRequest::new().with_instructions("Keep decisions"));
+        assert_eq!(
+            to_value(params).unwrap()["compaction"],
+            json!({"type": "summarize", "instructions": "Keep decisions"})
+        );
+    }
+
+    #[test]
+    fn mcp_servers_serialize() {
+        let params = simple_params().with_mcp_servers(vec![
+            McpServer::new("example", "https://mcp.example.com/sse")
+                .with_authorization_token("token"),
+        ]);
+        assert_eq!(
+            to_value(params).unwrap()["mcp_servers"],
+            json!([{
+                "type": "url",
+                "url": "https://mcp.example.com/sse",
+                "name": "example",
+                "authorization_token": "token"
+            }])
+        );
+    }
+
+    #[test]
+    fn task_budget_serializes_in_output_config() {
+        let params = simple_params().with_output_config(
+            OutputConfig::new()
+                .with_effort(Effort::High)
+                .with_task_budget(TaskBudget::new(64_000)),
+        );
+        assert_eq!(
+            to_value(params).unwrap()["output_config"],
+            json!({"effort": "high", "task_budget": {"type": "tokens", "total": 64000}})
+        );
+    }
+
+    #[test]
+    fn between_tools_thinking_serializes() {
+        let params = simple_params().with_thinking(ThinkingConfig::between_tools());
+        assert_eq!(
+            to_value(&params).unwrap()["thinking"],
+            json!({"type": "between_tools"})
+        );
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_compaction_with_context_management() {
+        let params = simple_params()
+            .with_compaction(CompactionRequest::new())
+            .with_context_management(ContextManagement::new(vec![ContextEdit::compact()]));
+        let err = params.validate().unwrap_err();
+        assert!(err.is_validation());
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn validate_task_budget_minimum() {
+        let make = |total| {
+            simple_params()
+                .with_output_config(OutputConfig::new().with_task_budget(TaskBudget::new(total)))
+        };
+        let err = make(19_999).validate().unwrap_err();
+        assert!(err.is_validation());
+        assert!(err.to_string().contains("task_budget"));
+        assert!(make(20_000).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_container_skill_limit() {
+        let skills = |count: usize| {
+            (0..count)
+                .map(|i| SkillRef::custom(format!("skill_{i}")))
+                .collect::<Vec<_>>()
+        };
+        let too_many = simple_params().with_container(Container::with_skills(skills(21)));
+        let err = too_many.validate().unwrap_err();
+        assert!(err.is_validation());
+        assert!(err.to_string().contains("skills"));
+        let ok = simple_params().with_container(Container::with_skills(skills(20)));
+        assert!(ok.validate().is_ok());
     }
 }

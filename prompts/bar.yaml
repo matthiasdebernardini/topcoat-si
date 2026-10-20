@@ -1,6 +1,0 @@
-inherits: "../base.yaml"
-name: "Bar Test"
-prompt: "What is the capital of France?"
-expected_contains:
-  - "Paris"
-temperature: 0.0

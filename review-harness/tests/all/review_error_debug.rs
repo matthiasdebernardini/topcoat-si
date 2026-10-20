@@ -47,7 +47,7 @@ async fn network_timeout_preserves_source_chain() {
     let err = client
         .send(MessageCreateParams::simple(
             "hello",
-            KnownModel::ClaudeHaiku45,
+            KnownModel::ClaudeHaiku55,
         ))
         .await
         .unwrap_err();
@@ -93,7 +93,7 @@ async fn redirect_does_not_forward_api_key() {
         client
             .send(MessageCreateParams::simple(
                 "hello",
-                KnownModel::ClaudeHaiku45
+                KnownModel::ClaudeHaiku55
             ))
             .await
             .is_err()

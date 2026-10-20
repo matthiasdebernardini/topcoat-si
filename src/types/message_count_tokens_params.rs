@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    MessageParam, Model, SystemPrompt, TextBlock, ThinkingConfig, ToolChoice, ToolUnionParam,
+    CacheControlEphemeral, ContextManagement, InferenceSpeed, McpServer, MessageParam, Model,
+    OutputConfig, SystemPrompt, TextBlock, ThinkingConfig, ToolChoice, ToolUnionParam,
 };
 
 /// Parameters for counting tokens in messages.
@@ -66,9 +67,32 @@ pub struct MessageCountTokensParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolUnionParam>>,
 
+    /// Output configuration (structured output format, effort, task budget).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+
+    /// Inference speed the counted request would use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<InferenceSpeed>,
+
+    /// Top-level cache control for automatic prompt caching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
+
+    /// Server-side context management; the response reports the original
+    /// input token count. Its betas are added automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<ContextManagement>,
+
+    /// Remote MCP servers; the `mcp-client-2025-11-20` beta is added
+    /// automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Vec<McpServer>>,
+
     /// Beta feature headers to include with this request.
     ///
-    /// These are merged with any client-level default betas. Duplicates are
+    /// These are merged with any client-level default betas and the betas
+    /// auto-detected from the features this request uses. Duplicates are
     /// removed before sending.
     #[serde(skip)]
     pub betas: Option<Vec<String>>,
@@ -84,6 +108,11 @@ impl MessageCountTokensParams {
             thinking: None,
             tool_choice: None,
             tools: None,
+            output_config: None,
+            speed: None,
+            cache_control: None,
+            context_management: None,
+            mcp_servers: None,
             betas: None,
         }
     }
@@ -124,9 +153,40 @@ impl MessageCountTokensParams {
         self
     }
 
+    /// Set the output configuration.
+    pub fn with_output_config(mut self, output_config: OutputConfig) -> Self {
+        self.output_config = Some(output_config);
+        self
+    }
+
+    /// Set the inference speed.
+    pub fn with_speed(mut self, speed: InferenceSpeed) -> Self {
+        self.speed = Some(speed);
+        self
+    }
+
+    /// Enable automatic prompt caching.
+    pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
+        self.cache_control = Some(cache_control);
+        self
+    }
+
+    /// Set server-side context management.
+    pub fn with_context_management(mut self, context_management: ContextManagement) -> Self {
+        self.context_management = Some(context_management);
+        self
+    }
+
+    /// Set the remote MCP servers.
+    pub fn with_mcp_servers(mut self, mcp_servers: Vec<McpServer>) -> Self {
+        self.mcp_servers = Some(mcp_servers);
+        self
+    }
+
     /// Set the beta feature headers for this request.
     ///
-    /// These are merged with any client-level default betas. Duplicates are
+    /// These are merged with any client-level default betas and the betas
+    /// auto-detected from the features this request uses. Duplicates are
     /// removed before sending.
     pub fn with_betas(mut self, betas: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.betas = Some(betas.into_iter().map(Into::into).collect());
@@ -152,10 +212,8 @@ mod tests {
     fn message_count_tokens_params_serialization() {
         let message = MessageParam::new_with_string("Hello, Claude".to_string(), MessageRole::User);
 
-        let params = MessageCountTokensParams::new(
-            vec![message],
-            Model::Known(KnownModel::Claude37Sonnet20250219),
-        );
+        let params =
+            MessageCountTokensParams::new(vec![message], Model::Known(KnownModel::ClaudeSonnet55));
 
         let json = to_value(&params).unwrap();
         assert_eq!(
@@ -167,7 +225,7 @@ mod tests {
                         "content": "Hello, Claude"
                     }
                 ],
-                "model": "claude-3-7-sonnet-20250219"
+                "model": "claude-sonnet-5-5"
             })
         );
     }
@@ -176,11 +234,9 @@ mod tests {
     fn message_count_tokens_params_with_system() {
         let message = MessageParam::new_with_string("Hello, Claude".to_string(), MessageRole::User);
 
-        let params = MessageCountTokensParams::new(
-            vec![message],
-            Model::Known(KnownModel::Claude37Sonnet20250219),
-        )
-        .with_system_string("You are a helpful assistant.".to_string());
+        let params =
+            MessageCountTokensParams::new(vec![message], Model::Known(KnownModel::ClaudeSonnet55))
+                .with_system_string("You are a helpful assistant.".to_string());
 
         let json = to_value(&params).unwrap();
         assert_eq!(
@@ -192,7 +248,7 @@ mod tests {
                         "content": "Hello, Claude"
                     }
                 ],
-                "model": "claude-3-7-sonnet-20250219",
+                "model": "claude-sonnet-5-5",
                 "system": "You are a helpful assistant."
             })
         );
@@ -215,11 +271,9 @@ mod tests {
             }),
         );
 
-        let params = MessageCountTokensParams::new(
-            vec![message],
-            Model::Known(KnownModel::Claude37Sonnet20250219),
-        )
-        .with_tools(vec![tool]);
+        let params =
+            MessageCountTokensParams::new(vec![message], Model::Known(KnownModel::ClaudeSonnet55))
+                .with_tools(vec![tool]);
 
         let json = to_value(&params).unwrap();
         assert_eq!(
@@ -231,7 +285,7 @@ mod tests {
                         "content": "Hello, Claude"
                     }
                 ],
-                "model": "claude-3-7-sonnet-20250219",
+                "model": "claude-sonnet-5-5",
                 "tools": [
                     {
                         "type": "custom",
@@ -249,5 +303,36 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn message_count_tokens_params_new_fields_serialize() {
+        let params = MessageCountTokensParams::new(
+            vec![MessageParam::new_with_string(
+                "Hi".to_string(),
+                MessageRole::User,
+            )],
+            Model::Known(KnownModel::ClaudeSonnet55),
+        )
+        .with_speed(InferenceSpeed::Fast)
+        .with_cache_control(CacheControlEphemeral::one_hour())
+        .with_output_config(OutputConfig::new().with_effort(crate::types::Effort::High))
+        .with_context_management(ContextManagement::new(vec![
+            crate::types::ContextEdit::clear_tool_uses(),
+        ]))
+        .with_mcp_servers(vec![McpServer::new("a", "https://mcp.example.com")]);
+
+        let json = to_value(&params).unwrap();
+        assert_eq!(json["speed"], json!("fast"));
+        assert_eq!(
+            json["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        assert_eq!(json["output_config"], json!({"effort": "high"}));
+        assert_eq!(
+            json["context_management"],
+            json!({"edits": [{"type": "clear_tool_uses_20250919"}]})
+        );
+        assert_eq!(json["mcp_servers"][0]["type"], json!("url"));
     }
 }

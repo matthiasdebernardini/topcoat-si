@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
 use std::env;
 use std::fs;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
@@ -14,15 +15,15 @@ use tracing::{Instrument, Span, field};
 use crate::AccumulatingStream;
 use crate::backoff::ExponentialBackoff;
 use crate::error::{Error, HttpMetadata, RequestPhase, Result, map_reqwest_error};
-use crate::observability::{
-    CLIENT_REQUEST_DURATION, CLIENT_REQUEST_ERRORS, CLIENT_REQUEST_RETRIES, CLIENT_REQUESTS,
-    CLIENT_RETRY_BACKOFF,
-};
+use crate::observability;
 use crate::sse::process_message_stream_sse;
 use crate::types::{
-    DeletedMessageBatch, Message, MessageBatch, MessageBatchCreateParams, MessageBatchListParams,
-    MessageBatchListResponse, MessageBatchResult, MessageCountTokensParams, MessageCreateParams,
-    MessageStreamEvent, MessageTokensCount, ModelInfo, ModelListParams, ModelListResponse,
+    CompactionRequest, ContextManagement, CostReport, CostReportParams, DeletedFile,
+    DeletedMessageBatch, FileInfo, FileList, FileListParams, McpServer, Message, MessageBatch,
+    MessageBatchCreateParams, MessageBatchListParams, MessageBatchListResponse, MessageBatchResult,
+    MessageCountTokensParams, MessageCreateParams, MessageStreamEvent, MessageTokensCount, Model,
+    ModelInfo, ModelListParams, ModelListResponse, OutputConfig, RateLimits, ToolUnionParam, Usage,
+    UsageReport, UsageReportParams, retry_after_from_headers,
 };
 
 fn final_failure(error: &Error) {
@@ -40,9 +41,46 @@ fn final_failure(error: &Error) {
     );
 }
 
-fn record_usage(message: &Message) {
-    Span::current().record("input_tokens", message.usage.input_tokens);
-    Span::current().record("output_tokens", message.usage.output_tokens);
+fn record_usage(model: &Model, usage: &Usage) {
+    let span = Span::current();
+    span.record("input_tokens", usage.input_tokens);
+    span.record("output_tokens", usage.output_tokens);
+    span.record(
+        "cache_read_input_tokens",
+        usage.cache_read_input_tokens.unwrap_or(0),
+    );
+    span.record(
+        "cache_creation_input_tokens",
+        usage.cache_creation_input_tokens.unwrap_or(0),
+    );
+    if let Model::Known(known) = model {
+        span.record("cost_micro_cents", known.cost_micro_cents(usage));
+    }
+}
+
+/// Emit one `claudius::usage` event for a completed request.
+///
+/// Fires once per completed `send` call and once per stream that reaches `message_stop`
+/// (from the merged usage).  `cost_micro_cents` is `None` for models that are not a
+/// `KnownModel`.  Batch results are not reported; call `KnownModel::cost_micro_cents` per
+/// result.  Its tier modifier is whatever `usage.service_tier` the API reports: batch results
+/// are expected to report `"batch"`, but that is unverified.
+fn count_usage(model: &Model, usage: &Usage) {
+    let tokens = |tokens: Option<i32>| u64::try_from(tokens.unwrap_or(0)).unwrap_or(0);
+    let cost_micro_cents = match model {
+        Model::Known(known) => Some(known.cost_micro_cents(usage)),
+        _ => None,
+    };
+    tracing::info!(
+        target: "claudius::usage",
+        model = %model,
+        input_tokens = tokens(Some(usage.input_tokens)),
+        output_tokens = tokens(Some(usage.output_tokens)),
+        cache_read_input_tokens = tokens(usage.cache_read_input_tokens),
+        cache_creation_input_tokens = tokens(usage.cache_creation_input_tokens),
+        cost_micro_cents = ?cost_micro_cents,
+        "usage"
+    );
 }
 
 // Own the span until EOF, failure, or drop. Enter it only while polling, never across
@@ -79,10 +117,118 @@ const DEFAULT_API_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 /// Total deadline for non-streaming requests; streams use a separate read timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
-const STRUCTURED_OUTPUTS_BETA: &str = "structured-outputs-2025-11-13";
+const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+const COMPACT_EDIT_BETA: &str = "compact-2026-01-12";
+const COMPACTION_BETA: &str = "compact-2026-09-04";
+const MCP_CLIENT_BETA: &str = "mcp-client-2025-11-20";
+const TASK_BUDGETS_BETA: &str = "task-budgets-2026-03-13";
 const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const FALLBACK_CREDIT_BETA: &str = "fallback-credit-2026-07-01";
 const THINKING_DISPLAY_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18";
+
+/// Allowed lifetime of an uploaded file: one hour to ninety days.
+const FILE_EXPIRY_SECONDS: std::ops::RangeInclusive<u64> = 3_600..=7_776_000;
+
+/// A multipart boundary built from a process-wide counter and the current time.
+fn multipart_boundary() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("claudius-boundary-{nanos:x}-{count:x}")
+}
+
+/// Builds the `multipart/form-data` body of a file upload.
+fn build_file_upload_body(
+    boundary: &str,
+    filename: &str,
+    mime_type: &str,
+    bytes: &[u8],
+    expires_in_seconds: Option<u64>,
+) -> Vec<u8> {
+    let escaped_filename = filename.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut body = Vec::with_capacity(bytes.len() + 512);
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"{escaped_filename}\"\r\nContent-Type: {mime_type}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+    if let Some(seconds) = expires_in_seconds {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; \
+                 name=\"expires_in_seconds\"\r\n\r\n{seconds}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// Betas implied by the request fields shared by messages and count-tokens requests.
+fn push_feature_betas(
+    auto_betas: &mut Vec<&'static str>,
+    context_management: Option<&ContextManagement>,
+    compaction: Option<&CompactionRequest>,
+    mcp_servers: Option<&[McpServer]>,
+    tools: Option<&[ToolUnionParam]>,
+    output_config: Option<&OutputConfig>,
+) {
+    if let Some(context_management) = context_management {
+        auto_betas.push(CONTEXT_MANAGEMENT_BETA);
+        if context_management.has_compact_edit() {
+            auto_betas.push(COMPACT_EDIT_BETA);
+        }
+    }
+    if compaction.is_some() {
+        auto_betas.push(COMPACTION_BETA);
+    }
+    let has_mcp_toolset = tools.is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| matches!(tool, ToolUnionParam::McpToolset(_)))
+    });
+    if mcp_servers.is_some() || has_mcp_toolset {
+        auto_betas.push(MCP_CLIENT_BETA);
+    }
+    if output_config.is_some_and(|config| config.task_budget.is_some()) {
+        auto_betas.push(TASK_BUDGETS_BETA);
+    }
+}
+
+/// Betas implied by the features a Messages request uses.
+fn create_params_betas(params: &MessageCreateParams) -> Vec<&'static str> {
+    let mut auto_betas = Vec::new();
+    push_feature_betas(
+        &mut auto_betas,
+        params.context_management.as_ref(),
+        params.compaction.as_ref(),
+        params.mcp_servers.as_deref(),
+        params.tools.as_deref(),
+        params.output_config.as_ref(),
+    );
+    auto_betas
+}
+
+/// Betas implied by the features a count-tokens request uses.
+fn count_params_betas(params: &MessageCountTokensParams) -> Vec<&'static str> {
+    let mut auto_betas = Vec::new();
+    push_feature_betas(
+        &mut auto_betas,
+        params.context_management.as_ref(),
+        None,
+        params.mcp_servers.as_deref(),
+        params.tools.as_deref(),
+        params.output_config.as_ref(),
+    );
+    auto_betas
+}
 
 /// Base URLs of providers that authenticate via the standard HTTP
 /// `Authorization: Bearer ${API_KEY}` header rather than (or in addition to)
@@ -217,35 +363,7 @@ fn response_metadata(response: &Response) -> HttpMetadata {
     {
         Span::current().record("request_id", id);
     }
-    let seconds = |name| {
-        headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value >= 0.0)
-    };
-    let retry_after = seconds("retry-after-ms")
-        .and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok())
-        .or_else(|| seconds("retry-after").and_then(|s| Duration::try_from_secs_f64(s).ok()))
-        .or_else(|| {
-            headers
-                .get("retry-after")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| {
-                    time::OffsetDateTime::parse(
-                        value,
-                        &time::format_description::well_known::Rfc2822,
-                    )
-                    .ok()
-                })
-                .map(|deadline| {
-                    Duration::from_secs_f64(
-                        (deadline - time::OffsetDateTime::now_utc())
-                            .as_seconds_f64()
-                            .max(0.0),
-                    )
-                })
-        });
+    let retry_after = retry_after_from_headers(headers);
     HttpMetadata {
         status: response.status().as_u16(),
         error_type: None,
@@ -292,6 +410,8 @@ pub struct Anthropic {
     cached_headers: Arc<HeaderMap>,
     /// Beta feature headers included on every request.
     default_betas: Vec<String>,
+    /// Rate-limit headers from the most recent response, shared by clones.
+    last_rate_limits: Arc<Mutex<Option<RateLimits>>>,
 }
 
 impl std::fmt::Debug for Anthropic {
@@ -380,6 +500,7 @@ impl Anthropic {
             max_retries: 3,
             cached_headers,
             default_betas: Vec::new(),
+            last_rate_limits: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -451,7 +572,7 @@ impl Anthropic {
     /// Set default beta feature headers included on every request.
     ///
     /// These are merged with any per-request betas and auto-detected betas
-    /// (like `structured-outputs-2025-11-13`). Duplicates are removed.
+    /// (like `context-management-2025-06-27`). Duplicates are removed.
     pub fn with_default_betas(
         mut self,
         betas: impl IntoIterator<Item = impl Into<String>>,
@@ -607,8 +728,7 @@ impl Anthropic {
                         sleep_seconds = sleep_duration.as_secs_f64(),
                         "Retrying API request"
                     );
-                    CLIENT_REQUEST_RETRIES.click();
-                    CLIENT_RETRY_BACKOFF.add(sleep_duration.as_secs_f64());
+                    observability::retry(sleep_duration);
                     sleep(sleep_duration).await;
                     last_error = Some(error);
                 }
@@ -646,6 +766,40 @@ impl Anthropic {
             .and_then(|value| value["error"]["message"].as_str())
             .unwrap_or("HTTP error response");
         Error::from_http(message, metadata, None)
+    }
+
+    /// Remember the rate-limit headers of a received response.
+    ///
+    /// Responses without any `anthropic-ratelimit-*`, `anthropic-priority-*`, `anthropic-fast-*`
+    /// or `retry-after` header (for example an error page from a proxy) leave the previously
+    /// recorded state in place.
+    fn record_rate_limits(&self, response: &Response) {
+        let headers = response.headers();
+        let has_rate_limit_headers = headers.keys().any(|name| {
+            let name = name.as_str();
+            name.starts_with("anthropic-ratelimit-")
+                || name.starts_with("anthropic-priority-")
+                || name.starts_with("anthropic-fast-")
+                || name == header::RETRY_AFTER
+        });
+        if !has_rate_limit_headers {
+            return;
+        }
+        let limits = RateLimits::from_headers(headers);
+        if let Ok(mut slot) = self.last_rate_limits.lock() {
+            *slot = Some(limits);
+        }
+    }
+
+    /// Rate-limit state from the headers of the most recent HTTP response that carried them.
+    ///
+    /// Updated on every response the client receives, successful or not, including streaming
+    /// responses, that carries at least one `anthropic-ratelimit-*`, `anthropic-priority-*`,
+    /// `anthropic-fast-*` or `retry-after` header; responses without them leave the previous
+    /// value in place.  Clones of this client share the same slot.  Returns `None` before the
+    /// first such response.
+    pub fn last_rate_limits(&self) -> Option<RateLimits> {
+        self.last_rate_limits.lock().ok()?.clone()
     }
 
     fn map_request_error(&self, error: reqwest::Error) -> Error {
@@ -686,6 +840,41 @@ impl Anthropic {
             .await
             .map_err(|e| self.map_request_error(e))?;
 
+        self.record_rate_limits(&response);
+        if !response.status().is_success() {
+            return Err(Self::process_error_response(response).await);
+        }
+
+        Self::decode_response(response).await
+    }
+
+    /// Execute a POST request with a raw body and an explicit content type.
+    async fn execute_post_body_request<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: Bytes,
+        content_type: &str,
+        headers: Option<HeaderMap>,
+    ) -> Result<T> {
+        let mut headers = headers.unwrap_or_else(|| self.default_headers());
+        let content_type = HeaderValue::from_str(content_type).map_err(|error| {
+            Error::validation(
+                format!("Invalid content type: {error}"),
+                Some("content_type".to_string()),
+            )
+        })?;
+        headers.insert(header::CONTENT_TYPE, content_type);
+
+        let response = self
+            .client
+            .post(url)
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| self.map_request_error(e))?;
+
+        self.record_rate_limits(&response);
         if !response.status().is_success() {
             return Err(Self::process_error_response(response).await);
         }
@@ -714,6 +903,7 @@ impl Anthropic {
             .await
             .map_err(|e| self.map_request_error(e))?;
 
+        self.record_rate_limits(&response);
         if !response.status().is_success() {
             return Err(Self::process_error_response(response).await);
         }
@@ -737,6 +927,7 @@ impl Anthropic {
             .await
             .map_err(|e| self.map_request_error(e))?;
 
+        self.record_rate_limits(&response);
         if !response.status().is_success() {
             return Err(Self::process_error_response(response).await);
         }
@@ -760,6 +951,7 @@ impl Anthropic {
             .await
             .map_err(|e| self.map_request_error(e))?;
 
+        self.record_rate_limits(&response);
         if !response.status().is_success() {
             return Err(Self::process_error_response(response).await);
         }
@@ -783,6 +975,7 @@ impl Anthropic {
             .await
             .map_err(|e| self.map_request_error(e))?;
 
+        self.record_rate_limits(&response);
         if !response.status().is_success() {
             return Err(Self::process_error_response(response).await);
         }
@@ -795,17 +988,17 @@ impl Anthropic {
         operation = "send",
         otel.kind = "client", gen_ai.request.model = %params.model, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty,
+        cache_read_input_tokens = field::Empty, cache_creation_input_tokens = field::Empty,
+        cost_micro_cents = field::Empty
     ))]
     pub async fn send(&self, mut params: MessageCreateParams) -> Result<Message> {
         let start = Instant::now();
-        CLIENT_REQUESTS.click();
 
         // Validate parameters first
         if let Err(err) = params.validate() {
             final_failure(&err);
-            CLIENT_REQUEST_ERRORS.click();
-            CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
+            observability::request_failed(start.elapsed());
             return Err(err);
         }
 
@@ -813,10 +1006,7 @@ impl Anthropic {
         params.stream = false;
 
         // Collect all betas: client defaults + per-request + auto-detected
-        let mut auto_betas = Vec::new();
-        if params.requires_structured_outputs_beta() {
-            auto_betas.push(STRUCTURED_OUTPUTS_BETA);
-        }
+        let mut auto_betas = create_params_betas(&params);
         if params.fallbacks.is_some() {
             auto_betas.push(SERVER_SIDE_FALLBACK_BETA);
         }
@@ -829,7 +1019,7 @@ impl Anthropic {
         let all_betas = self.collect_betas(params.betas.as_deref(), &auto_betas);
         let headers = self.headers_with_betas(&all_betas);
 
-        let result = self
+        let result: Result<Message> = self
             .retry_with_backoff(|| async {
                 let url = self.build_url("messages");
                 self.execute_post_request(&url, &params, headers.clone())
@@ -837,12 +1027,10 @@ impl Anthropic {
             })
             .await;
 
-        CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
-        if result.is_err() {
-            CLIENT_REQUEST_ERRORS.click();
-        }
+        observability::request_finished(start.elapsed(), &result);
         if let Ok(message) = &result {
-            record_usage(message);
+            record_usage(&params.model, &message.usage);
+            count_usage(&params.model, &message.usage);
         }
         result
     }
@@ -854,20 +1042,20 @@ impl Anthropic {
         operation = "stream",
         otel.kind = "client", gen_ai.request.model = %params.model, stream = true,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty,
+        cache_read_input_tokens = field::Empty, cache_creation_input_tokens = field::Empty,
+        cost_micro_cents = field::Empty
     ))]
     pub async fn stream(
         &self,
         params: &MessageCreateParams,
     ) -> Result<impl Stream<Item = Result<MessageStreamEvent>> + use<>> {
         let start = Instant::now();
-        CLIENT_REQUESTS.click();
 
         // Validate parameters first
         if let Err(err) = params.validate() {
             final_failure(&err);
-            CLIENT_REQUEST_ERRORS.click();
-            CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
+            observability::request_failed(start.elapsed());
             return Err(err);
         }
 
@@ -878,16 +1066,12 @@ impl Anthropic {
                 Some("stream".to_string()),
             );
             final_failure(&err);
-            CLIENT_REQUEST_ERRORS.click();
-            CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
+            observability::request_failed(start.elapsed());
             return Err(err);
         }
 
         // Collect all betas: client defaults + per-request + auto-detected
-        let mut auto_betas = Vec::new();
-        if params.requires_structured_outputs_beta() {
-            auto_betas.push(STRUCTURED_OUTPUTS_BETA);
-        }
+        let mut auto_betas = create_params_betas(params);
         if params.fallbacks.is_some() {
             auto_betas.push(SERVER_SIDE_FALLBACK_BETA);
         }
@@ -921,6 +1105,7 @@ impl Anthropic {
                     .await
                     .map_err(|e| self.map_request_error(e))?;
 
+                self.record_rate_limits(&response);
                 if !response.status().is_success() {
                     return Err(Self::process_error_response(response).await);
                 }
@@ -929,11 +1114,10 @@ impl Anthropic {
             })
             .await;
 
-        CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
+        observability::request_finished(start.elapsed(), &response);
         let response = match response {
             Ok(response) => response,
             Err(err) => {
-                CLIENT_REQUEST_ERRORS.click();
                 return Err(err);
             }
         };
@@ -942,15 +1126,27 @@ impl Anthropic {
         let request_id = response_metadata(&response).request_id;
         let stream = response.bytes_stream();
         let (events, _receiver) = AccumulatingStream::new(process_message_stream_sse(stream));
+        let model = params.model.clone();
+        let mut usage: Option<Usage> = None;
         let events = events.map(move |item| {
             let item = item.map_err(|error| error.with_request_id(request_id.clone()));
             if let Ok(event) = &item {
                 match event {
-                    MessageStreamEvent::MessageStart(start) => record_usage(&start.message),
+                    MessageStreamEvent::MessageStart(start) => {
+                        record_usage(&model, &start.message.usage);
+                        usage = Some(start.message.usage.clone());
+                    }
                     MessageStreamEvent::MessageDelta(delta) => {
-                        Span::current().record("output_tokens", delta.usage.output_tokens);
-                        if let Some(tokens) = delta.usage.input_tokens {
-                            Span::current().record("input_tokens", tokens);
+                        let running = usage.get_or_insert_with(|| Usage::new(0, 0));
+                        delta.usage.merge_into(running);
+                        record_usage(&model, running);
+                    }
+                    MessageStreamEvent::MessageStop(_) => {
+                        // Deltas carry cumulative counts and may repeat, so the counters
+                        // take the merged usage once, here.  A stream that ends without
+                        // `message_stop` is not counted.
+                        if let Some(running) = &usage {
+                            count_usage(&model, running);
                         }
                     }
                     _ => {}
@@ -976,10 +1172,10 @@ impl Anthropic {
         params: MessageCountTokensParams,
     ) -> Result<MessageTokensCount> {
         let start = Instant::now();
-        CLIENT_REQUESTS.click();
 
-        // Collect betas: client defaults + per-request
-        let all_betas = self.collect_betas(params.betas.as_deref(), &[]);
+        // Collect betas: client defaults + per-request + auto-detected
+        let auto_betas = count_params_betas(&params);
+        let all_betas = self.collect_betas(params.betas.as_deref(), &auto_betas);
         let headers = self.headers_with_betas(&all_betas);
 
         let result = self
@@ -990,10 +1186,7 @@ impl Anthropic {
             })
             .await;
 
-        CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
-        if result.is_err() {
-            CLIENT_REQUEST_ERRORS.click();
-        }
+        observability::request_finished(start.elapsed(), &result);
         result
     }
 
@@ -1009,12 +1202,10 @@ impl Anthropic {
         params: MessageBatchCreateParams,
     ) -> Result<MessageBatch> {
         let start = Instant::now();
-        CLIENT_REQUESTS.click();
 
         if let Err(err) = params.validate() {
             final_failure(&err);
-            CLIENT_REQUEST_ERRORS.click();
-            CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
+            observability::request_failed(start.elapsed());
             return Err(err);
         }
 
@@ -1028,15 +1219,11 @@ impl Anthropic {
             }
         }
 
-        let auto_betas: Vec<&str> = if params
+        let auto_betas: Vec<&str> = params
             .requests
             .iter()
-            .any(|request| request.params.requires_structured_outputs_beta())
-        {
-            vec![STRUCTURED_OUTPUTS_BETA]
-        } else {
-            vec![]
-        };
+            .flat_map(|request| create_params_betas(&request.params))
+            .collect();
         let all_betas = if request_betas.is_empty() {
             self.collect_betas(None, &auto_betas)
         } else {
@@ -1052,10 +1239,7 @@ impl Anthropic {
             })
             .await;
 
-        CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
-        if result.is_err() {
-            CLIENT_REQUEST_ERRORS.click();
-        }
+        observability::request_finished(start.elapsed(), &result);
         result
     }
 
@@ -1068,7 +1252,6 @@ impl Anthropic {
     ))]
     pub async fn get_message_batch(&self, message_batch_id: &str) -> Result<MessageBatch> {
         let start = Instant::now();
-        CLIENT_REQUESTS.click();
 
         let all_betas = self.collect_betas(None, &[]);
         let headers = self.headers_with_betas(&all_betas);
@@ -1080,10 +1263,7 @@ impl Anthropic {
             })
             .await;
 
-        CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
-        if result.is_err() {
-            CLIENT_REQUEST_ERRORS.click();
-        }
+        observability::request_finished(start.elapsed(), &result);
         result
     }
 
@@ -1104,7 +1284,6 @@ impl Anthropic {
         params: Option<MessageBatchListParams>,
     ) -> Result<MessageBatchListResponse> {
         let start = Instant::now();
-        CLIENT_REQUESTS.click();
 
         let request_betas = params.as_ref().and_then(|p| p.betas.as_deref());
         let all_betas = self.collect_betas(request_betas, &[]);
@@ -1132,10 +1311,7 @@ impl Anthropic {
             })
             .await;
 
-        CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
-        if result.is_err() {
-            CLIENT_REQUEST_ERRORS.click();
-        }
+        observability::request_finished(start.elapsed(), &result);
         result
     }
 
@@ -1148,7 +1324,6 @@ impl Anthropic {
     ))]
     pub async fn cancel_message_batch(&self, message_batch_id: &str) -> Result<MessageBatch> {
         let start = Instant::now();
-        CLIENT_REQUESTS.click();
 
         let all_betas = self.collect_betas(None, &[]);
         let headers = self.headers_with_betas(&all_betas);
@@ -1160,10 +1335,7 @@ impl Anthropic {
             })
             .await;
 
-        CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
-        if result.is_err() {
-            CLIENT_REQUEST_ERRORS.click();
-        }
+        observability::request_finished(start.elapsed(), &result);
         result
     }
 
@@ -1179,7 +1351,6 @@ impl Anthropic {
         message_batch_id: &str,
     ) -> Result<DeletedMessageBatch> {
         let start = Instant::now();
-        CLIENT_REQUESTS.click();
 
         let all_betas = self.collect_betas(None, &[]);
         let headers = self.headers_with_betas(&all_betas);
@@ -1191,10 +1362,7 @@ impl Anthropic {
             })
             .await;
 
-        CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
-        if result.is_err() {
-            CLIENT_REQUEST_ERRORS.click();
-        }
+        observability::request_finished(start.elapsed(), &result);
         result
     }
 
@@ -1210,7 +1378,6 @@ impl Anthropic {
         message_batch_id: &str,
     ) -> Result<impl Stream<Item = Result<MessageBatchResult>> + use<>> {
         let start = Instant::now();
-        CLIENT_REQUESTS.click();
 
         let all_betas = self.collect_betas(None, &[]);
         let headers = self.headers_with_betas(&all_betas);
@@ -1222,11 +1389,10 @@ impl Anthropic {
             })
             .await;
 
-        CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
+        observability::request_finished(start.elapsed(), &response);
         let response = match response {
             Ok(response) => response,
             Err(err) => {
-                CLIENT_REQUEST_ERRORS.click();
                 return Err(err);
             }
         };
@@ -1249,7 +1415,6 @@ impl Anthropic {
     ))]
     pub async fn list_models(&self, params: Option<ModelListParams>) -> Result<ModelListResponse> {
         let start = Instant::now();
-        CLIENT_REQUESTS.click();
 
         // Collect betas: client defaults + per-request from ModelListParams
         let request_betas = params.as_ref().and_then(|p| p.betas.as_deref());
@@ -1260,29 +1425,73 @@ impl Anthropic {
             .retry_with_backoff(|| async {
                 let url = self.build_url("models");
 
-                let query_params = params.as_ref().map(|p| {
-                    let mut params = Vec::new();
-                    if let Some(ref after_id) = p.after_id {
-                        params.push(("after_id".to_string(), after_id.clone()));
-                    }
-                    if let Some(ref before_id) = p.before_id {
-                        params.push(("before_id".to_string(), before_id.clone()));
-                    }
-                    if let Some(limit) = p.limit {
-                        params.push(("limit".to_string(), limit.to_string()));
-                    }
-                    params
-                });
+                let query_params = params.as_ref().map(ModelListParams::query_pairs);
 
                 self.execute_get_request(&url, query_params.as_deref(), headers.clone())
                     .await
             })
             .await;
 
-        CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
-        if result.is_err() {
-            CLIENT_REQUEST_ERRORS.click();
-        }
+        observability::request_finished(start.elapsed(), &result);
+        result
+    }
+
+    /// Fetch the organization's Messages usage report.
+    ///
+    /// This is an Admin API endpoint: the client must be built with an Admin API key
+    /// (`sk-ant-admin01-...`), which is sent in the same `x-api-key` header.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "usage_report",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
+    pub async fn usage_report(&self, params: UsageReportParams) -> Result<UsageReport> {
+        let start = Instant::now();
+
+        let all_betas = self.collect_betas(None, &[]);
+        let headers = self.headers_with_betas(&all_betas);
+        let query = params.to_query();
+
+        let result = self
+            .retry_with_backoff(|| async {
+                let url = format!(
+                    "{}?{query}",
+                    self.build_url("organizations/usage_report/messages")
+                );
+                self.execute_get_request(&url, None, headers.clone()).await
+            })
+            .await;
+
+        observability::request_finished(start.elapsed(), &result);
+        result
+    }
+
+    /// Fetch the organization's daily cost report.
+    ///
+    /// This is an Admin API endpoint: the client must be built with an Admin API key
+    /// (`sk-ant-admin01-...`), which is sent in the same `x-api-key` header.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "cost_report",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
+    pub async fn cost_report(&self, params: CostReportParams) -> Result<CostReport> {
+        let start = Instant::now();
+
+        let all_betas = self.collect_betas(None, &[]);
+        let headers = self.headers_with_betas(&all_betas);
+        let query = params.to_query();
+
+        let result = self
+            .retry_with_backoff(|| async {
+                let url = format!("{}?{query}", self.build_url("organizations/cost_report"));
+                self.execute_get_request(&url, None, headers.clone()).await
+            })
+            .await;
+
+        observability::request_finished(start.elapsed(), &result);
         result
     }
 
@@ -1298,7 +1507,6 @@ impl Anthropic {
     ))]
     pub async fn get_model(&self, model_id: &str) -> Result<ModelInfo> {
         let start = Instant::now();
-        CLIENT_REQUESTS.click();
         let result = self
             .retry_with_backoff(|| async {
                 let url = self.build_url(&format!("models/{}", model_id));
@@ -1306,10 +1514,158 @@ impl Anthropic {
             })
             .await;
 
-        CLIENT_REQUEST_DURATION.add(start.elapsed().as_secs_f64());
-        if result.is_err() {
-            CLIENT_REQUEST_ERRORS.click();
+        observability::request_finished(start.elapsed(), &result);
+        result
+    }
+
+    /// Upload a file to the Files API.
+    ///
+    /// The file is sent as `multipart/form-data`. `expires_in_seconds`, when given, must be
+    /// between 3,600 (one hour) and 7,776,000 (90 days).
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "upload_file",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
+    pub async fn upload_file(
+        &self,
+        filename: &str,
+        mime_type: &str,
+        bytes: Vec<u8>,
+        expires_in_seconds: Option<u64>,
+    ) -> Result<FileInfo> {
+        if let Some(seconds) = expires_in_seconds
+            && !FILE_EXPIRY_SECONDS.contains(&seconds)
+        {
+            return Err(Error::validation(
+                format!(
+                    "expires_in_seconds must be between {} and {}, got {seconds}",
+                    FILE_EXPIRY_SECONDS.start(),
+                    FILE_EXPIRY_SECONDS.end()
+                ),
+                Some("expires_in_seconds".to_string()),
+            ));
         }
+        if [filename, mime_type]
+            .iter()
+            .any(|value| value.contains(['\r', '\n']))
+        {
+            return Err(Error::validation(
+                "filename and mime_type must not contain line breaks",
+                Some("filename".to_string()),
+            ));
+        }
+
+        let start = Instant::now();
+
+        let boundary = multipart_boundary();
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let body = Bytes::from(build_file_upload_body(
+            &boundary,
+            filename,
+            mime_type,
+            &bytes,
+            expires_in_seconds,
+        ));
+        let result = self
+            .retry_with_backoff(|| async {
+                let url = self.build_url("files");
+                self.execute_post_body_request(&url, body.clone(), &content_type, None)
+                    .await
+            })
+            .await;
+
+        observability::request_finished(start.elapsed(), &result);
+        result
+    }
+
+    /// List files stored through the Files API.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "list_files",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
+    pub async fn list_files(&self, params: Option<FileListParams>) -> Result<FileList> {
+        let start = Instant::now();
+
+        let result = self
+            .retry_with_backoff(|| async {
+                let url = self.build_url("files");
+                let query_params = params.as_ref().map(FileListParams::query_pairs);
+                self.execute_get_request(&url, query_params.as_deref(), None)
+                    .await
+            })
+            .await;
+
+        observability::request_finished(start.elapsed(), &result);
+        result
+    }
+
+    /// Fetch the metadata of a file.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "get_file",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
+    pub async fn get_file(&self, file_id: &str) -> Result<FileInfo> {
+        let start = Instant::now();
+        let result = self
+            .retry_with_backoff(|| async {
+                let url = self.build_url(&format!("files/{file_id}"));
+                self.execute_get_request(&url, None, None).await
+            })
+            .await;
+
+        observability::request_finished(start.elapsed(), &result);
+        result
+    }
+
+    /// Download the raw content of a file.
+    ///
+    /// Only files created by code execution or skills are downloadable.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "download_file",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
+    pub async fn download_file(&self, file_id: &str) -> Result<Bytes> {
+        let start = Instant::now();
+        let result = self
+            .retry_with_backoff(|| async {
+                let url = self.build_url(&format!("files/{file_id}/content"));
+                let response = self.execute_get_stream_request(&url, None).await?;
+                let metadata = response_metadata(&response);
+                response.bytes().await.map_err(|error| {
+                    map_reqwest_error(error, RequestPhase::Body).with_http_metadata(metadata)
+                })
+            })
+            .await;
+
+        observability::request_finished(start.elapsed(), &result);
+        result
+    }
+
+    /// Delete a file.
+    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+        operation = "delete_file",
+        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
+        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
+    ))]
+    pub async fn delete_file(&self, file_id: &str) -> Result<DeletedFile> {
+        let start = Instant::now();
+        let result = self
+            .retry_with_backoff(|| async {
+                let url = self.build_url(&format!("files/{file_id}"));
+                self.execute_delete_request(&url, None).await
+            })
+            .await;
+
+        observability::request_finished(start.elapsed(), &result);
         result
     }
 }
@@ -1447,6 +1803,7 @@ Connection: close\r\n\r\n{}",
             max_retries: 2,
             cached_headers: Arc::new(HeaderMap::new()),
             default_betas: Vec::new(),
+            last_rate_limits: Arc::new(Mutex::new(None)),
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));
@@ -1481,6 +1838,7 @@ Connection: close\r\n\r\n{}",
             max_retries: 2,
             cached_headers: Arc::new(HeaderMap::new()),
             default_betas: Vec::new(),
+            last_rate_limits: Arc::new(Mutex::new(None)),
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));
@@ -1513,6 +1871,7 @@ Connection: close\r\n\r\n{}",
             max_retries: 2,
             cached_headers: Arc::new(HeaderMap::new()),
             default_betas: Vec::new(),
+            last_rate_limits: Arc::new(Mutex::new(None)),
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));
@@ -1546,6 +1905,7 @@ Connection: close\r\n\r\n{}",
             max_retries: 2,
             cached_headers: Arc::new(HeaderMap::new()),
             default_betas: Vec::new(),
+            last_rate_limits: Arc::new(Mutex::new(None)),
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));
@@ -1834,6 +2194,7 @@ Connection: close\r\n\r\n{}",
             max_retries: 1,
             cached_headers: Arc::new(HeaderMap::new()),
             default_betas: Vec::new(),
+            last_rate_limits: Arc::new(Mutex::new(None)),
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));
@@ -1878,7 +2239,99 @@ Connection: close\r\n\r\n{}",
             max_retries: 0,
             cached_headers: Arc::new(HeaderMap::new()),
             default_betas: Vec::new(),
+            last_rate_limits: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn sample_create_params() -> MessageCreateParams {
+        MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet55)
+    }
+
+    #[test]
+    fn create_params_betas_none_by_default() {
+        assert!(create_params_betas(&sample_create_params()).is_empty());
+    }
+
+    #[test]
+    fn create_params_betas_context_management() {
+        use crate::types::ContextEdit;
+        let params = sample_create_params()
+            .with_context_management(ContextManagement::new(vec![ContextEdit::clear_tool_uses()]));
+        assert_eq!(create_params_betas(&params), vec![CONTEXT_MANAGEMENT_BETA]);
+    }
+
+    #[test]
+    fn create_params_betas_compact_edit_adds_both() {
+        use crate::types::ContextEdit;
+        let params = sample_create_params()
+            .with_context_management(ContextManagement::new(vec![ContextEdit::compact()]));
+        assert_eq!(
+            create_params_betas(&params),
+            vec![CONTEXT_MANAGEMENT_BETA, COMPACT_EDIT_BETA]
+        );
+    }
+
+    #[test]
+    fn create_params_betas_compaction() {
+        let params = sample_create_params().with_compaction(CompactionRequest::new());
+        assert_eq!(create_params_betas(&params), vec![COMPACTION_BETA]);
+    }
+
+    #[test]
+    fn create_params_betas_mcp_servers() {
+        let params = sample_create_params()
+            .with_mcp_servers(vec![McpServer::new("a", "https://mcp.example.com")]);
+        assert_eq!(create_params_betas(&params), vec![MCP_CLIENT_BETA]);
+    }
+
+    #[test]
+    fn create_params_betas_task_budget() {
+        let params = sample_create_params().with_output_config(
+            OutputConfig::new().with_task_budget(crate::types::TaskBudget::new(64_000)),
+        );
+        assert_eq!(create_params_betas(&params), vec![TASK_BUDGETS_BETA]);
+    }
+
+    #[test]
+    fn structured_outputs_never_adds_a_beta() {
+        use crate::types::{OutputFormat, ToolParam, ToolUnionParam};
+        let tool = ToolParam::new(
+            "get_weather".to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
+        .with_strict(true);
+        let params = sample_create_params()
+            .with_output_config(OutputConfig::new().with_format(OutputFormat::json_schema(
+                serde_json::json!({"type": "object", "additionalProperties": false}),
+            )))
+            .with_tools(vec![ToolUnionParam::CustomTool(tool)]);
+        assert!(create_params_betas(&params).is_empty());
+    }
+
+    #[test]
+    fn count_params_betas_mirror_create_params() {
+        use crate::types::{ContextEdit, MessageParam};
+        let params = MessageCountTokensParams::new(
+            vec![MessageParam::new_with_string(
+                "Hi".to_string(),
+                crate::types::MessageRole::User,
+            )],
+            Model::Known(KnownModel::ClaudeSonnet55),
+        )
+        .with_context_management(ContextManagement::new(vec![ContextEdit::compact()]))
+        .with_mcp_servers(vec![McpServer::new("a", "https://mcp.example.com")])
+        .with_output_config(
+            OutputConfig::new().with_task_budget(crate::types::TaskBudget::new(20_000)),
+        );
+        assert_eq!(
+            count_params_betas(&params),
+            vec![
+                CONTEXT_MANAGEMENT_BETA,
+                COMPACT_EDIT_BETA,
+                MCP_CLIENT_BETA,
+                TASK_BUDGETS_BETA
+            ]
+        );
     }
 
     #[test]
@@ -1906,8 +2359,8 @@ Connection: close\r\n\r\n{}",
     #[test]
     fn collect_betas_auto_only() {
         let client = test_client();
-        let result = client.collect_betas(None, &[STRUCTURED_OUTPUTS_BETA]);
-        assert_eq!(result, vec![STRUCTURED_OUTPUTS_BETA]);
+        let result = client.collect_betas(None, &[CONTEXT_MANAGEMENT_BETA]);
+        assert_eq!(result, vec![CONTEXT_MANAGEMENT_BETA]);
     }
 
     #[test]
@@ -1983,7 +2436,7 @@ Connection: close\r\n\r\n{}",
             assert_eq!(body_json["requests"][0]["custom_id"], "request-1");
             assert_eq!(
                 body_json["requests"][0]["params"]["model"],
-                "claude-haiku-4-5"
+                "claude-haiku-5-5"
             );
             assert!(
                 body_json["requests"][0]["params"].get("stream").is_none(),
@@ -2003,7 +2456,7 @@ Connection: close\r\n\r\n{}",
         let request_params = MessageCreateParams::new(
             16,
             vec![MessageParam::user("ping")],
-            Model::Known(KnownModel::ClaudeHaiku45),
+            Model::Known(KnownModel::ClaudeHaiku55),
         )
         .with_beta("request-beta");
         let params = MessageBatchCreateParams::new(vec![MessageBatchCreateRequest::new(
@@ -2095,6 +2548,109 @@ Connection: close\r\n\r\n{}",
     }
 
     #[tokio::test]
+    async fn last_rate_limits_reflects_response_headers() {
+        let body = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let base_url = start_test_server(move |mut socket| async move {
+            let _ = read_http_request_bytes(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+Content-Type: application/json\r\n\
+anthropic-ratelimit-requests-limit: 50\r\n\
+anthropic-ratelimit-requests-remaining: 49\r\n\
+anthropic-ratelimit-requests-reset: 2026-10-19T12:00:00Z\r\n\
+request-id: req_abc\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        })
+        .await;
+
+        let client = Anthropic::new(Some("test_key".to_string()))
+            .unwrap()
+            .with_base_url(base_url)
+            .unwrap();
+        assert_eq!(client.last_rate_limits(), None);
+        let params = MessageCreateParams::simple("hi", KnownModel::ClaudeHaiku55);
+        client.send(params).await.unwrap();
+
+        let limits = client.last_rate_limits().unwrap();
+        let requests = limits.requests.unwrap();
+        assert_eq!((requests.limit, requests.remaining), (50, 49));
+        assert!(requests.reset.is_some());
+        assert_eq!(limits.request_id.as_deref(), Some("req_abc"));
+        assert_eq!(limits.tokens, None);
+    }
+
+    #[tokio::test]
+    async fn response_without_rate_limit_headers_keeps_last_rate_limits() {
+        let body = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let with_headers = start_test_server(move |mut socket| async move {
+            let _ = read_http_request_bytes(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+Content-Type: application/json\r\n\
+anthropic-ratelimit-requests-limit: 50\r\n\
+anthropic-ratelimit-requests-remaining: 49\r\n\
+request-id: req_abc\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        })
+        .await;
+        let without_headers = start_test_server(move |mut socket| async move {
+            let _ = read_http_request_bytes(&mut socket).await;
+            write_json_response(&mut socket, body).await;
+        })
+        .await;
+        let fast_only = start_test_server(move |mut socket| async move {
+            let _ = read_http_request_bytes(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+Content-Type: application/json\r\n\
+anthropic-fast-input-tokens-limit: 1000\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        })
+        .await;
+
+        let client = Anthropic::new(Some("test_key".to_string()))
+            .unwrap()
+            .with_base_url(with_headers)
+            .unwrap();
+        let params = MessageCreateParams::simple("hi", KnownModel::ClaudeHaiku55);
+        client.send(params.clone()).await.unwrap();
+        let recorded = client.last_rate_limits().unwrap();
+
+        let other = client.clone().with_base_url(without_headers).unwrap();
+        other.send(params.clone()).await.unwrap();
+        assert_eq!(client.last_rate_limits(), Some(recorded.clone()));
+        assert_eq!(
+            client.last_rate_limits().unwrap().request_id.as_deref(),
+            Some("req_abc")
+        );
+
+        let fast = client.clone().with_base_url(fast_only).unwrap();
+        fast.send(params).await.unwrap();
+        let updated = client.last_rate_limits().unwrap();
+        assert_ne!(updated, recorded);
+        assert_eq!(updated.requests, None);
+        assert_eq!(updated.request_id, None);
+    }
+
+    #[tokio::test]
     async fn cancel_message_batch_posts_empty_body() {
         let response_body = r#"{
             "id": "msgbatch_123",
@@ -2168,7 +2724,7 @@ Connection: close\r\n\r\n{}",
         let results_body = concat!(
             r#"{"custom_id":"second","result":{"type":"expired"}}"#,
             "\n",
-            r#"{"custom_id":"first","result":{"type":"succeeded","message":{"id":"msg_123","type":"message","role":"assistant","model":"claude-haiku-4-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}}"#
+            r#"{"custom_id":"first","result":{"type":"succeeded","message":{"id":"msg_123","type":"message","role":"assistant","model":"claude-haiku-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}}"#
         );
 
         let base_url = start_test_server(move |mut socket| async move {
@@ -2261,7 +2817,7 @@ Connection: close\r\n\r\n",
         let params = MessageCreateParams::new_streaming(
             16,
             vec![MessageParam::user("ping")],
-            Model::Known(KnownModel::ClaudeHaiku45),
+            Model::Known(KnownModel::ClaudeHaiku55),
         );
 
         let mut stream = std::pin::pin!(client.stream(&params).await.unwrap());
@@ -2299,7 +2855,7 @@ event: ping\n",
         let params = MessageCreateParams::new_streaming(
             16,
             vec![MessageParam::user("ping")],
-            Model::Known(KnownModel::ClaudeHaiku45),
+            Model::Known(KnownModel::ClaudeHaiku55),
         );
 
         let mut stream = std::pin::pin!(client.stream(&params).await.unwrap());
@@ -2312,7 +2868,7 @@ event: ping\n",
     async fn non_streaming_body_stall_reports_timeout_error() {
         let base_url = start_test_server(|mut socket| async move {
             read_http_request(&mut socket).await;
-            let body_prefix = b"{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-haiku-4-5-20251001\",\"content\":[{\"type\":\"text\",\"text\":\"hel";
+            let body_prefix = b"{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-haiku-5-5\",\"content\":[{\"type\":\"text\",\"text\":\"hel";
             let body_suffix = b"lo\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}";
             let headers = format!(
                 "HTTP/1.1 200 OK\r\n\
@@ -2344,10 +2900,178 @@ Connection: close\r\n\r\n",
         let params = MessageCreateParams::new(
             16,
             vec![MessageParam::user("ping")],
-            Model::Known(KnownModel::ClaudeHaiku45),
+            Model::Known(KnownModel::ClaudeHaiku55),
         );
 
         let err = client.send(params).await.unwrap_err();
         assert!(matches!(err, Error::Timeout { .. }), "{err:?}");
+    }
+
+    fn file_info_json() -> &'static str {
+        r#"{"id":"file_01","type":"file","filename":"notes.txt","mime_type":"text/plain","size_bytes":5,"created_at":"2026-10-19T00:00:00Z","downloadable":false}"#
+    }
+
+    fn files_client(base_url: String) -> Anthropic {
+        Anthropic::new(Some("test_key".to_string()))
+            .unwrap()
+            .with_base_url(base_url)
+            .unwrap()
+    }
+
+    #[test]
+    fn create_params_betas_mcp_toolset() {
+        let params = sample_create_params().with_tools(vec![ToolUnionParam::new_mcp_toolset("a")]);
+        assert_eq!(create_params_betas(&params), vec![MCP_CLIENT_BETA]);
+    }
+
+    #[test]
+    fn file_upload_body_framing() {
+        let body = build_file_upload_body("BOUND", "a\"b.txt", "text/plain", b"hello", Some(3_600));
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            "--BOUND\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"a\\\"b.txt\"\r\n\
+             Content-Type: text/plain\r\n\r\nhello\r\n\
+             --BOUND\r\n\
+             Content-Disposition: form-data; name=\"expires_in_seconds\"\r\n\r\n3600\r\n\
+             --BOUND--\r\n"
+        );
+        assert_ne!(multipart_boundary(), multipart_boundary());
+    }
+
+    #[tokio::test]
+    async fn upload_file_sends_multipart_body() {
+        let base_url = start_test_server(move |mut socket| async move {
+            let request = read_http_request_bytes(&mut socket).await;
+            let (headers, body) = split_http_request(&request);
+            assert_eq!(request_method(&headers), "POST");
+            assert_eq!(request_target(&headers), "/v1/files");
+            let content_type = header_value(&headers, "content-type").unwrap();
+            let boundary = content_type
+                .strip_prefix("multipart/form-data; boundary=")
+                .expect("multipart content type");
+            assert!(header_value(&headers, "anthropic-beta").is_none());
+            assert_eq!(
+                body,
+                format!(
+                    "--{boundary}\r\n\
+                     Content-Disposition: form-data; name=\"file\"; filename=\"notes.txt\"\r\n\
+                     Content-Type: text/plain\r\n\r\nhello\r\n\
+                     --{boundary}\r\n\
+                     Content-Disposition: form-data; name=\"expires_in_seconds\"\r\n\r\n7200\r\n\
+                     --{boundary}--\r\n"
+                )
+            );
+            write_json_response(&mut socket, file_info_json()).await;
+        })
+        .await;
+
+        let info = files_client(base_url)
+            .upload_file("notes.txt", "text/plain", b"hello".to_vec(), Some(7_200))
+            .await
+            .unwrap();
+        assert_eq!(info.id, "file_01");
+        assert_eq!(info.size_bytes, 5);
+        assert!(!info.downloadable);
+    }
+
+    #[tokio::test]
+    async fn upload_file_rejects_bad_expiry_and_line_breaks() {
+        let client = test_client();
+        let too_short = client
+            .upload_file("a.txt", "text/plain", Vec::new(), Some(60))
+            .await
+            .unwrap_err();
+        assert!(too_short.is_validation());
+        let too_long = client
+            .upload_file("a.txt", "text/plain", Vec::new(), Some(7_776_001))
+            .await
+            .unwrap_err();
+        assert!(too_long.is_validation());
+        let bad_name = client
+            .upload_file("a\r\nb.txt", "text/plain", Vec::new(), None)
+            .await
+            .unwrap_err();
+        assert!(bad_name.is_validation());
+    }
+
+    #[tokio::test]
+    async fn list_files_sends_query() {
+        let base_url = start_test_server(move |mut socket| async move {
+            let request = read_http_request_bytes(&mut socket).await;
+            let (headers, _) = split_http_request(&request);
+            assert_eq!(request_method(&headers), "GET");
+            assert_eq!(request_target(&headers), "/v1/files?limit=2&page=p2");
+            let body = format!(
+                r#"{{"data":[{}],"has_more":true,"next_page":"p3"}}"#,
+                file_info_json()
+            );
+            write_json_response(&mut socket, &body).await;
+        })
+        .await;
+
+        let list = files_client(base_url)
+            .list_files(Some(FileListParams::new().with_limit(2).with_page("p2")))
+            .await
+            .unwrap();
+        assert_eq!(list.data.len(), 1);
+        assert_eq!(list.next_page.as_deref(), Some("p3"));
+        assert_eq!(list.has_more, Some(true));
+    }
+
+    #[tokio::test]
+    async fn get_file_uses_file_endpoint() {
+        let base_url = start_test_server(move |mut socket| async move {
+            let request = read_http_request_bytes(&mut socket).await;
+            let (headers, _) = split_http_request(&request);
+            assert_eq!(request_method(&headers), "GET");
+            assert_eq!(request_target(&headers), "/v1/files/file_01");
+            write_json_response(&mut socket, file_info_json()).await;
+        })
+        .await;
+
+        let info = files_client(base_url).get_file("file_01").await.unwrap();
+        assert_eq!(info.filename, "notes.txt");
+    }
+
+    #[tokio::test]
+    async fn delete_file_uses_delete_endpoint() {
+        let base_url = start_test_server(move |mut socket| async move {
+            let request = read_http_request_bytes(&mut socket).await;
+            let (headers, _) = split_http_request(&request);
+            assert_eq!(request_method(&headers), "DELETE");
+            assert_eq!(request_target(&headers), "/v1/files/file_01");
+            write_json_response(&mut socket, r#"{"id":"file_01","type":"file_deleted"}"#).await;
+        })
+        .await;
+
+        let deleted = files_client(base_url).delete_file("file_01").await.unwrap();
+        assert_eq!(deleted.id, "file_01");
+        assert_eq!(deleted.r#type, "file_deleted");
+    }
+
+    #[tokio::test]
+    async fn download_file_returns_raw_bytes() {
+        let base_url = start_test_server(move |mut socket| async move {
+            let request = read_http_request_bytes(&mut socket).await;
+            let (headers, _) = split_http_request(&request);
+            assert_eq!(request_method(&headers), "GET");
+            assert_eq!(request_target(&headers), "/v1/files/file_01/content");
+            let payload: &[u8] = &[0, 159, 146, 150, 255];
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(payload).await.unwrap();
+            socket.shutdown().await.unwrap();
+        })
+        .await;
+
+        let bytes = files_client(base_url)
+            .download_file("file_01")
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), &[0, 159, 146, 150, 255]);
     }
 }

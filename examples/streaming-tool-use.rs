@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
         let mut params = MessageCreateParams::new_streaming(
             1024,
             messages.clone(),
-            Model::Known(KnownModel::ClaudeHaiku45),
+            Model::Known(KnownModel::ClaudeHaiku55),
         )
         .with_tools(tools.clone());
 

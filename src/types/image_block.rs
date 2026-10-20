@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Base64ImageSource, CacheControlEphemeral, UrlImageSource};
+use crate::types::{Base64ImageSource, CacheControlEphemeral, FileSource, UrlImageSource};
 
 /// The source type for an image block, which can be either Base64 encoded or a URL.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -13,6 +13,28 @@ pub enum ImageSource {
     /// A URL image source.
     #[serde(rename = "url")]
     Url(UrlImageSource),
+
+    /// A file uploaded through the Files API.
+    #[serde(rename = "file")]
+    File(FileSource),
+}
+
+/// What to do with an image larger than the supported size.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OversizedImage {
+    /// Downsize the image to fit.
+    Downsize,
+    /// Reject the request.
+    Error,
+}
+
+/// Transformations applied to an image before the model sees it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageTransformations {
+    /// How oversized images are handled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oversized_image: Option<OversizedImage>,
 }
 
 /// Parameters for an image block.
@@ -24,6 +46,10 @@ pub struct ImageBlock {
     /// Create a cache control breakpoint at this content block.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControlEphemeral>,
+
+    /// Transformations applied to the image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transformations: Option<ImageTransformations>,
 }
 
 impl ImageBlock {
@@ -32,6 +58,7 @@ impl ImageBlock {
         Self {
             source,
             cache_control: None,
+            transformations: None,
         }
     }
 
@@ -43,6 +70,17 @@ impl ImageBlock {
     /// Create a new `ImageBlock` with a URL image source.
     pub fn new_with_url(source: UrlImageSource) -> Self {
         Self::new(ImageSource::Url(source))
+    }
+
+    /// Create a new `ImageBlock` referencing a file uploaded through the Files API.
+    pub fn from_file_id(file_id: impl Into<String>) -> Self {
+        Self::new(ImageSource::File(FileSource::new(file_id)))
+    }
+
+    /// Set the image transformations.
+    pub fn with_transformations(mut self, transformations: ImageTransformations) -> Self {
+        self.transformations = Some(transformations);
+        self
     }
 
     /// Add a cache control to this image block.
@@ -119,5 +157,23 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn image_block_with_file_source_and_transformations() {
+        let block =
+            ImageBlock::from_file_id("file_02").with_transformations(ImageTransformations {
+                oversized_image: Some(OversizedImage::Downsize),
+            });
+        let json = to_value(&block).unwrap();
+        assert_eq!(
+            json,
+            json!({
+                "source": {"type": "file", "file_id": "file_02"},
+                "transformations": {"oversized_image": "downsize"}
+            })
+        );
+        let parsed: ImageBlock = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, block);
     }
 }

@@ -27,7 +27,7 @@ fn cache_prewarm_allows_zero_output_tokens() {
             ],
             MessageRole::User,
         )],
-        KnownModel::ClaudeOpus5.into(),
+        KnownModel::ClaudeOpus55.into(),
     );
     assert!(params.validate().is_ok());
 }
@@ -42,7 +42,7 @@ fn accepts_base64_image_below_anthropic_limit() {
         vec![ContentBlock::Image(ImageBlock::new_with_base64(source))],
         MessageRole::User,
     );
-    let params = MessageCreateParams::new(100, vec![message], KnownModel::ClaudeOpus5.into());
+    let params = MessageCreateParams::new(100, vec![message], KnownModel::ClaudeOpus55.into());
     assert!(params.validate().is_ok());
 }
 
@@ -107,7 +107,7 @@ fn cache_prewarm_rejects_output_producing_options() {
     let base = MessageCreateParams::new(
         0,
         vec![MessageParam::user("warmup")],
-        KnownModel::ClaudeOpus5.into(),
+        KnownModel::ClaudeOpus55.into(),
     );
     let mut params = base.clone();
     params.stream = true;

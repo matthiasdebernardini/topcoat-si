@@ -29,6 +29,12 @@ pub enum ContentBlockDelta {
     /// A signature delta.
     #[serde(rename = "signature_delta")]
     SignatureDelta(SignatureDelta),
+
+    /// A compaction summary delta.
+    ///
+    /// Builders that do not understand compaction ignore it.
+    #[serde(rename = "compaction_delta")]
+    CompactionDelta(CompactionDelta),
     /// A value introduced by a newer API version.
     #[serde(other)]
     Unknown,
@@ -54,6 +60,7 @@ impl<'de> Deserialize<'de> for ContentBlockDelta {
                 from_value(value).map(ContentBlockDelta::ThinkingDelta)
             }
             "signature_delta" => from_value(value).map(ContentBlockDelta::SignatureDelta),
+            "compaction_delta" => from_value(value).map(ContentBlockDelta::CompactionDelta),
             other if is_thinking_like_delta(other) => {
                 let thinking_delta: ThinkingDelta = from_value(value)?;
                 if thinking_delta.thinking.is_empty() {
@@ -65,6 +72,18 @@ impl<'de> Deserialize<'de> for ContentBlockDelta {
             _ => Ok(ContentBlockDelta::Unknown),
         }
     }
+}
+
+/// The fields of a `compaction_delta`; each replaces the block's field of the same name.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CompactionDelta {
+    /// The summary text, or `None` when the API sends null.
+    #[serde(default)]
+    pub content: Option<String>,
+
+    /// The encrypted form of the summary, or `None` when the API sends null.
+    #[serde(default)]
+    pub encrypted_content: Option<String>,
 }
 
 fn from_value<T, E>(value: Value) -> Result<T, E>
@@ -112,6 +131,34 @@ mod tests {
     use serde_json::{from_value, json, to_value};
 
     #[test]
+    fn compaction_delta_round_trip() {
+        let json = json!({
+            "type": "compaction_delta",
+            "content": "Summary so far",
+            "encrypted_content": null
+        });
+        let delta: ContentBlockDelta = from_value(json.clone()).unwrap();
+        assert_eq!(
+            delta,
+            ContentBlockDelta::CompactionDelta(CompactionDelta {
+                content: Some("Summary so far".to_string()),
+                encrypted_content: None,
+            })
+        );
+        assert_eq!(to_value(&delta).unwrap(), json);
+
+        let delta: ContentBlockDelta =
+            from_value(json!({"type": "compaction_delta", "encrypted_content": "enc"})).unwrap();
+        assert_eq!(
+            delta,
+            ContentBlockDelta::CompactionDelta(CompactionDelta {
+                content: None,
+                encrypted_content: Some("enc".to_string()),
+            })
+        );
+    }
+
+    #[test]
     fn text_delta_serialization() {
         let text_delta = TextDelta::new("Hello world".to_string());
         let delta = ContentBlockDelta::TextDelta(text_delta);
@@ -149,6 +196,7 @@ mod tests {
             document_title: Some("Document Title".to_string()),
             end_char_index: 12,
             start_char_index: 0,
+            file_id: None,
         };
 
         let citations_delta = CitationsDelta::with_char_location(char_location);

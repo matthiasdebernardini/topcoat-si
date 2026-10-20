@@ -21,7 +21,11 @@ async fn serve(body: String) -> Anthropic {
 #[tokio::test]
 async fn public_stream_reports_missing_message_error() {
     let client = serve(String::new()).await;
-    let params = ().create_request(100, vec![MessageParam::user("hello")], true).await;
+    let params = MessageCreateParams::new_streaming(
+        100,
+        vec![MessageParam::user("hello")],
+        KnownModel::ClaudeSonnet55.into(),
+    );
     let events: Vec<_> = client.stream(&params).await.unwrap().collect().await;
     assert_eq!(events.len(), 1);
     assert!(
@@ -38,7 +42,7 @@ async fn public_stream_reports_failure_once() {
     let message = Message::new(
         "msg_partial".into(),
         vec![],
-        KnownModel::ClaudeSonnet40.into(),
+        KnownModel::ClaudeSonnet55.into(),
         Usage::new(100, 0),
     );
     let body = format!(
@@ -47,7 +51,11 @@ async fn public_stream_reports_failure_once() {
         json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}})
     );
     let client = serve(body).await;
-    let params = ().create_request(100, vec![MessageParam::user("hello")], true).await;
+    let params = MessageCreateParams::new_streaming(
+        100,
+        vec![MessageParam::user("hello")],
+        KnownModel::ClaudeSonnet55.into(),
+    );
     let events: Vec<_> = client.stream(&params).await.unwrap().collect().await;
     assert_eq!(events.iter().filter(|event| event.is_err()).count(), 1);
 }

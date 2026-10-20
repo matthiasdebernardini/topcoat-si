@@ -26,7 +26,7 @@ mod tests {
     fn message_start_event_serialization() {
         let text_block = TextBlock::new("Hello, I'm Claude.".to_string());
         let content = vec![ContentBlock::Text(text_block)];
-        let model = Model::Known(crate::types::KnownModel::Claude37Sonnet20250219);
+        let model = Model::Known(crate::types::KnownModel::ClaudeSonnet55);
         let usage = Usage::new(50, 100);
 
         let message = Message::new("msg_012345".to_string(), content, model, usage);
@@ -45,7 +45,7 @@ mod tests {
                             "type": "text"
                         }
                     ],
-                    "model": "claude-3-7-sonnet-20250219",
+                    "model": "claude-sonnet-5-5",
                     "role": "assistant",
                     "type": "message",
                     "usage": {
@@ -68,7 +68,7 @@ mod tests {
                         "type": "text"
                     }
                 ],
-                "model": "claude-3-7-sonnet-20250219",
+                "model": "claude-sonnet-5-5",
                 "role": "assistant",
                 "type": "message",
                 "usage": {

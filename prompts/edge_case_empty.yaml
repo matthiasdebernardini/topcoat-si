@@ -1,9 +1,0 @@
-name: "Edge Case - Minimal Response"
-prompt: "Just say 'OK'."
-model: "claude-haiku-4-5"
-max_tokens: 10
-temperature: 0.0
-expected_contains:
-  - "OK"
-min_response_length: 2
-max_response_length: 10

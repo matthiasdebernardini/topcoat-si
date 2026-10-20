@@ -20,6 +20,10 @@ pub struct CitationContentBlockLocation {
 
     /// The start content block index (inclusive) of the citation in the document
     pub start_block_index: i32,
+
+    /// ID of the cited file when the document came from the Files API
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
 }
 
 impl CitationContentBlockLocation {
@@ -37,7 +41,14 @@ impl CitationContentBlockLocation {
             document_title,
             end_block_index,
             start_block_index,
+            file_id: None,
         }
+    }
+
+    /// Sets the ID of the cited file
+    pub fn with_file_id(mut self, file_id: impl Into<String>) -> Self {
+        self.file_id = Some(file_id.into());
+        self
     }
 
     /// Returns the number of content blocks in the citation span
@@ -58,6 +69,7 @@ mod tests {
             document_title: Some("Document Title".to_string()),
             end_block_index: 3,
             start_block_index: 1,
+            file_id: None,
         };
 
         let json = serde_json::to_string(&location).unwrap();
@@ -74,6 +86,7 @@ mod tests {
             document_title: None,
             end_block_index: 3,
             start_block_index: 1,
+            file_id: None,
         };
 
         let json = serde_json::to_string(&location).unwrap();
@@ -102,6 +115,7 @@ mod tests {
             document_title: None,
             end_block_index: 3,
             start_block_index: 1,
+            file_id: None,
         };
 
         assert_eq!(location.block_count(), 2);

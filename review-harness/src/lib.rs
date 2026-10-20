@@ -174,7 +174,7 @@ mod telemetry {
         )
     }
     fn params() -> MessageCreateParams {
-        MessageCreateParams::simple("synthetic-private-prompt", KnownModel::ClaudeHaiku45)
+        MessageCreateParams::simple("synthetic-private-prompt", KnownModel::ClaudeHaiku55)
     }
     fn response(id: &str, stream: bool) -> String {
         let message = Message::new(
@@ -364,49 +364,5 @@ mod telemetry {
             assert!(!output.contains("synthetic-private-response"));
             assert!(!output.contains("synthetic-secret"));
         }
-    }
-    struct FailingTool;
-    #[async_trait::async_trait]
-    impl Agent for FailingTool {
-        async fn tools(&self) -> Vec<std::sync::Arc<dyn Tool<Self>>> {
-            vec![std::sync::Arc::new(ToolBash20250124::new())]
-        }
-        async fn bash(&self, _: &str, _: bool) -> std::io::Result<String> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "synthetic shell denied",
-            ))
-        }
-    }
-
-    #[test]
-    fn tool_failure_retains_source_and_tool_context_for_sentry() {
-        let (_exporter, provider) = provider();
-        let events = sentry::test::with_captured_events(|| {
-            with_default(subscriber(&provider), || {
-                runtime().block_on(async {
-                    let client = Anthropic::new(Some("synthetic-key".into())).unwrap();
-                    let message = Message::new(
-                        "m".into(),
-                        vec![
-                            ToolUseBlock::new(
-                                "tool_context",
-                                "bash",
-                                serde_json::json!({"command":"synthetic"}),
-                            )
-                            .into(),
-                        ],
-                        KnownModel::ClaudeHaiku45.into(),
-                        Usage::new(1, 1),
-                    );
-                    let result = FailingTool.handle_default_tool_use(&client, &message).await;
-                    assert!(matches!(result, std::ops::ControlFlow::Continue(_)));
-                })
-            })
-        });
-        assert_eq!(events.len(), 1);
-        assert!(format!("{:?}", events[0].exception).contains("synthetic shell denied"));
-        assert!(format!("{:?}", events[0].contexts).contains("tool_context"));
-        assert!(format!("{:?}", events[0].contexts).contains("bash"));
     }
 }

@@ -7,9 +7,7 @@ use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt};
 use std::time::Instant;
 
-use crate::observability::{
-    STREAM_BYTES, STREAM_DURATION, STREAM_ERRORS, STREAM_EVENTS, STREAM_TTFB,
-};
+use crate::observability;
 use crate::{
     ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent, Error,
     MessageDeltaEvent, MessageStartEvent, MessageStopEvent, MessageStreamEvent, Result,
@@ -86,7 +84,7 @@ where
                 Ok(Some((event, remaining))) => {
                     state.buffer = remaining;
                     match &event {
-                        Ok(_) => STREAM_EVENTS.click(),
+                        Ok(_) => observability::stream_event(),
                         Err(_) => state.fail(),
                     }
                     return Some((event, (stream, state)));
@@ -116,11 +114,11 @@ where
             match stream.next().await {
                 Some(Ok(bytes)) => {
                     state.total_bytes_processed += bytes.len();
-                    STREAM_BYTES.count(bytes.len() as u64);
+                    observability::stream_bytes(bytes.len() as u64);
                     if state.first_byte.is_none() {
                         let now = Instant::now();
                         state.first_byte = Some(now);
-                        STREAM_TTFB.add(now.duration_since(state.start).as_secs_f64());
+                        observability::stream_first_byte(now.duration_since(state.start));
                     }
 
                     let mut utf8_bytes = std::mem::take(&mut state.pending_utf8);
@@ -185,7 +183,7 @@ where
                         ));
                     }
                     state.finished = true;
-                    STREAM_DURATION.add(state.start.elapsed().as_secs_f64());
+                    observability::stream_completed(state.start.elapsed());
                     return None;
                 }
             }
@@ -197,7 +195,7 @@ where
 impl SseState {
     fn fail(&mut self) {
         self.finished = true;
-        STREAM_ERRORS.click();
+        observability::stream_error();
     }
 }
 
@@ -244,7 +242,7 @@ where
                 let decoded = result.and_then(|event| {
                 tracing::trace!(target: "claudius::wire", event = %event.event, data = %event.data);
                 let result = parse_message_stream_event(&event);
-                if result.is_err() { STREAM_ERRORS.click(); }
+                if result.is_err() { observability::stream_error(); }
                 result
             });
                 if decoded.is_err() {

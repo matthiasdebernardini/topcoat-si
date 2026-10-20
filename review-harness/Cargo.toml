@@ -14,11 +14,9 @@ opentelemetry = { version = "=0.32.0", default-features = false, features = ["tr
 opentelemetry_sdk = { version = "=0.32.0", default-features = false, features = ["trace", "testing"] }
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["trace", "http-json", "reqwest-blocking-client"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
 
 # Direct dependencies used by the independent regression tests.
-async-trait = "0.1.89"
 base64 = "0.22.1"
-biometrics = "0.14.0"
 bytes = "1.11.1"
 futures = "0.3.32"

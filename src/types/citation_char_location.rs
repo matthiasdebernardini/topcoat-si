@@ -21,6 +21,10 @@ pub struct CitationCharLocation {
 
     /// The start character index (inclusive) of the citation in the document
     pub start_char_index: i32,
+
+    /// ID of the cited file when the document came from the Files API
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
 }
 
 impl CitationCharLocation {
@@ -38,7 +42,14 @@ impl CitationCharLocation {
             document_title,
             end_char_index,
             start_char_index,
+            file_id: None,
         }
+    }
+
+    /// Sets the ID of the cited file
+    pub fn with_file_id(mut self, file_id: impl Into<String>) -> Self {
+        self.file_id = Some(file_id.into());
+        self
     }
 
     /// Returns the length of the cited text in characters
@@ -59,6 +70,7 @@ mod tests {
             document_title: Some("Document Title".to_string()),
             end_char_index: 12,
             start_char_index: 0,
+            file_id: None,
         };
 
         let json = serde_json::to_string(&location).unwrap();
@@ -75,6 +87,7 @@ mod tests {
             document_title: None,
             end_char_index: 12,
             start_char_index: 0,
+            file_id: None,
         };
 
         let json = serde_json::to_string(&location).unwrap();
@@ -103,6 +116,7 @@ mod tests {
             document_title: None,
             end_char_index: 12,
             start_char_index: 0,
+            file_id: None,
         };
 
         assert_eq!(location.length(), 12);

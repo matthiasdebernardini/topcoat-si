@@ -1,9 +1,12 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
-use crate::types::{ImageBlock, TextBlock};
+use crate::types::open_union::{from_value, type_tag};
+use crate::types::{DocumentBlock, ImageBlock, SearchResultBlock, TextBlock, ToolReference};
 
-/// A content type that can be either a text block or an image block.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// A content item inside a tool result: text, image, document, search result, tool
+/// reference, or an unrecognized item kept verbatim.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum Content {
     /// A text block content.
@@ -13,6 +16,39 @@ pub enum Content {
     /// An image block content.
     #[serde(rename = "image")]
     Image(ImageBlock),
+
+    /// A document block content.
+    #[serde(rename = "document")]
+    Document(DocumentBlock),
+
+    /// A search result block content.
+    #[serde(rename = "search_result")]
+    SearchResult(SearchResultBlock),
+
+    /// A reference to a tool discovered by tool search.
+    #[serde(rename = "tool_reference")]
+    ToolReference(ToolReference),
+
+    /// An item of a type this crate does not know, kept verbatim.
+    #[serde(untagged)]
+    Unknown(Value),
+}
+
+impl<'de> Deserialize<'de> for Content {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match type_tag::<D::Error>(&value)?.as_str() {
+            "text" => from_value(value).map(Content::Text),
+            "image" => from_value(value).map(Content::Image),
+            "document" => from_value(value).map(Content::Document),
+            "search_result" => from_value(value).map(Content::SearchResult),
+            "tool_reference" => from_value(value).map(Content::ToolReference),
+            _ => Ok(Content::Unknown(value)),
+        }
+    }
 }
 
 impl From<TextBlock> for Content {
@@ -133,5 +169,35 @@ mod tests {
             }
             _ => panic!("Expected Image variant"),
         }
+    }
+
+    #[test]
+    fn open_dispatch() {
+        let raw = r#"{"type":"future_item","x":[1]}"#;
+        let content: Content = serde_json::from_str(raw).unwrap();
+        assert!(matches!(content, Content::Unknown(_)));
+        assert_eq!(serde_json::to_string(&content).unwrap(), raw);
+
+        let reference: Content =
+            serde_json::from_value(json!({"type": "tool_reference", "tool_name": "x"})).unwrap();
+        assert_eq!(
+            to_value(&reference).unwrap(),
+            json!({"type": "tool_reference", "tool_name": "x"})
+        );
+
+        let document: Content = serde_json::from_value(
+            json!({"type": "document", "source": {"type": "file", "file_id": "f"}}),
+        )
+        .unwrap();
+        assert!(matches!(document, Content::Document(_)));
+
+        let search: Content = serde_json::from_value(json!({
+            "type": "search_result", "source": "s", "title": "t",
+            "content": [{"type": "text", "text": "hi"}]
+        }))
+        .unwrap();
+        assert!(matches!(search, Content::SearchResult(_)));
+
+        assert!(serde_json::from_value::<Content>(json!({"type": "text"})).is_err());
     }
 }

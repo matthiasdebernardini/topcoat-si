@@ -1,6 +1,64 @@
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::types::OutputFormat;
+
+/// A token budget for an entire agentic task.
+///
+/// Serializes as `{"type":"tokens","total":N,"remaining":M}`. Requires the
+/// `task-budgets-2026-03-13` beta, which is added automatically.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct TaskBudget {
+    /// Total tokens for the task; at least 20,000 (checked by request validation).
+    pub total: u64,
+
+    /// Tokens left, when the task spans several requests.
+    pub remaining: Option<u64>,
+}
+
+impl TaskBudget {
+    /// Create a task budget with the given total.
+    pub fn new(total: u64) -> Self {
+        Self {
+            total,
+            remaining: None,
+        }
+    }
+
+    /// Set the remaining tokens.
+    pub fn with_remaining(mut self, remaining: u64) -> Self {
+        self.remaining = Some(remaining);
+        self
+    }
+}
+
+impl Serialize for TaskBudget {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(2 + usize::from(self.remaining.is_some())))?;
+        map.serialize_entry("type", "tokens")?;
+        map.serialize_entry("total", &self.total)?;
+        if let Some(remaining) = &self.remaining {
+            map.serialize_entry("remaining", remaining)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskBudget {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            total: u64,
+            #[serde(default)]
+            remaining: Option<u64>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Self {
+            total: raw.total,
+            remaining: raw.remaining,
+        })
+    }
+}
 
 /// Effort level for controlling thinking depth with adaptive thinking.
 ///
@@ -24,8 +82,8 @@ pub enum Effort {
 
 /// Output configuration for API requests.
 ///
-/// This is the newer configuration format that replaces the deprecated `output_format` field.
-/// It supports both structured output format and the effort parameter for adaptive thinking.
+/// It supports the structured output format, the effort parameter for adaptive thinking,
+/// and a task budget.
 ///
 /// # Example
 ///
@@ -47,6 +105,10 @@ pub struct OutputConfig {
     /// Claude applies to a task.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
+
+    /// Token budget for the whole agentic task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_budget: Option<TaskBudget>,
 }
 
 impl OutputConfig {
@@ -55,6 +117,7 @@ impl OutputConfig {
         Self {
             format: None,
             effort: None,
+            task_budget: None,
         }
     }
 
@@ -67,6 +130,12 @@ impl OutputConfig {
     /// Set the effort level.
     pub fn with_effort(mut self, effort: Effort) -> Self {
         self.effort = Some(effort);
+        self
+    }
+
+    /// Set the task budget.
+    pub fn with_task_budget(mut self, task_budget: TaskBudget) -> Self {
+        self.task_budget = Some(task_budget);
         self
     }
 }
@@ -259,6 +328,28 @@ mod tests {
         let config: OutputConfig = serde_json::from_value(json).unwrap();
         assert_eq!(config.format, None);
         assert_eq!(config.effort, None);
+    }
+
+    #[test]
+    fn output_config_task_budget_serialization() {
+        let config = OutputConfig::new()
+            .with_effort(Effort::High)
+            .with_task_budget(TaskBudget::new(64_000));
+        assert_eq!(
+            to_value(&config).unwrap(),
+            json!({"effort": "high", "task_budget": {"type": "tokens", "total": 64000}})
+        );
+    }
+
+    #[test]
+    fn task_budget_with_remaining_round_trips() {
+        let budget = TaskBudget::new(64_000).with_remaining(10_000);
+        let value = to_value(budget).unwrap();
+        assert_eq!(
+            value,
+            json!({"type": "tokens", "total": 64000, "remaining": 10000})
+        );
+        assert_eq!(serde_json::from_value::<TaskBudget>(value).unwrap(), budget);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::{MessageDeltaUsage, StopDetails, StopReason};
+use crate::types::{
+    ContainerInfo, ContextManagementResponse, MessageDeltaUsage, StopDetails, StopReason,
+};
 
 /// The delta information for a message delta event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -17,6 +19,10 @@ pub struct MessageDelta {
     /// Additional refusal information, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_details: Option<Box<StopDetails>>,
+
+    /// The container used by the request, when it changed or became known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerInfo>,
 }
 
 impl MessageDelta {
@@ -26,6 +32,7 @@ impl MessageDelta {
             stop_reason: None,
             stop_sequence: None,
             stop_details: None,
+            container: None,
         }
     }
 
@@ -56,12 +63,20 @@ pub struct MessageDeltaEvent {
 
     /// The usage information for the message.
     pub usage: MessageDeltaUsage,
+
+    /// Context-management edits applied to the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<ContextManagementResponse>,
 }
 
 impl MessageDeltaEvent {
     /// Create a new `MessageDeltaEvent` with the given delta and usage.
     pub fn new(delta: MessageDelta, usage: MessageDeltaUsage) -> Self {
-        Self { delta, usage }
+        Self {
+            delta,
+            usage,
+            context_management: None,
+        }
     }
 }
 
@@ -136,5 +151,26 @@ mod tests {
         assert_eq!(event.delta.stop_sequence, Some("###".to_string()));
         assert_eq!(event.usage.input_tokens, Some(50));
         assert_eq!(event.usage.output_tokens, 100);
+    }
+
+    #[test]
+    fn message_delta_event_deserializes_container_and_context_management() {
+        let event: MessageDeltaEvent = serde_json::from_value(json!({
+            "delta": {
+                "stop_reason": "compaction",
+                "container": {"id": "container_011"}
+            },
+            "usage": {"output_tokens": 15},
+            "context_management": {
+                "applied_edits": [{"type": "clear_thinking_20251015", "cleared_thinking_turns": 3}]
+            }
+        }))
+        .unwrap();
+        assert_eq!(event.delta.stop_reason, Some(StopReason::Compaction));
+        assert_eq!(event.delta.container.unwrap().id, "container_011");
+        assert_eq!(
+            event.context_management.unwrap().applied_edits[0].cleared_thinking_turns,
+            Some(3)
+        );
     }
 }

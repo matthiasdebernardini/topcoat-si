@@ -37,6 +37,12 @@ pub enum ThinkingConfig {
         display: ThinkingDisplay,
     },
 
+    /// Thinking between tool calls only.
+    ///
+    /// Serializes as exactly `{"type":"between_tools"}`. Sonnet 5.5 only, with
+    /// effort `high` or below.
+    BetweenTools,
+
     /// Enabled thinking configuration with a token budget.
     Enabled {
         /// Determines how many tokens Claude can use for its internal reasoning process.
@@ -67,7 +73,8 @@ impl ThinkingConfig {
         match self {
             ThinkingConfig::Disabled
             | ThinkingConfig::Adaptive
-            | ThinkingConfig::AdaptiveWithDisplay { .. } => 0,
+            | ThinkingConfig::AdaptiveWithDisplay { .. }
+            | ThinkingConfig::BetweenTools => 0,
             ThinkingConfig::Enabled { budget_tokens }
             | ThinkingConfig::EnabledWithDisplay { budget_tokens, .. } => *budget_tokens,
         }
@@ -99,6 +106,13 @@ impl ThinkingConfig {
         Self::Disabled
     }
 
+    /// Create a thinking configuration that thinks between tool calls only.
+    ///
+    /// Sonnet 5.5 only, with effort `high` or below.
+    pub fn between_tools() -> Self {
+        Self::BetweenTools
+    }
+
     /// Create a new adaptive thinking configuration.
     pub fn adaptive() -> Self {
         Self::Adaptive
@@ -124,10 +138,11 @@ impl ThinkingConfig {
     /// Set how thinking content should be returned.
     ///
     /// `display` is only valid for enabled or adaptive thinking. Calling this on
-    /// disabled thinking leaves it unchanged.
+    /// disabled or between-tools thinking leaves it unchanged.
     pub fn with_display(self, display: ThinkingDisplay) -> Self {
         match self {
             ThinkingConfig::Disabled => ThinkingConfig::Disabled,
+            ThinkingConfig::BetweenTools => ThinkingConfig::BetweenTools,
             ThinkingConfig::Adaptive | ThinkingConfig::AdaptiveWithDisplay { .. } => {
                 ThinkingConfig::AdaptiveWithDisplay { display }
             }
@@ -148,6 +163,7 @@ impl ThinkingConfig {
             | ThinkingConfig::EnabledWithDisplay { display, .. } => Some(*display),
             ThinkingConfig::Disabled
             | ThinkingConfig::Adaptive
+            | ThinkingConfig::BetweenTools
             | ThinkingConfig::Enabled { .. } => None,
         }
     }
@@ -167,6 +183,11 @@ impl Serialize for ThinkingConfig {
             ThinkingConfig::Adaptive => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("type", "adaptive")?;
+                map.end()
+            }
+            ThinkingConfig::BetweenTools => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("type", "between_tools")?;
                 map.end()
             }
             ThinkingConfig::AdaptiveWithDisplay { display } => {
@@ -211,6 +232,7 @@ impl<'de> Deserialize<'de> for ThinkingConfig {
         let raw = RawThinkingConfig::deserialize(deserializer)?;
         match raw.kind.as_str() {
             "disabled" => Ok(ThinkingConfig::Disabled),
+            "between_tools" => Ok(ThinkingConfig::BetweenTools),
             "adaptive" => Ok(match raw.display {
                 Some(display) => ThinkingConfig::AdaptiveWithDisplay { display },
                 None => ThinkingConfig::Adaptive,
@@ -229,7 +251,7 @@ impl<'de> Deserialize<'de> for ThinkingConfig {
             }
             other => Err(de::Error::unknown_variant(
                 other,
-                &["disabled", "adaptive", "enabled"],
+                &["disabled", "adaptive", "between_tools", "enabled"],
             )),
         }
     }
@@ -245,6 +267,23 @@ impl Default for ThinkingConfig {
 mod tests {
     use super::*;
     use serde_json::{json, to_value};
+
+    #[test]
+    fn thinking_config_between_tools_round_trip() {
+        let config = ThinkingConfig::between_tools();
+        let json = to_value(config).unwrap();
+        assert_eq!(json, json!({"type": "between_tools"}));
+        assert_eq!(
+            serde_json::from_value::<ThinkingConfig>(json).unwrap(),
+            config
+        );
+        assert_eq!(config.num_tokens(), 0);
+        assert_eq!(
+            config.with_display(ThinkingDisplay::Summarized),
+            ThinkingConfig::BetweenTools
+        );
+        assert_eq!(config.display(), None);
+    }
 
     #[test]
     fn thinking_config_enabled_serialization() {

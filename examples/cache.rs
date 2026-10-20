@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
     let params = MessageCreateParams::new(
         64,
         vec!["What is 2+2?".into()],
-        Model::Known(KnownModel::ClaudeHaiku45),
+        Model::Known(KnownModel::ClaudeHaiku55),
     )
     .with_system(system.clone());
 
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
     let params = MessageCreateParams::new(
         64,
         vec!["What is 3+3?".into()],
-        Model::Known(KnownModel::ClaudeHaiku45),
+        Model::Known(KnownModel::ClaudeHaiku55),
     )
     .with_system(system);
 

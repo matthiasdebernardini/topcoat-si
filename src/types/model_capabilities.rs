@@ -20,6 +20,19 @@ pub struct ContextManagementCapability {
     pub supported: bool,
 }
 
+/// Server-side tools exposed by the Models API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerToolsCapability {
+    /// Whether server tools are supported.
+    pub supported: bool,
+    /// Code execution server tool support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_execution: Option<CapabilitySupport>,
+    /// Web search server tool support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<CapabilitySupport>,
+}
+
 /// Effort levels exposed by the Models API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffortCapability {
@@ -44,6 +57,12 @@ pub struct ThinkingTypes {
     pub adaptive: CapabilitySupport,
     /// Manual extended-thinking support.
     pub enabled: CapabilitySupport,
+    /// Support for explicitly disabling thinking, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<CapabilitySupport>,
+    /// Support for thinking between tool calls, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub between_tools: Option<CapabilitySupport>,
 }
 
 /// Thinking support exposed by the Models API.
@@ -72,6 +91,9 @@ pub struct ModelCapabilities {
     pub image_input: CapabilitySupport,
     /// PDF input support.
     pub pdf_input: CapabilitySupport,
+    /// Server-side tool support, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tools: Option<ServerToolsCapability>,
     /// Structured output and strict tool-schema support.
     pub structured_outputs: CapabilitySupport,
     /// Thinking support and modes.

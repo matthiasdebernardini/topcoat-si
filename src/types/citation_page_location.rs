@@ -20,6 +20,10 @@ pub struct CitationPageLocation {
 
     /// The start page number (inclusive) of the citation in the document
     pub start_page_number: i32,
+
+    /// ID of the cited file when the document came from the Files API
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
 }
 
 impl CitationPageLocation {
@@ -37,7 +41,14 @@ impl CitationPageLocation {
             document_title,
             end_page_number,
             start_page_number,
+            file_id: None,
         }
+    }
+
+    /// Sets the ID of the cited file
+    pub fn with_file_id(mut self, file_id: impl Into<String>) -> Self {
+        self.file_id = Some(file_id.into());
+        self
     }
 
     /// Returns the number of pages in the citation span (exclusive end)
@@ -63,6 +74,7 @@ mod tests {
             document_title: Some("Document Title".to_string()),
             end_page_number: 5,
             start_page_number: 3,
+            file_id: None,
         };
 
         let json = serde_json::to_string(&location).unwrap();
@@ -79,6 +91,7 @@ mod tests {
             document_title: None,
             end_page_number: 5,
             start_page_number: 3,
+            file_id: None,
         };
 
         let json = serde_json::to_string(&location).unwrap();
@@ -107,6 +120,7 @@ mod tests {
             document_title: None,
             end_page_number: 5,
             start_page_number: 3,
+            file_id: None,
         };
 
         assert_eq!(location.page_count(), 2);
@@ -120,6 +134,7 @@ mod tests {
             document_title: None,
             end_page_number: 4,
             start_page_number: 3,
+            file_id: None,
         };
 
         let multi_page = CitationPageLocation {
@@ -128,6 +143,7 @@ mod tests {
             document_title: None,
             end_page_number: 5,
             start_page_number: 3,
+            file_id: None,
         };
 
         assert!(single_page.is_single_page());

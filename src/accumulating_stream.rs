@@ -6,9 +6,9 @@ use futures::Stream;
 use serde_json::Value;
 
 use crate::{
-    CacheControlEphemeral, Citation, ContentBlock, ContentBlockDelta, Error, Message,
-    MessageStreamEvent, ServerToolUseBlock, StopReason, TextBlock, TextCitation, ThinkingBlock,
-    ToolUseBlock,
+    CacheControlEphemeral, Citation, ContentBlock, ContentBlockDelta, Error, McpToolUseBlock,
+    Message, MessageStreamEvent, ServerToolUseBlock, StopReason, TextBlock, TextCitation,
+    ThinkingBlock, ToolUseBlock,
 };
 
 /// A stream wrapper that accumulates `MessageStreamEvent`s into a complete `Message`.
@@ -91,25 +91,13 @@ impl AccumulatingStream {
                     if delta_event.delta.stop_details.is_some() {
                         msg.stop_details = delta_event.delta.stop_details.clone();
                     }
-                    if let Some(input_tokens) = delta_event.usage.input_tokens {
-                        msg.usage.input_tokens = input_tokens;
+                    if delta_event.delta.container.is_some() {
+                        msg.container = delta_event.delta.container.clone();
                     }
-                    msg.usage.output_tokens = delta_event.usage.output_tokens;
-                    if let Some(cache) = delta_event.usage.cache_creation_input_tokens {
-                        msg.usage.cache_creation_input_tokens = Some(cache);
+                    if delta_event.context_management.is_some() {
+                        msg.context_management = delta_event.context_management.clone();
                     }
-                    if let Some(cache_read) = delta_event.usage.cache_read_input_tokens {
-                        msg.usage.cache_read_input_tokens = Some(cache_read);
-                    }
-                    if let Some(details) = delta_event.usage.output_tokens_details {
-                        msg.usage.output_tokens_details = Some(details);
-                    }
-                    if let Some(server_tool) = delta_event.usage.server_tool_use {
-                        msg.usage.server_tool_use = Some(server_tool);
-                    }
-                    if let Some(iterations) = &delta_event.usage.iterations {
-                        msg.usage.iterations = Some(iterations.clone());
-                    }
+                    delta_event.usage.merge_into(&mut msg.usage);
                 }
             }
             MessageStreamEvent::MessageStop(_) => {
@@ -197,6 +185,7 @@ impl Stream for AccumulatingStream {
 enum ToolKind {
     Client,
     Server,
+    Mcp { server_name: String },
 }
 
 enum ContentBlockBuilder {
@@ -248,6 +237,17 @@ impl ContentBlockBuilder {
                 saw_delta: false,
                 cache_control: server_tool_use.cache_control,
             },
+            ContentBlock::McpToolUse(mcp_tool_use) => ContentBlockBuilder::ToolUse {
+                kind: ToolKind::Mcp {
+                    server_name: mcp_tool_use.server_name,
+                },
+                id: mcp_tool_use.id,
+                name: mcp_tool_use.name,
+                input_json: String::new(),
+                input_value: Some(mcp_tool_use.input),
+                saw_delta: false,
+                cache_control: None,
+            },
             ContentBlock::Thinking(thinking) => ContentBlockBuilder::Thinking {
                 thinking: thinking.thinking,
                 signature: thinking.signature,
@@ -272,6 +272,8 @@ impl ContentBlockBuilder {
                     Citation::WebSearchResultLocation(loc) => {
                         TextCitation::WebSearchResultLocation(loc)
                     }
+                    Citation::SearchResultLocation(loc) => TextCitation::SearchResultLocation(loc),
+                    Citation::Unknown(value) => TextCitation::Unknown(value),
                 };
                 citations.get_or_insert_with(Vec::new).push(citation);
             }
@@ -297,6 +299,13 @@ impl ContentBlockBuilder {
                 ContentBlockDelta::SignatureDelta(sig_delta),
             ) => {
                 signature.push_str(&sig_delta.signature);
+            }
+            (
+                ContentBlockBuilder::Complete(ContentBlock::Compaction(block)),
+                ContentBlockDelta::CompactionDelta(delta),
+            ) => {
+                block.content = delta.content;
+                block.encrypted_content = delta.encrypted_content;
             }
             _ => {}
         }
@@ -365,6 +374,12 @@ impl ContentBlockBuilder {
                         input,
                         cache_control,
                     }),
+                    ToolKind::Mcp { server_name } => ContentBlock::McpToolUse(McpToolUseBlock {
+                        id,
+                        name,
+                        server_name,
+                        input,
+                    }),
                 };
                 Ok(Some(block))
             }
@@ -401,7 +416,7 @@ mod tests {
         let start_message = Message::new(
             "msg_test".to_string(),
             Vec::new(),
-            Model::Known(KnownModel::Claude37SonnetLatest),
+            Model::Known(KnownModel::ClaudeSonnet55),
             usage_with_cache,
         );
         let start_event = MessageStreamEvent::MessageStart(MessageStartEvent::new(start_message));
@@ -483,7 +498,7 @@ mod tests {
         let start_message = Message::new(
             "msg_test".to_string(),
             Vec::new(),
-            Model::Known(KnownModel::Claude37SonnetLatest),
+            Model::Known(KnownModel::ClaudeSonnet55),
             usage,
         );
         let start_event = MessageStreamEvent::MessageStart(MessageStartEvent::new(start_message));
@@ -558,7 +573,7 @@ mod tests {
         let start_message = Message::new(
             "msg_test".to_string(),
             Vec::new(),
-            Model::Known(KnownModel::Claude37SonnetLatest),
+            Model::Known(KnownModel::ClaudeSonnet55),
             usage,
         );
         let start_event = MessageStreamEvent::MessageStart(MessageStartEvent::new(start_message));
@@ -606,5 +621,208 @@ mod tests {
             "Tool input should match initial value"
         );
         println!("tool_use.input: {:?}", tool_use.input);
+    }
+
+    /// Verifies that container and diagnostics from message_start and
+    /// context_management from message_delta reach the final message.
+    #[tokio::test]
+    async fn response_fields_are_carried_into_final_message() {
+        use crate::{
+            AppliedEdit, CacheDiagnostics, CacheMissReason, ContainerInfo,
+            ContextManagementResponse,
+        };
+
+        let mut start_message = Message::new(
+            "msg_test".to_string(),
+            Vec::new(),
+            Model::Known(KnownModel::ClaudeSonnet55),
+            Usage::new(100, 0),
+        );
+        start_message.container = Some(ContainerInfo {
+            id: "container_1".to_string(),
+            expires_at: None,
+            skills: None,
+        });
+        start_message.diagnostics = Some(CacheDiagnostics {
+            cache_miss_reason: Some(CacheMissReason {
+                r#type: CacheMissReason::SYSTEM_CHANGED.to_string(),
+                cache_missed_input_tokens: Some(10),
+            }),
+        });
+
+        let mut message_delta = MessageDelta::new().with_stop_reason(StopReason::EndTurn);
+        message_delta.container = Some(ContainerInfo {
+            id: "container_2".to_string(),
+            expires_at: None,
+            skills: None,
+        });
+        let mut delta_event = MessageDeltaEvent::new(message_delta, MessageDeltaUsage::new(5));
+        delta_event.context_management = Some(ContextManagementResponse {
+            applied_edits: vec![AppliedEdit {
+                r#type: "clear_tool_uses_20250919".to_string(),
+                cleared_input_tokens: Some(12000),
+                cleared_tool_uses: Some(4),
+                cleared_thinking_turns: None,
+            }],
+        });
+
+        let events = vec![
+            Ok(MessageStreamEvent::MessageStart(MessageStartEvent::new(
+                start_message,
+            ))),
+            Ok(MessageStreamEvent::MessageDelta(delta_event)),
+            Ok(MessageStreamEvent::MessageStop(
+                crate::MessageStopEvent::new(),
+            )),
+        ];
+        let (mut stream, rx) = AccumulatingStream::new(stream::iter(events));
+        while futures::StreamExt::next(&mut stream).await.is_some() {}
+        let message = rx.await.unwrap().unwrap();
+
+        assert_eq!(message.container.unwrap().id, "container_2");
+        assert_eq!(
+            message
+                .diagnostics
+                .unwrap()
+                .cache_miss_reason
+                .unwrap()
+                .r#type,
+            "system_changed"
+        );
+        assert_eq!(
+            message.context_management.unwrap().applied_edits[0].cleared_tool_uses,
+            Some(4)
+        );
+    }
+
+    /// Runs one content block through the accumulator and returns the final content.
+    async fn accumulate_block(
+        start_block: ContentBlock,
+        deltas: Vec<ContentBlockDelta>,
+    ) -> Vec<ContentBlock> {
+        use futures::StreamExt;
+
+        let start_message = Message::new(
+            "msg_test".to_string(),
+            Vec::new(),
+            Model::Known(KnownModel::ClaudeSonnet55),
+            Usage::new(1, 0),
+        );
+        let mut events = vec![
+            Ok(MessageStreamEvent::MessageStart(MessageStartEvent::new(
+                start_message,
+            ))),
+            Ok(MessageStreamEvent::ContentBlockStart(
+                ContentBlockStartEvent::new(start_block, 0),
+            )),
+        ];
+        events.extend(deltas.into_iter().map(|delta| {
+            Ok(MessageStreamEvent::ContentBlockDelta(
+                ContentBlockDeltaEvent::new(delta, 0),
+            ))
+        }));
+        events.push(Ok(MessageStreamEvent::ContentBlockStop(
+            ContentBlockStopEvent::new(0),
+        )));
+        events.push(Ok(MessageStreamEvent::MessageDelta(
+            MessageDeltaEvent::new(
+                MessageDelta::new().with_stop_reason(StopReason::EndTurn),
+                MessageDeltaUsage::new(1),
+            ),
+        )));
+
+        let (mut acc_stream, rx) = AccumulatingStream::new(stream::iter(events));
+        while acc_stream.next().await.is_some() {}
+        rx.await
+            .expect("channel closed")
+            .expect("accumulation failed")
+            .content
+    }
+
+    #[tokio::test]
+    async fn complete_compaction_block_passes_through() {
+        let block =
+            ContentBlock::Compaction(crate::CompactionBlock::new("summary").with_signature("sig"));
+        let content = accumulate_block(block.clone(), Vec::new()).await;
+        assert_eq!(content, vec![block]);
+    }
+
+    #[tokio::test]
+    async fn compaction_delta_sets_content() {
+        let start = ContentBlock::Compaction(crate::CompactionBlock::default());
+        let content = accumulate_block(
+            start,
+            vec![
+                ContentBlockDelta::CompactionDelta(crate::CompactionDelta {
+                    content: Some("the summary".to_string()),
+                    encrypted_content: None,
+                }),
+                ContentBlockDelta::Unknown,
+            ],
+        )
+        .await;
+        let ContentBlock::Compaction(block) = &content[0] else {
+            panic!("expected compaction block");
+        };
+        assert_eq!(block.content.as_deref(), Some("the summary"));
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_use_accumulates_input_json_deltas() {
+        let start = ContentBlock::McpToolUse(McpToolUseBlock {
+            id: "mcptoolu_1".to_string(),
+            name: "lookup".to_string(),
+            server_name: "docs".to_string(),
+            input: serde_json::json!({}),
+        });
+        let content = accumulate_block(
+            start,
+            vec![
+                ContentBlockDelta::InputJsonDelta(InputJsonDelta::new(r#"{"query":"#.to_string())),
+                ContentBlockDelta::InputJsonDelta(InputJsonDelta::new(r#""rust"}"#.to_string())),
+            ],
+        )
+        .await;
+        assert_eq!(
+            content,
+            vec![ContentBlock::McpToolUse(McpToolUseBlock {
+                id: "mcptoolu_1".to_string(),
+                name: "lookup".to_string(),
+                server_name: "docs".to_string(),
+                input: serde_json::json!({"query": "rust"}),
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_delta_with_null_content_sets_encrypted_content() {
+        let start = ContentBlock::Compaction(crate::CompactionBlock::new("stale"));
+        let delta: ContentBlockDelta = serde_json::from_value(serde_json::json!({
+            "type": "compaction_delta",
+            "content": null,
+            "encrypted_content": "opaque"
+        }))
+        .unwrap();
+        let content = accumulate_block(start, vec![delta]).await;
+        let ContentBlock::Compaction(block) = &content[0] else {
+            panic!("expected compaction block");
+        };
+        assert_eq!(block.content, None);
+        assert_eq!(block.encrypted_content.as_deref(), Some("opaque"));
+    }
+
+    #[tokio::test]
+    async fn unknown_block_type_passes_through_intact() {
+        let raw = serde_json::json!({"type": "some_future_block", "foo": {"bar": [1, 2]}});
+        let block: ContentBlock = serde_json::from_value(raw.clone()).unwrap();
+        let content = accumulate_block(
+            block,
+            vec![ContentBlockDelta::TextDelta(TextDelta::new(
+                "ignored".to_string(),
+            ))],
+        )
+        .await;
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].as_unknown(), Some(&raw));
     }
 }
