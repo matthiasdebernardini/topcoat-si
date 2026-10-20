@@ -1,6 +1,6 @@
 //! Server-Sent Events (SSE) framing and decoding for streaming responses.
 //!
-//! This module provides the hardened raw SSE parser used by Claudius and
+//! This module provides the hardened raw SSE parser used by Antox and
 //! protocol-specific decoding helpers for Anthropic message streams.
 
 use bytes::Bytes;
@@ -40,7 +40,7 @@ struct SseState {
 
 /// Process a stream of bytes into a stream of raw server-sent events with production hardening.
 ///
-/// This is the canonical SSE framing parser for Claudius and is intended for
+/// This is the canonical SSE framing parser for Antox and is intended for
 /// reuse by other crates that need hardened SSE buffering and extraction.
 ///
 /// This function takes a byte stream from an HTTP response and converts it into
@@ -199,7 +199,7 @@ impl SseState {
     }
 }
 
-/// Decode a raw [`SseEvent`] into a Claudius [`MessageStreamEvent`].
+/// Decode a raw [`SseEvent`] into an Antox [`MessageStreamEvent`].
 pub fn parse_message_stream_event(event: &SseEvent) -> Result<MessageStreamEvent> {
     match event.event.as_str() {
         "" if event.data.is_empty() => Ok(MessageStreamEvent::Ping),
@@ -227,7 +227,7 @@ pub fn parse_message_stream_event(event: &SseEvent) -> Result<MessageStreamEvent
     }
 }
 
-/// Process a stream of bytes into decoded Claudius [`MessageStreamEvent`] values.
+/// Process a stream of bytes into decoded Antox [`MessageStreamEvent`] values.
 pub fn process_message_stream_sse<S>(
     byte_stream: S,
 ) -> impl Stream<Item = Result<MessageStreamEvent>>
@@ -240,7 +240,7 @@ where
                 None
             } else {
                 let decoded = result.and_then(|event| {
-                tracing::trace!(target: "claudius::wire", event = %event.event, data = %event.data);
+                tracing::trace!(target: "antox::wire", event = %event.event, data = %event.data);
                 let result = parse_message_stream_event(&event);
                 if result.is_err() { observability::stream_error(); }
                 result

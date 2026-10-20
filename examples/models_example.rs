@@ -3,7 +3,7 @@
 /// This example shows how to:
 /// - List available models with pagination
 /// - Retrieve information about a specific model
-use claudius::{Anthropic, ModelListParams};
+use antox::{Anthropic, ModelListParams};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

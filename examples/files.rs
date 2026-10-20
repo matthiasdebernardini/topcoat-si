@@ -1,4 +1,4 @@
-use claudius::{
+use antox::{
     Anthropic, ContentBlock, DocumentBlock, KnownModel, MessageCreateParams, MessageParam,
     MessageParamContent, MessageRole, TextBlock,
 };
@@ -7,9 +7,9 @@ use claudius::{
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Anthropic::new(None)?;
 
-    let text = "Claudius is a Rust SDK for the Anthropic Messages API.\n";
+    let text = "Antox is a Rust SDK for the Anthropic Messages API.\n";
     let file = client
-        .upload_file("claudius.txt", "text/plain", text.as_bytes().to_vec(), None)
+        .upload_file("antox.txt", "text/plain", text.as_bytes().to_vec(), None)
         .await?;
     println!("uploaded {} ({} bytes)", file.id, file.size_bytes);
 

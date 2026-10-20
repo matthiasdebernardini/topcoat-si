@@ -1,11 +1,11 @@
 [package]
-name = "claudius"
-version = "0.33.0"
-authors = ["Robert Escriva <robert@rescrv.net>"]
+name = "antox"
+version = "0.1.0"
+authors = ["Matthias Debernardini <matthias@nashvilleautomation.io>"]
 edition = "2024"
-description = "SDK for the Anthropic API"
+description = "Typed Rust client for the Anthropic Messages API, built for Topcoat apps"
 license = "Apache-2.0"
-repository = "https://github.com/rescrv/claudius"
+repository = "https://github.com/matthiasdebernardini/claudius"
 
 [features]
 default = ["native-tls"]

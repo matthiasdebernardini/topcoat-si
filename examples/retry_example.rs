@@ -1,4 +1,4 @@
-use claudius::{Anthropic, KnownModel, MessageCreateParams, MessageParam, MessageRole, Model};
+use antox::{Anthropic, KnownModel, MessageCreateParams, MessageParam, MessageRole, Model};
 use std::time::Duration;
 
 #[tokio::main]

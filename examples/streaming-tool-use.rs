@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io::{self, Write};
 
-use claudius::{
+use antox::{
     AccumulatingStream, Anthropic, ContentBlock, ContentBlockDelta, Error, KnownModel, Message,
     MessageCreateParams, MessageParam, MessageRole, MessageStreamEvent, Model, Result, StopReason,
     ToolChoice, ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock,

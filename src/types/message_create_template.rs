@@ -14,7 +14,7 @@ use crate::types::{
 /// # Example
 ///
 /// ```
-/// # use claudius::{MessageCreateTemplate, MessageCreateParams, KnownModel};
+/// # use antox::{MessageCreateTemplate, MessageCreateParams, KnownModel};
 /// let template = MessageCreateTemplate::new()
 ///     .with_max_tokens(2048);
 ///

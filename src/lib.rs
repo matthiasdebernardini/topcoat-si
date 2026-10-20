@@ -1,7 +1,7 @@
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-//! Claudius: A typed Rust client for the Anthropic API.
+//! Antox: A typed Rust client for the Anthropic API.
 //!
 //! This crate provides typed access to the Messages API (buffered and streaming), tool
 //! definitions, message batches, files, models, and admin usage and cost reports, with

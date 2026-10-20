@@ -3,6 +3,42 @@
 version = 4
 
 [[package]]
+name = "antox"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "antox-review-harness"
+version = "0.0.0"
+dependencies = [
+ "antox",
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "sentry",
+ "sentry-tracing",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -117,42 +153,6 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
-]
-
-[[package]]
-name = "claudius"
-version = "0.33.0"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "claudius-review-harness"
-version = "0.0.0"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "claudius",
- "futures",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "sentry",
- "sentry-tracing",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,13 +1,13 @@
-# Claudius review harness
+# Antox review harness
 
 Integration tests for the client against local servers: retries, streaming, error context, logging, metrics and telemetry. All network tests use synthetic credentials and localhost; no live Anthropic call is made.
 
 Run from the repository root:
 
 ```sh
-export CARGO_TARGET_DIR=/tmp/claudius-review-target
+export CARGO_TARGET_DIR=/tmp/antox-review-target
 
-env -u CLAUDIUS_API_KEY -u ANTHROPIC_API_KEY -u CLAUDIUS_BASE_URL -u ANTHROPIC_BASE_URL -u CLAUDIUS_DEBUG_STREAM mbx nextest run --manifest-path review-harness/Cargo.toml -p claudius-review-harness --locked --no-fail-fast
+env -u ANTOX_API_KEY -u ANTHROPIC_API_KEY -u ANTOX_BASE_URL -u ANTHROPIC_BASE_URL -u CLAUDIUS_DEBUG_STREAM mbx nextest run --manifest-path review-harness/Cargo.toml -p antox-review-harness --locked --no-fail-fast
 ```
 
 Filter a suite by adding, for example, `-E 'test(review_streaming::)'`. Add `--lib` for the telemetry checks.

@@ -212,7 +212,7 @@ impl KnownModel {
     /// # Example
     ///
     /// ```rust
-    /// use claudius::KnownModel;
+    /// use antox::KnownModel;
     ///
     /// let rates = KnownModel::ClaudeSonnet55.token_rates();
     /// assert_eq!(rates.input, 200_000);   // $2/MTok

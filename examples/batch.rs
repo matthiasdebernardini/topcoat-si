@@ -1,7 +1,7 @@
 use std::env;
 use std::time::Duration;
 
-use claudius::{
+use antox::{
     Anthropic, KnownModel, MessageBatch, MessageBatchCreateParams, MessageBatchCreateRequest,
     MessageBatchProcessingStatus, MessageBatchResult, MessageBatchResultVariant,
     MessageCreateParams, Result,

@@ -88,7 +88,7 @@ pub enum Effort {
 /// # Example
 ///
 /// ```
-/// use claudius::{OutputConfig, Effort};
+/// use antox::{OutputConfig, Effort};
 ///
 /// // Control thinking effort
 /// let config = OutputConfig::new().with_effort(Effort::High);

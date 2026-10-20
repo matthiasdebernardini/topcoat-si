@@ -689,7 +689,7 @@ impl From<Utf8Error> for Error {
     }
 }
 
-/// A specialized Result type for Claudius operations.
+/// A specialized Result type for Antox operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Phase determines whether a transport failure is safe to retry.

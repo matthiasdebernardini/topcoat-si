@@ -1,4 +1,4 @@
-use claudius::{
+use antox::{
     Anthropic, CodeExecutionTool, ContentBlock, KnownModel, MessageCreateParams, ResponseInclusion,
     ToolUnionParam, WebFetchTool, WebSearchTool,
 };

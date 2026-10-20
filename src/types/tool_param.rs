@@ -103,7 +103,7 @@ impl ToolParam {
     ///
     /// ```
     /// use serde_json::json;
-    /// use claudius::ToolParam;
+    /// use antox::ToolParam;
     ///
     /// let tool = ToolParam::new(
     ///     "get_weather".to_string(),

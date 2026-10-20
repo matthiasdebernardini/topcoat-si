@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use claudius::Error;
+    use antox::Error;
     use opentelemetry::trace::{Span, Status, Tracer, TracerProvider};
     use opentelemetry_otlp::{Protocol, WithExportConfig};
     use std::io::{Read, Write};
@@ -91,7 +91,7 @@ mod tests {
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_simple_exporter(exporter)
             .build();
-        let tracer = provider.tracer("claudius-review");
+        let tracer = provider.tracer("antox-review");
         let mut span = tracer.start("anthropic.messages");
         let error = Error::api(
             429,
@@ -115,7 +115,7 @@ mod tests {
 
 #[cfg(test)]
 mod telemetry {
-    use claudius::*;
+    use antox::*;
     use futures::StreamExt;
     use opentelemetry::trace::{Status, TracerProvider};
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
@@ -216,7 +216,7 @@ mod telemetry {
         });
         let spans = exporter.get_finished_spans().unwrap();
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].name, "claudius.request");
+        assert_eq!(spans[0].name, "antox.request");
         assert_eq!(attr(&spans[0], "request_id").as_deref(), Some("req_ok"));
         assert_eq!(attr(&spans[0], "input_tokens").as_deref(), Some("3"));
         assert_eq!(attr(&spans[0], "output_tokens").as_deref(), Some("2"));
@@ -328,7 +328,7 @@ mod telemetry {
     }
     #[test]
     fn debug_flag_child() {
-        if std::env::var_os("CLAUDIUS_REVIEW_CHILD").is_none() {
+        if std::env::var_os("ANTOX_REVIEW_CHILD").is_none() {
             return;
         }
         runtime().block_on(async {
@@ -347,7 +347,7 @@ mod telemetry {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "telemetry::debug_flag_child", "--nocapture"])
                 .env("CLAUDIUS_DEBUG_STREAM", value)
-                .env("CLAUDIUS_REVIEW_CHILD", "1")
+                .env("ANTOX_REVIEW_CHILD", "1")
                 .output()
                 .unwrap();
             assert!(

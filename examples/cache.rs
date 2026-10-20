@@ -3,8 +3,8 @@
 /// The first request populates the cache (cache_creation_input_tokens > 0).
 /// The second request reads from the cache (cache_read_input_tokens > 0).
 ///
-/// Requires ANTHROPIC_API_KEY or CLAUDIUS_API_KEY in the environment.
-use claudius::{
+/// Requires ANTHROPIC_API_KEY or ANTOX_API_KEY in the environment.
+use antox::{
     Anthropic, CacheControlEphemeral, ContentBlock, KnownModel, MessageCreateParams, Model, Result,
     SystemPrompt, TextBlock,
 };

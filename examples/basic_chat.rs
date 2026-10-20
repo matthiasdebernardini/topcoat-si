@@ -1,4 +1,4 @@
-use claudius::{
+use antox::{
     Anthropic, ContentBlock, KnownModel, MessageCreateParams, MessageParam, MessageRole, Model,
     Result, TextBlock,
 };
@@ -7,7 +7,7 @@ use tokio::pin;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create a client using the API key from the environment variable CLAUDIUS_API_KEY
+    // Create a client using the API key from the environment variable ANTOX_API_KEY
     let client = Anthropic::new(None)?;
 
     // Example 1: Non-streaming request (old verbose way)

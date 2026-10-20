@@ -58,7 +58,7 @@ fn record_usage(model: &Model, usage: &Usage) {
     }
 }
 
-/// Emit one `claudius::usage` event for a completed request.
+/// Emit one `antox::usage` event for a completed request.
 ///
 /// Fires once per completed `send` call and once per stream that reaches `message_stop`
 /// (from the merged usage).  `cost_micro_cents` is `None` for models that are not a
@@ -72,7 +72,7 @@ fn count_usage(model: &Model, usage: &Usage) {
         _ => None,
     };
     tracing::info!(
-        target: "claudius::usage",
+        target: "antox::usage",
         model = %model,
         input_tokens = tokens(Some(usage.input_tokens)),
         output_tokens = tokens(Some(usage.output_tokens)),
@@ -136,7 +136,7 @@ fn multipart_boundary() -> String {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("claudius-boundary-{nanos:x}-{count:x}")
+    format!("antox-boundary-{nanos:x}-{count:x}")
 }
 
 /// Builds the `multipart/form-data` body of a file upload.
@@ -459,19 +459,19 @@ impl Anthropic {
 
     /// Create a new Anthropic client.
     ///
-    /// The API key can be provided directly or read from the CLAUDIUS_API_KEY or ANTHROPIC_API_KEY
+    /// The API key can be provided directly or read from the ANTOX_API_KEY or ANTHROPIC_API_KEY
     /// environment variables. If an environment variable value starts with "file://", it will be
     /// treated as a file path and the API key will be read from that file.
     ///
-    /// The base URL is resolved from the CLAUDIUS_BASE_URL or ANTHROPIC_BASE_URL environment
+    /// The base URL is resolved from the ANTOX_BASE_URL or ANTHROPIC_BASE_URL environment
     /// variables, in that order. If neither is set, the default Anthropic API URL is used.
     pub fn new(api_key: Option<String>) -> Result<Self> {
         let key = match api_key {
             Some(key) => key,
             None => {
-                configured_value(&["CLAUDIUS_API_KEY", "ANTHROPIC_API_KEY"])?.ok_or_else(|| {
+                configured_value(&["ANTOX_API_KEY", "ANTHROPIC_API_KEY"])?.ok_or_else(|| {
                     Error::authentication(
-                        "No nonempty API key configured in CLAUDIUS_API_KEY or ANTHROPIC_API_KEY",
+                        "No nonempty API key configured in ANTOX_API_KEY or ANTHROPIC_API_KEY",
                     )
                 })?
             }
@@ -485,7 +485,7 @@ impl Anthropic {
         // This is resolved before building headers because some providers
         // (see `BASE_URLS_REQUIRING_AUTH_HEADER`) require an `Authorization`
         // header derived from the base URL.
-        let base_url = configured_value(&["CLAUDIUS_BASE_URL", "ANTHROPIC_BASE_URL"])?
+        let base_url = configured_value(&["ANTOX_BASE_URL", "ANTHROPIC_BASE_URL"])?
             .unwrap_or_else(|| DEFAULT_API_URL.to_string());
 
         // Pre-build headers for performance
@@ -513,7 +513,7 @@ impl Anthropic {
     /// # Examples
     ///
     /// ```
-    /// # use claudius::Anthropic;
+    /// # use antox::Anthropic;
     /// // For Anthropic's API (default)
     /// let client = Anthropic::new(Some("api-key".to_string()))?
     ///     .with_base_url("https://api.anthropic.com".to_string())?;
@@ -525,7 +525,7 @@ impl Anthropic {
     /// // For Minimax (China)
     /// let client = Anthropic::new(Some("api-key".to_string()))?
     ///     .with_base_url("https://api.minimaxi.com/anthropic".to_string())?;
-    /// # Ok::<(), claudius::Error>(())
+    /// # Ok::<(), antox::Error>(())
     /// ```
     pub fn with_base_url(mut self, base_url: String) -> Result<Self> {
         // The set of default headers is derived from the base URL: providers
@@ -811,7 +811,7 @@ impl Anthropic {
         let body = response.bytes().await.map_err(|error| {
             map_reqwest_error(error, RequestPhase::Body).with_http_metadata(metadata.clone())
         })?;
-        tracing::trace!(target: "claudius::wire", response = %String::from_utf8_lossy(&body));
+        tracing::trace!(target: "antox::wire", response = %String::from_utf8_lossy(&body));
         serde_json::from_slice(&body).map_err(|error| {
             Error::from_http(
                 format!("Failed to parse response ({} bytes): {error}", body.len()),
@@ -830,7 +830,7 @@ impl Anthropic {
     ) -> Result<T> {
         let headers = headers.unwrap_or_else(|| self.default_headers());
 
-        tracing::trace!(target: "claudius::wire", request = %serde_json::to_string(body).unwrap_or_default());
+        tracing::trace!(target: "antox::wire", request = %serde_json::to_string(body).unwrap_or_default());
         let response = self
             .client
             .post(url)
@@ -984,7 +984,7 @@ impl Anthropic {
     }
 
     /// Send a message to the API and get a non-streaming response.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "send",
         otel.kind = "client", gen_ai.request.model = %params.model, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1038,7 +1038,7 @@ impl Anthropic {
     /// Send a message to the API and get a streaming response.
     ///
     /// Returns a stream of MessageStreamEvent objects that can be processed incrementally.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "stream",
         otel.kind = "client", gen_ai.request.model = %params.model, stream = true,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1095,7 +1095,7 @@ impl Anthropic {
                     HeaderValue::from_static("text/event-stream"),
                 );
 
-                tracing::trace!(target: "claudius::wire", request = ?params);
+                tracing::trace!(target: "antox::wire", request = ?params);
                 let response = self
                     .stream_client
                     .post(&url)
@@ -1161,7 +1161,7 @@ impl Anthropic {
     ///
     /// This method counts the number of tokens that would be used by a message with the given parameters.
     /// It's useful for estimating costs or making sure your messages fit within the model's context window.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "count_tokens",
         otel.kind = "client", gen_ai.request.model = %params.model, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1191,7 +1191,7 @@ impl Anthropic {
     }
 
     /// Create a Message Batch for asynchronous processing.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "create_message_batch",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1244,7 +1244,7 @@ impl Anthropic {
     }
 
     /// Retrieve a Message Batch by ID.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "get_message_batch",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1273,7 +1273,7 @@ impl Anthropic {
     }
 
     /// List Message Batches in the current Workspace.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "list_message_batches",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1316,7 +1316,7 @@ impl Anthropic {
     }
 
     /// Cancel a Message Batch that is currently processing.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "cancel_message_batch",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1340,7 +1340,7 @@ impl Anthropic {
     }
 
     /// Delete a Message Batch after processing has ended.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "delete_message_batch",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1367,7 +1367,7 @@ impl Anthropic {
     }
 
     /// Stream results for an ended Message Batch as JSONL records.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "stream_message_batch_results",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = true,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1407,7 +1407,7 @@ impl Anthropic {
     ///
     /// Returns a paginated list of all available models. Use the parameters to control
     /// pagination and filter results.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "list_models",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1440,7 +1440,7 @@ impl Anthropic {
     ///
     /// This is an Admin API endpoint: the client must be built with an Admin API key
     /// (`sk-ant-admin01-...`), which is sent in the same `x-api-key` header.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "usage_report",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1471,7 +1471,7 @@ impl Anthropic {
     ///
     /// This is an Admin API endpoint: the client must be built with an Admin API key
     /// (`sk-ant-admin01-...`), which is sent in the same `x-api-key` header.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "cost_report",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1499,7 +1499,7 @@ impl Anthropic {
     ///
     /// Returns detailed information about the specified model, including its
     /// ID, creation date, display name, and type.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "get_model",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1522,7 +1522,7 @@ impl Anthropic {
     ///
     /// The file is sent as `multipart/form-data`. `expires_in_seconds`, when given, must be
     /// between 3,600 (one hour) and 7,776,000 (90 days).
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "upload_file",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1581,7 +1581,7 @@ impl Anthropic {
     }
 
     /// List files stored through the Files API.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "list_files",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1604,7 +1604,7 @@ impl Anthropic {
     }
 
     /// Fetch the metadata of a file.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "get_file",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1626,7 +1626,7 @@ impl Anthropic {
     /// Download the raw content of a file.
     ///
     /// Only files created by code execution or skills are downloadable.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "download_file",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1650,7 +1650,7 @@ impl Anthropic {
     }
 
     /// Delete a file.
-    #[tracing::instrument(name = "claudius.request", skip_all, fields(
+    #[tracing::instrument(name = "antox.request", skip_all, fields(
         operation = "delete_file",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1963,7 +1963,7 @@ Connection: close\r\n\r\n{}",
 
     #[test]
     fn resolve_api_key_file_url_absolute() {
-        let test_dir = std::env::temp_dir().join(format!("claudius_test_{}", std::process::id()));
+        let test_dir = std::env::temp_dir().join(format!("antox_test_{}", std::process::id()));
         std::fs::create_dir_all(&test_dir).unwrap();
         let test_file = test_dir.join("test_api_key.txt");
         std::fs::write(&test_file, "sk-test-from-file-123\n").unwrap();

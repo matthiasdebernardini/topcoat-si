@@ -1,4 +1,7 @@
-# Claudius
+# Antox
+
+A fork of Robert Escriva's [claudius](https://github.com/rescrv/claudius) crate (Apache-2.0),
+trimmed to the Messages API client so Topcoat apps can call Anthropic with typed requests.
 
 A typed Rust client for the Anthropic Messages API: requests and responses for the current
 Claude models, streaming, tools (including server-side web search), prompt caching, Message
@@ -6,24 +9,24 @@ Batches, files, cost accounting, and monitoring.
 
 ```toml
 [dependencies]
-claudius = { version = "0.33.0", default-features = false, features = ["rustls-tls"] }
+antox = { version = "0.1.0", default-features = false, features = ["rustls-tls"] }
 ```
 
 The default feature is `native-tls`; pick `rustls-tls` instead to avoid OpenSSL.
 
 ## Client
 
-`Anthropic::new(None)` reads `CLAUDIUS_API_KEY`, then `ANTHROPIC_API_KEY`. A value of the form
-`file:///path` is read from that file. The base URL comes from `CLAUDIUS_BASE_URL` or
+`Anthropic::new(None)` reads `ANTOX_API_KEY`, then `ANTHROPIC_API_KEY`. A value of the form
+`file:///path` is read from that file. The base URL comes from `ANTOX_BASE_URL` or
 `ANTHROPIC_BASE_URL` when set; pass it without the `/v1/` suffix.
 
 ```rust,no_run
 use std::time::Duration;
 
-use claudius::{Anthropic, KnownModel, MessageCreateParams};
+use antox::{Anthropic, KnownModel, MessageCreateParams};
 
 #[tokio::main]
-async fn main() -> claudius::Result<()> {
+async fn main() -> antox::Result<()> {
     let client = Anthropic::new(None)?
         .with_max_retries(3)
         .with_timeout(Duration::from_secs(120))?;
@@ -48,7 +51,7 @@ async fn main() -> claudius::Result<()> {
 `ClaudeFable51`. Any other model ID parses to `Model::Custom`:
 
 ```rust
-use claudius::{KnownModel, Model};
+use antox::{KnownModel, Model};
 
 let model: Model = "claude-opus-5-5".parse().unwrap_or_else(|()| Model::Custom("claude-opus-5-5".into()));
 assert_eq!(model, Model::Known(KnownModel::ClaudeOpus55));
@@ -64,13 +67,13 @@ deltas as they arrive and still get the assembled `Message` at the end:
 ```rust,no_run
 use std::io::Write;
 
-use claudius::{
+use antox::{
     AccumulatingStream, Anthropic, ContentBlockDelta, Error, KnownModel, Message,
     MessageCreateParams, MessageParam, MessageStreamEvent, Model,
 };
 use futures::StreamExt;
 
-async fn stream_reply(client: &Anthropic, prompt: &str) -> claudius::Result<Message> {
+async fn stream_reply(client: &Anthropic, prompt: &str) -> antox::Result<Message> {
     let params = MessageCreateParams::new_streaming(
         4096,
         vec![MessageParam::user(prompt)],
@@ -104,7 +107,7 @@ Web search runs on Anthropic's side, so one request returns the searches, their 
 cited answer:
 
 ```rust
-use claudius::{KnownModel, MessageCreateParams, ToolUnionParam, WebSearchTool};
+use antox::{KnownModel, MessageCreateParams, ToolUnionParam, WebSearchTool};
 
 let search = WebSearchTool::new().with_max_uses(5);
 let params = MessageCreateParams::simple_streaming("What changed in Rust 1.90?", KnownModel::ClaudeSonnet55)
@@ -123,7 +126,7 @@ uses all three in one request.
 no beta header is needed.
 
 ```rust
-use claudius::{KnownModel, MessageCreateParams, OutputConfig, OutputFormat};
+use antox::{KnownModel, MessageCreateParams, OutputConfig, OutputFormat};
 use serde_json::json;
 
 let schema = json!({"type": "object", "properties": {"summary": {"type": "string"}},
@@ -140,7 +143,7 @@ to let the API place the breakpoint on the last cacheable block (automatic cachi
 `CacheControlEphemeral::new()` lives five minutes; `CacheControlEphemeral::one_hour()` lives an hour:
 
 ```rust
-use claudius::{CacheControlEphemeral, KnownModel, MessageCreateParams, SystemPrompt, TextBlock};
+use antox::{CacheControlEphemeral, KnownModel, MessageCreateParams, SystemPrompt, TextBlock};
 
 let long_instructions = "...".repeat(2000);
 
@@ -171,13 +174,13 @@ and then `DiagnosticsRequest::after(previous_id)` on later turns. The response's
 Batches cost half as much and finish within 24 hours:
 
 ```rust,no_run
-use claudius::{
+use antox::{
     Anthropic, KnownModel, MessageBatchCreateParams, MessageBatchCreateRequest,
     MessageBatchProcessingStatus, MessageCreateParams,
 };
 use futures::StreamExt;
 
-async fn run_batch(client: &Anthropic) -> claudius::Result<()> {
+async fn run_batch(client: &Anthropic) -> antox::Result<()> {
     let ask = |id: &str, q: &str| {
         MessageBatchCreateRequest::new(id, MessageCreateParams::simple(q, KnownModel::ClaudeHaiku55))
     };
@@ -210,7 +213,7 @@ Rates are integer nano-cents per token (`TokenRates`); costs are micro-cents, ro
 `Usage`, including Haiku 5.5's long-prompt tier.
 
 ```rust
-use claudius::{KnownModel, Usage};
+use antox::{KnownModel, Usage};
 
 let usage = Usage::new(10_000, 2_000).with_cache_read_input_tokens(50_000);
 let micro_cents = KnownModel::ClaudeSonnet55.cost_micro_cents(&usage);
@@ -238,31 +241,31 @@ proxy's error page, leave it unchanged. The windows `requests`, `tokens`, `input
 `output_tokens`, `priority_input_tokens`, `priority_output_tokens`, `fast_input_tokens` and
 `fast_output_tokens` each hold `limit`, `remaining` and `reset`.
 
-Every API call runs in a `claudius.request` tracing span. On `send` and `stream` it records
+Every API call runs in an `antox.request` tracing span. On `send` and `stream` it records
 `request_id`, `http.status_code`, `attempts`, the token counts and `cost_micro_cents`. The crate
 also emits plain tracing events; aggregate them with any subscriber (durations in seconds):
 
 | Target | Level | Message | Fields |
 |---|---|---|---|
-| `claudius::usage` | `INFO` | `usage` | `model`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `cost_micro_cents` (`None` for unknown models) |
-| `claudius::client` | `DEBUG` | `request_completed` | `duration_seconds`, `ok` |
-| `claudius::client` | `DEBUG` | `retry` | `backoff_seconds` |
-| `claudius::stream` | `TRACE` | `event` | (none) |
-| `claudius::stream` | `TRACE` | `bytes` | `bytes` |
-| `claudius::stream` | `DEBUG` | `first_byte` | `ttfb_seconds` |
-| `claudius::stream` | `DEBUG` | `completed` | `duration_seconds` |
-| `claudius::stream` | `DEBUG` | `error` | (none) |
+| `antox::usage` | `INFO` | `usage` | `model`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `cost_micro_cents` (`None` for unknown models) |
+| `antox::client` | `DEBUG` | `request_completed` | `duration_seconds`, `ok` |
+| `antox::client` | `DEBUG` | `retry` | `backoff_seconds` |
+| `antox::stream` | `TRACE` | `event` | (none) |
+| `antox::stream` | `TRACE` | `bytes` | `bytes` |
+| `antox::stream` | `DEBUG` | `first_byte` | `ttfb_seconds` |
+| `antox::stream` | `DEBUG` | `completed` | `duration_seconds` |
+| `antox::stream` | `DEBUG` | `error` | (none) |
 
-`claudius::usage` fires once per completed `send` and once per stream that reaches `message_stop`.
+`antox::usage` fires once per completed `send` and once per stream that reaches `message_stop`.
 
 The Admin API reports organization-wide usage and cost. It needs an Admin key, passed as
 `Anthropic::new(Some(admin_key))`:
 
 ```rust,no_run
-use claudius::{Anthropic, BucketWidth, CostGroupBy, CostReportParams, UsageGroupBy, UsageReportParams};
+use antox::{Anthropic, BucketWidth, CostGroupBy, CostReportParams, UsageGroupBy, UsageReportParams};
 use time::{Duration, OffsetDateTime};
 
-async fn report(admin_key: String) -> claudius::Result<()> {
+async fn report(admin_key: String) -> antox::Result<()> {
     let admin = Anthropic::new(Some(admin_key))?;
     let since = OffsetDateTime::now_utc() - Duration::days(7);
     let usage = UsageReportParams::new(since)
@@ -291,10 +294,10 @@ async fn report(admin_key: String) -> claudius::Result<()> {
 and `delete_file` removes it. See `examples/files.rs`.
 
 ```rust,no_run
-use claudius::{Anthropic, ContentBlock, DocumentBlock, KnownModel, MessageCreateParams};
-use claudius::{MessageParam, MessageParamContent, MessageRole, TextBlock};
+use antox::{Anthropic, ContentBlock, DocumentBlock, KnownModel, MessageCreateParams};
+use antox::{MessageParam, MessageParamContent, MessageRole, TextBlock};
 
-async fn summarise(client: &Anthropic, text: &str) -> claudius::Result<()> {
+async fn summarise(client: &Anthropic, text: &str) -> antox::Result<()> {
     let file = client.upload_file("notes.txt", "text/plain", text.as_bytes().to_vec(), None).await?;
     let content = MessageParamContent::Array(vec![
         ContentBlock::Document(DocumentBlock::from_file_id(&file.id)),
@@ -311,13 +314,13 @@ async fn summarise(client: &Anthropic, text: &str) -> claudius::Result<()> {
 
 ## Errors and retries
 
-Every call returns `claudius::Result<T>`. Rate limits, overloads, server errors, timeouts and
+Every call returns `antox::Result<T>`. Rate limits, overloads, server errors, timeouts and
 connection failures are retried up to `with_max_retries` times (default 3) with exponential
 backoff from 0.5 s capped at 8 s, or the server's `retry-after` when longer; a `retry-after`
 above 60 s is returned immediately. Errors carry the HTTP status and request ID:
 
 ```rust,no_run
-use claudius::{Anthropic, Error, MessageCreateParams};
+use antox::{Anthropic, Error, MessageCreateParams};
 
 async fn send(client: &Anthropic, params: MessageCreateParams) {
     match client.send(params).await {

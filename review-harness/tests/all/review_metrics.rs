@@ -1,5 +1,5 @@
+use antox::*;
 use bytes::Bytes;
-use claudius::*;
 use futures::{StreamExt, stream};
 use std::sync::{Arc, Mutex};
 use tracing::field::{Field, Visit};
@@ -36,7 +36,7 @@ fn stream_errors(events: &Events) -> usize {
         .lock()
         .unwrap()
         .iter()
-        .filter(|(target, message)| target == "claudius::stream" && message == "error")
+        .filter(|(target, message)| target == "antox::stream" && message == "error")
         .count()
 }
 

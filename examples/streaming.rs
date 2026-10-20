@@ -1,10 +1,10 @@
-use claudius::{Anthropic, KnownModel, MessageCreateParams, Result};
+use antox::{Anthropic, KnownModel, MessageCreateParams, Result};
 use futures::StreamExt;
 use tokio::pin;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create a client using the API key from the environment variable CLAUDIUS_API_KEY
+    // Create a client using the API key from the environment variable ANTOX_API_KEY
     let client = Anthropic::new(None)?;
 
     // Create a streaming request with the new ergonomic API
