@@ -2,18 +2,21 @@
 
 use std::str::FromStr;
 
-use antox::{
-    AccumulatingStream, Anthropic, ContentBlock, HttpMetadata, Message, MessageCreateParams,
-    MessageParam, Model, StopReason, ToolUnionParam, WebSearchTool20250305,
+use topcoat_si::{
+    AccumulatingStream, Anthropic, ContentBlock, FirecrawlClient, FirecrawlWebSearch, HttpMetadata,
+    Message, MessageCreateParams, MessageParam, Model, StopReason,
 };
 
 /// Mirrors topcoat's streaming call. The future is built but never polled.
-async fn call(client: &Anthropic, params: MessageCreateParams) -> Result<Message, antox::Error> {
+async fn call(
+    client: &Anthropic,
+    params: MessageCreateParams,
+) -> Result<Message, topcoat_si::Error> {
     let events = client.stream(&params).await?;
     let (mut acc, done) = AccumulatingStream::new(events);
     drop(done);
     let _ = &mut acc;
-    Err(antox::Error::streaming(
+    Err(topcoat_si::Error::streaming(
         "stream ended without a final message",
         None,
     ))
@@ -44,19 +47,22 @@ fn topcoat_surface_compiles_and_builds_without_network() {
         .unwrap_or_else(|()| Model::Custom("some-custom-model".to_string()));
     assert!(matches!(custom, Model::Custom(ref name) if name == "some-custom-model"));
 
-    let max_searches: i32 = 3;
-    let search = WebSearchTool20250305::new().with_max_uses(max_searches);
+    let search = FirecrawlWebSearch::new(
+        FirecrawlClient::new("fc-test-key")
+            .unwrap()
+            .with_base_url("http://127.0.0.1:9"),
+    );
     let params = MessageCreateParams::new_streaming(
         1024,
         vec![MessageParam::from("hello".to_string())],
         known,
     )
     .with_system("system prompt")
-    .with_tools(vec![ToolUnionParam::WebSearch20250305(search)]);
+    .with_tools(vec![search.tool()]);
 
     let _unpolled = call(&client, params);
 
-    let err = antox::Error::streaming("stream ended without a final message", None);
+    let err = topcoat_si::Error::streaming("stream ended without a final message", None);
     assert!(err.to_string().contains("stream ended"));
 
     let stop = Some(StopReason::MaxTokens);
@@ -71,7 +77,7 @@ fn api_error_exposes_http_metadata() {
         request_id: Some("req_123".to_string()),
         ..HttpMetadata::default()
     };
-    let err = antox::Error::from_http("internal error", metadata, None);
+    let err = topcoat_si::Error::from_http("internal error", metadata, None);
     assert!(err.metadata().is_some());
     let formatted = format!("{:?}", err.metadata());
     assert!(formatted.contains("req_123"));

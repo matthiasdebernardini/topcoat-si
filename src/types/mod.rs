@@ -6,7 +6,6 @@ mod cache_ttl;
 mod citation_char_location;
 mod citation_content_block_location;
 mod citation_page_location;
-mod citation_web_search_result_location;
 mod citations_config;
 mod citations_delta;
 mod compaction_request;
@@ -53,6 +52,7 @@ mod output_tokens_details;
 mod plain_text_source;
 mod rate_limits;
 mod redacted_thinking_block;
+mod response_inclusion;
 mod server_tool_usage;
 mod server_tool_use_block;
 mod service_tier;
@@ -82,11 +82,6 @@ mod url_pdf_source;
 mod usage;
 mod usage_iteration;
 mod usage_report;
-mod web_search_result_block;
-mod web_search_tool;
-mod web_search_tool_result_block;
-mod web_search_tool_result_block_content;
-mod web_search_tool_result_error;
 
 mod citation_search_result_location;
 mod code_execution_tool;
@@ -114,7 +109,6 @@ pub use citation_char_location::CitationCharLocation;
 pub use citation_content_block_location::CitationContentBlockLocation;
 pub use citation_page_location::CitationPageLocation;
 pub use citation_search_result_location::CitationSearchResultLocation;
-pub use citation_web_search_result_location::CitationWebSearchResultLocation;
 pub use citations_config::CitationsConfig;
 pub use citations_delta::{Citation, CitationsDelta};
 pub use code_execution_tool::CodeExecutionTool;
@@ -167,7 +161,7 @@ pub use message_stop_event::MessageStopEvent;
 pub use message_stream_event::MessageStreamEvent;
 pub use message_tokens_count::MessageTokensCount;
 pub use metadata::Metadata;
-pub use model::{KnownModel, Model, TokenRates, WEB_SEARCH_MICRO_CENTS_PER_REQUEST};
+pub use model::{KnownModel, Model, TokenRates};
 pub use model_capabilities::{
     CapabilitySupport, ContextManagementCapability, EffortCapability, ModelCapabilities,
     ServerToolsCapability, ThinkingCapability, ThinkingTypes,
@@ -183,6 +177,7 @@ pub use plain_text_source::PlainTextSource;
 pub(crate) use rate_limits::retry_after_from_headers;
 pub use rate_limits::{RateLimitWindow, RateLimits};
 pub use redacted_thinking_block::RedactedThinkingBlock;
+pub use response_inclusion::ResponseInclusion;
 pub use search_result_block::SearchResultBlock;
 pub use server_tool_usage::ServerToolUsage;
 pub use server_tool_use_block::ServerToolUseBlock;
@@ -218,16 +213,7 @@ pub use usage::Usage;
 pub use usage_iteration::{IterationUsage, UsageIteration};
 pub use usage_report::{
     BucketWidth, UsageBucket, UsageBucketResult, UsageGroupBy, UsageReport,
-    UsageReportCacheCreation, UsageReportParams, UsageReportServerToolUse,
+    UsageReportCacheCreation, UsageReportParams,
 };
 pub use web_fetch_tool::WebFetchTool;
 pub use web_fetch_tool_result_block::{WebFetchToolResultBlock, WebFetchToolResultContent};
-pub use web_search_result_block::WebSearchResultBlock;
-pub use web_search_tool::{ResponseInclusion, UserLocation, WebSearchTool};
-
-/// Name used by existing callers; the 20250305 tool version shares `WebSearchTool`.
-pub type WebSearchTool20250305 = WebSearchTool;
-
-pub use web_search_tool_result_block::WebSearchToolResultBlock;
-pub use web_search_tool_result_block_content::WebSearchToolResultBlockContent;
-pub use web_search_tool_result_error::{WebSearchErrorCode, WebSearchToolResultError};

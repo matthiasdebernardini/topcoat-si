@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::types::open_union::{from_value, type_tag};
 use crate::types::{
     CitationCharLocation, CitationContentBlockLocation, CitationPageLocation,
-    CitationSearchResultLocation, CitationWebSearchResultLocation,
+    CitationSearchResultLocation,
 };
 
 /// A citation reference in a TextBlock.
@@ -26,10 +26,6 @@ pub enum TextCitation {
     #[serde(rename = "content_block_location")]
     ContentBlockLocation(CitationContentBlockLocation),
 
-    /// A web search result location citation
-    #[serde(rename = "web_search_result_location")]
-    WebSearchResultLocation(CitationWebSearchResultLocation),
-
     /// A search result location citation
     #[serde(rename = "search_result_location")]
     SearchResultLocation(CitationSearchResultLocation),
@@ -49,9 +45,6 @@ impl<'de> Deserialize<'de> for TextCitation {
             "char_location" => from_value(value).map(TextCitation::CharLocation),
             "page_location" => from_value(value).map(TextCitation::PageLocation),
             "content_block_location" => from_value(value).map(TextCitation::ContentBlockLocation),
-            "web_search_result_location" => {
-                from_value(value).map(TextCitation::WebSearchResultLocation)
-            }
             "search_result_location" => from_value(value).map(TextCitation::SearchResultLocation),
             _ => Ok(TextCitation::Unknown(value)),
         }
@@ -114,22 +107,6 @@ impl TextCitation {
             file_id: None,
         };
         Self::ContentBlockLocation(content_block_location)
-    }
-
-    /// Creates a new web search result location citation
-    pub fn web_search_result_location(
-        cited_text: String,
-        encrypted_index: String,
-        url: String,
-        title: Option<String>,
-    ) -> Self {
-        let web_search_result_location = CitationWebSearchResultLocation {
-            cited_text,
-            encrypted_index,
-            title,
-            url,
-        };
-        Self::WebSearchResultLocation(web_search_result_location)
     }
 }
 
@@ -211,29 +188,6 @@ mod tests {
             "document_title": "Document Title",
             "end_block_index": 5,
             "start_block_index": 1
-        });
-
-        assert_eq!(json, expected);
-    }
-
-    #[test]
-    fn web_search_result_location_serialization() {
-        let web_search_location = CitationWebSearchResultLocation {
-            cited_text: "example text".to_string(),
-            encrypted_index: "abc123".to_string(),
-            title: Some("Example Website".to_string()),
-            url: "https://example.com/page".to_string(),
-        };
-
-        let citation = TextCitation::WebSearchResultLocation(web_search_location);
-
-        let json = serde_json::to_value(&citation).unwrap();
-        let expected = serde_json::json!({
-            "type": "web_search_result_location",
-            "cited_text": "example text",
-            "encrypted_index": "abc123",
-            "title": "Example Website",
-            "url": "https://example.com/page"
         });
 
         assert_eq!(json, expected);
@@ -327,27 +281,6 @@ mod tests {
             "document_title": "Document Title",
             "end_block_index": 4,
             "start_block_index": 2
-        });
-
-        assert_eq!(json_value, expected);
-    }
-
-    #[test]
-    fn web_search_result_location_method() {
-        let citation = TextCitation::web_search_result_location(
-            "example text".to_string(),
-            "encrypted123".to_string(),
-            "https://example.com".to_string(),
-            Some("Example Website".to_string()),
-        );
-
-        let json_value = serde_json::to_value(&citation).unwrap();
-        let expected = json!({
-            "type": "web_search_result_location",
-            "cited_text": "example text",
-            "encrypted_index": "encrypted123",
-            "title": "Example Website",
-            "url": "https://example.com"
         });
 
         assert_eq!(json_value, expected);

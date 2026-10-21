@@ -1,8 +1,8 @@
-use antox::{
+use time::{Duration, OffsetDateTime};
+use topcoat_si::{
     Anthropic, CostGroupBy, CostReportParams, KnownModel, MessageCreateParams, UsageGroupBy,
     UsageReportParams,
 };
-use time::{Duration, OffsetDateTime};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let usage_report = admin
         .usage_report(
             UsageReportParams::new(starting_at)
-                .with_bucket_width(antox::BucketWidth::OneDay)
+                .with_bucket_width(topcoat_si::BucketWidth::OneDay)
                 .group_by(UsageGroupBy::Model),
         )
         .await?;

@@ -1,7 +1,7 @@
-use antox::*;
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use std::sync::{Arc, Mutex};
+use topcoat_si::*;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::{Layer, Registry};
@@ -36,7 +36,7 @@ fn stream_errors(events: &Events) -> usize {
         .lock()
         .unwrap()
         .iter()
-        .filter(|(target, message)| target == "antox::stream" && message == "error")
+        .filter(|(target, message)| target == "topcoat_si::stream" && message == "error")
         .count()
 }
 

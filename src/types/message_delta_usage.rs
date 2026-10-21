@@ -155,7 +155,7 @@ mod tests {
                     "thinking_tokens": 40
                 },
                 "server_tool_use": {
-                    "web_search_requests": 5
+                    "web_fetch_requests": 5
                 }
             })
         );
@@ -217,7 +217,8 @@ mod tests {
                 "thinking_tokens": 40
             },
             "server_tool_use": {
-                "web_search_requests": 5
+                "web_search_requests": 3,
+                "web_fetch_requests": 5
             }
         });
 

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// ```
 /// use serde_json::json;
-/// use antox::OutputFormat;
+/// use topcoat_si::OutputFormat;
 ///
 /// let output_format = OutputFormat::json_schema(json!({
 ///     "type": "object",
@@ -52,7 +52,7 @@ impl OutputFormat {
     ///
     /// ```
     /// use serde_json::json;
-    /// use antox::OutputFormat;
+    /// use topcoat_si::OutputFormat;
     ///
     /// let output_format = OutputFormat::json_schema(json!({
     ///     "type": "object",

@@ -3,8 +3,8 @@
 /// The first request populates the cache (cache_creation_input_tokens > 0).
 /// The second request reads from the cache (cache_read_input_tokens > 0).
 ///
-/// Requires ANTHROPIC_API_KEY or ANTOX_API_KEY in the environment.
-use antox::{
+/// Requires ANTHROPIC_API_KEY or TOPCOAT_SI_API_KEY in the environment.
+use topcoat_si::{
     Anthropic, CacheControlEphemeral, ContentBlock, KnownModel, MessageCreateParams, Model, Result,
     SystemPrompt, TextBlock,
 };

@@ -1,18 +1,12 @@
-use antox::*;
 use base64::Engine;
 use serde_json::json;
+use topcoat_si::*;
 
 #[test]
-fn web_search_error_round_trip_preserves_required_type() {
-    let wire = json!({"type":"web_search_tool_result", "tool_use_id":"srvtoolu_123", "content":{"type":"web_search_tool_result_error", "error_code":"max_uses_exceeded"}});
+fn web_fetch_error_round_trip_preserves_required_type() {
+    let wire = json!({"type":"web_fetch_tool_result", "tool_use_id":"srvtoolu_123", "content":{"type":"web_fetch_tool_result_error", "error_code":"max_uses_exceeded"}});
     let block: ContentBlock = serde_json::from_value(wire.clone()).unwrap();
     assert_eq!(serde_json::to_value(block).unwrap(), wire);
-}
-
-#[test]
-fn web_search_request_too_large_is_valid_response() {
-    let wire = json!({"type":"web_search_tool_result", "tool_use_id":"srvtoolu_123", "content":{"type":"web_search_tool_result_error", "error_code":"request_too_large"}});
-    assert!(serde_json::from_value::<ContentBlock>(wire).is_ok());
 }
 
 #[test]
@@ -79,10 +73,6 @@ fn future_response_enums_do_not_discard_messages() {
             .unwrap(),
         ContentBlockDelta::Unknown
     ));
-    assert_eq!(
-        serde_json::from_value::<WebSearchErrorCode>(json!("future_code")).unwrap(),
-        WebSearchErrorCode::Unknown
-    );
 }
 
 #[test]

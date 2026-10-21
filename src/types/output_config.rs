@@ -88,7 +88,7 @@ pub enum Effort {
 /// # Example
 ///
 /// ```
-/// use antox::{OutputConfig, Effort};
+/// use topcoat_si::{OutputConfig, Effort};
 ///
 /// // Control thinking effort
 /// let config = OutputConfig::new().with_effort(Effort::High);

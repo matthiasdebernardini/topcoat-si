@@ -1,10 +1,10 @@
-use antox::{Anthropic, KnownModel, MessageCreateParams, Result};
 use futures::StreamExt;
 use tokio::pin;
+use topcoat_si::{Anthropic, KnownModel, MessageCreateParams, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create a client using the API key from the environment variable ANTOX_API_KEY
+    // Create a client using the API key from the environment variable TOPCOAT_SI_API_KEY
     let client = Anthropic::new(None)?;
 
     // Create a streaming request with the new ergonomic API

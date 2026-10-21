@@ -102,7 +102,7 @@ mod tests {
     use super::*;
     use crate::types::{
         ImageBlock, KnownModel, Message, Model, TextBlock, ToolResultBlock, Usage,
-        WebSearchResultBlock, WebSearchToolResultBlock, WebSearchToolResultBlockContent,
+        WebFetchToolResultBlock, WebFetchToolResultContent,
     };
     use serde_json::{json, to_value};
 
@@ -296,16 +296,12 @@ mod tests {
                         "content": "ok"
                     },
                     {
-                        "type": "web_search_tool_result",
+                        "type": "web_fetch_tool_result",
                         "tool_use_id": "toolu_456",
-                        "content": [
-                            {
-                                "type": "web_search_result",
-                                "encrypted_content": "encrypted-data-1",
-                                "title": "Example Page 1",
-                                "url": "https://example.com/page1"
-                            }
-                        ]
+                        "content": {
+                            "type": "web_fetch_tool_result_error",
+                            "error_code": "url_not_accessible"
+                        }
                     }
                 ]
             }
@@ -318,27 +314,25 @@ mod tests {
             panic!("Expected array content");
         };
         assert!(matches!(&blocks[0], ContentBlock::ToolResult(_)));
-        assert!(matches!(&blocks[1], ContentBlock::WebSearchToolResult(_)));
+        assert!(matches!(&blocks[1], ContentBlock::WebFetchToolResult(_)));
     }
 
     #[test]
     fn message_param_serializes_tool_result_transcript_blocks_without_duplicate_type() {
         let tool_result =
             ToolResultBlock::new("toolu_123".to_string()).with_string_content("ok".to_string());
-        let search_result = WebSearchResultBlock::new(
-            "encrypted-data-1",
-            "Example Page 1",
-            "https://example.com/page1",
-        );
-        let web_search_tool_result = WebSearchToolResultBlock::new(
-            WebSearchToolResultBlockContent::with_results(vec![search_result]),
-            "toolu_456",
-        );
+        let web_fetch_tool_result = WebFetchToolResultBlock {
+            tool_use_id: "toolu_456".to_string(),
+            content: WebFetchToolResultContent::Error {
+                error_code: "url_not_accessible".to_string(),
+            },
+            cache_control: None,
+        };
 
         let message = MessageParam::new_with_blocks(
             vec![
                 ContentBlock::ToolResult(tool_result),
-                ContentBlock::WebSearchToolResult(web_search_tool_result),
+                ContentBlock::WebFetchToolResult(web_fetch_tool_result),
             ],
             MessageRole::User,
         );
@@ -355,16 +349,12 @@ mod tests {
                         "content": "ok"
                     },
                     {
-                        "type": "web_search_tool_result",
+                        "type": "web_fetch_tool_result",
                         "tool_use_id": "toolu_456",
-                        "content": [
-                            {
-                                "type": "web_search_result",
-                                "encrypted_content": "encrypted-data-1",
-                                "title": "Example Page 1",
-                                "url": "https://example.com/page1"
-                            }
-                        ]
+                        "content": {
+                            "type": "web_fetch_tool_result_error",
+                            "error_code": "url_not_accessible"
+                        }
                     }
                 ]
             })

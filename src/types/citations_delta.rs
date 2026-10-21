@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::types::open_union::{from_value, type_tag};
 use crate::types::{
     CitationCharLocation, CitationContentBlockLocation, CitationPageLocation,
-    CitationSearchResultLocation, CitationWebSearchResultLocation,
+    CitationSearchResultLocation,
 };
 
 /// Represents a citation object that could be any of the supported citation types
@@ -22,10 +22,6 @@ pub enum Citation {
     /// Citation referencing a content block location.
     #[serde(rename = "content_block_location")]
     ContentBlockLocation(CitationContentBlockLocation),
-
-    /// Citation referencing a web search result location.
-    #[serde(rename = "web_search_result_location")]
-    WebSearchResultLocation(CitationWebSearchResultLocation),
 
     /// Citation referencing a search result location.
     #[serde(rename = "search_result_location")]
@@ -46,9 +42,6 @@ impl<'de> Deserialize<'de> for Citation {
             "char_location" => from_value(value).map(Citation::CharLocation),
             "page_location" => from_value(value).map(Citation::PageLocation),
             "content_block_location" => from_value(value).map(Citation::ContentBlockLocation),
-            "web_search_result_location" => {
-                from_value(value).map(Citation::WebSearchResultLocation)
-            }
             "search_result_location" => from_value(value).map(Citation::SearchResultLocation),
             _ => Ok(Citation::Unknown(value)),
         }
@@ -81,13 +74,6 @@ impl CitationsDelta {
     pub fn with_content_block_location(location: CitationContentBlockLocation) -> Self {
         Self {
             citation: Citation::ContentBlockLocation(location),
-        }
-    }
-
-    /// Creates a new CitationsDelta with a CitationWebSearchResultLocation
-    pub fn with_web_search_result_location(location: CitationWebSearchResultLocation) -> Self {
-        Self {
-            citation: Citation::WebSearchResultLocation(location),
         }
     }
 }
@@ -149,23 +135,6 @@ mod tests {
 
         let json = serde_json::to_string(&delta).unwrap();
         let expected = r#"{"citation":{"type":"content_block_location","cited_text":"example text","document_index":0,"document_title":"Document Title","end_block_index":3,"start_block_index":1}}"#;
-
-        assert_eq!(json, expected);
-    }
-
-    #[test]
-    fn web_search_result_location_serialization() {
-        let web_search_result_location = CitationWebSearchResultLocation {
-            cited_text: "example text".to_string(),
-            encrypted_index: "abc123".to_string(),
-            title: Some("Example Website".to_string()),
-            url: "https://example.com/page".to_string(),
-        };
-
-        let delta = CitationsDelta::with_web_search_result_location(web_search_result_location);
-
-        let json = serde_json::to_string(&delta).unwrap();
-        let expected = r#"{"citation":{"type":"web_search_result_location","cited_text":"example text","encrypted_index":"abc123","title":"Example Website","url":"https://example.com/page"}}"#;
 
         assert_eq!(json, expected);
     }

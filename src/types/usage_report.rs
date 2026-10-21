@@ -300,14 +300,6 @@ pub struct UsageReportCacheCreation {
     pub ephemeral_5m_input_tokens: i64,
 }
 
-/// Server tool requests in a usage report.
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UsageReportServerToolUse {
-    /// Number of web search requests.
-    #[serde(default)]
-    pub web_search_requests: i64,
-}
-
 /// One result row inside a usage bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageBucketResult {
@@ -320,9 +312,6 @@ pub struct UsageBucketResult {
     /// Cache-creation tokens by lifetime.
     #[serde(default)]
     pub cache_creation: UsageReportCacheCreation,
-    /// Server tool requests.
-    #[serde(default)]
-    pub server_tool_use: UsageReportServerToolUse,
     /// Model identifier, when grouped by model.
     #[serde(default)]
     pub model: Option<String>,
@@ -409,7 +398,6 @@ mod tests {
         assert_eq!(result.output_tokens, 500);
         assert_eq!(result.cache_read_input_tokens, 200);
         assert_eq!(result.cache_creation, UsageReportCacheCreation::default());
-        assert_eq!(result.server_tool_use.web_search_requests, 10);
         assert_eq!(result.model.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(result.service_tier.as_deref(), Some("standard"));
         assert_eq!(result.speed.as_deref(), Some("standard"));

@@ -269,9 +269,6 @@ impl ContentBlockBuilder {
                     Citation::CharLocation(loc) => TextCitation::CharLocation(loc),
                     Citation::PageLocation(loc) => TextCitation::PageLocation(loc),
                     Citation::ContentBlockLocation(loc) => TextCitation::ContentBlockLocation(loc),
-                    Citation::WebSearchResultLocation(loc) => {
-                        TextCitation::WebSearchResultLocation(loc)
-                    }
                     Citation::SearchResultLocation(loc) => TextCitation::SearchResultLocation(loc),
                     Citation::Unknown(value) => TextCitation::Unknown(value),
                 };

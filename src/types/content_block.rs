@@ -5,7 +5,7 @@ use crate::types::{
     CodeExecutionToolResultBlock, CompactionBlock, DocumentBlock, FallbackBlock, ImageBlock,
     McpToolResultBlock, McpToolUseBlock, RedactedThinkingBlock, SearchResultBlock,
     ServerToolUseBlock, TextBlock, ThinkingBlock, ToolReference, ToolResultBlock,
-    ToolSearchToolResultBlock, ToolUseBlock, WebFetchToolResultBlock, WebSearchToolResultBlock,
+    ToolSearchToolResultBlock, ToolUseBlock, WebFetchToolResultBlock,
 };
 
 /// A block of content in a message.
@@ -32,10 +32,6 @@ pub enum ContentBlock {
     /// A block representing a server-side tool use request
     #[serde(rename = "server_tool_use")]
     ServerToolUse(ServerToolUseBlock),
-
-    /// A web search tool result block
-    #[serde(rename = "web_search_tool_result")]
-    WebSearchToolResult(WebSearchToolResultBlock),
 
     /// A tool result block
     #[serde(rename = "tool_result")]
@@ -136,7 +132,6 @@ impl<'de> Deserialize<'de> for ContentBlock {
             "image" => from_value(value).map(ContentBlock::Image),
             "tool_use" => from_value(value).map(ContentBlock::ToolUse),
             "server_tool_use" => from_value(value).map(ContentBlock::ServerToolUse),
-            "web_search_tool_result" => from_value(value).map(ContentBlock::WebSearchToolResult),
             "tool_result" => from_value(value).map(ContentBlock::ToolResult),
             "document" => from_value(value).map(ContentBlock::Document),
             "thinking" | "thinking_summary" | "summary" => {
@@ -219,11 +214,6 @@ impl ContentBlock {
     /// Returns true if this block is a server tool use block
     pub fn is_server_tool_use(&self) -> bool {
         matches!(self, ContentBlock::ServerToolUse(_))
-    }
-
-    /// Returns true if this block is a web search tool result block
-    pub fn is_web_search_tool_result(&self) -> bool {
-        matches!(self, ContentBlock::WebSearchToolResult(_))
     }
 
     /// Returns true if this block is a tool result block
@@ -329,7 +319,6 @@ impl ContentBlock {
             ContentBlock::Image(_) => "image",
             ContentBlock::ToolUse(_) => "tool_use",
             ContentBlock::ServerToolUse(_) => "server_tool_use",
-            ContentBlock::WebSearchToolResult(_) => "web_search_tool_result",
             ContentBlock::ToolResult(_) => "tool_result",
             ContentBlock::Document(_) => "document",
             ContentBlock::Thinking(_) => "thinking",
@@ -401,15 +390,6 @@ impl ContentBlock {
         }
     }
 
-    /// Returns a reference to the inner WebSearchToolResultBlock if this is a WebSearchToolResult variant,
-    /// or None otherwise.
-    pub fn as_web_search_tool_result(&self) -> Option<&WebSearchToolResultBlock> {
-        match self {
-            ContentBlock::WebSearchToolResult(block) => Some(block),
-            _ => None,
-        }
-    }
-
     /// Returns a reference to the inner ToolResultBlock if this is a ToolResult variant,
     /// or None otherwise.
     pub fn as_tool_result(&self) -> Option<&ToolResultBlock> {
@@ -469,12 +449,6 @@ impl From<ToolUseBlock> for ContentBlock {
 impl From<ServerToolUseBlock> for ContentBlock {
     fn from(block: ServerToolUseBlock) -> Self {
         ContentBlock::ServerToolUse(block)
-    }
-}
-
-impl From<WebSearchToolResultBlock> for ContentBlock {
-    fn from(block: WebSearchToolResultBlock) -> Self {
-        ContentBlock::WebSearchToolResult(block)
     }
 }
 
@@ -559,12 +533,15 @@ mod tests {
 
     #[test]
     fn server_tool_use_block_serialization() {
-        let server_block =
-            ServerToolUseBlock::new_web_search("tool_123", "weather in San Francisco");
+        let server_block = ServerToolUseBlock::new(
+            "tool_123",
+            "web_fetch",
+            serde_json::json!({"url": "https://example.com"}),
+        );
         let content_block = ContentBlock::from(server_block);
 
         let json = serde_json::to_string(&content_block).unwrap();
-        let expected = r#"{"type":"server_tool_use","id":"tool_123","input":{"query":"weather in San Francisco"},"name":"web_search"}"#;
+        let expected = r#"{"type":"server_tool_use","id":"tool_123","input":{"url":"https://example.com"},"name":"web_fetch"}"#;
 
         assert_eq!(json, expected);
     }
@@ -641,7 +618,7 @@ mod tests {
             panic!("Expected TextBlock");
         }
 
-        let json = r#"{"id":"tool_123","input":{"query":"weather in San Francisco"},"name":"web_search","type":"server_tool_use"}"#;
+        let json = r#"{"id":"tool_123","input":{"url":"https://example.com"},"name":"web_fetch","type":"server_tool_use"}"#;
         let content_block: ContentBlock = serde_json::from_str(json).unwrap();
 
         assert!(content_block.is_server_tool_use());
@@ -649,7 +626,7 @@ mod tests {
 
         if let ContentBlock::ServerToolUse(block) = content_block {
             assert_eq!(block.id, "tool_123");
-            assert_eq!(block.name, "web_search");
+            assert_eq!(block.name, "web_fetch");
         } else {
             panic!("Expected ServerToolUseBlock");
         }
@@ -664,7 +641,6 @@ mod tests {
         assert!(content_block.as_image().is_none());
         assert!(content_block.as_tool_use().is_none());
         assert!(content_block.as_server_tool_use().is_none());
-        assert!(content_block.as_web_search_tool_result().is_none());
         assert!(content_block.as_tool_result().is_none());
         assert!(content_block.as_document().is_none());
         assert!(content_block.as_thinking().is_none());

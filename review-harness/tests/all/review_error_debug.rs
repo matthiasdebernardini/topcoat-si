@@ -1,6 +1,6 @@
-use antox::{Anthropic, KnownModel, MessageCreateParams};
 use std::error::Error;
 use std::time::Duration;
+use topcoat_si::{Anthropic, KnownModel, MessageCreateParams};
 
 #[test]
 fn client_debug_must_redact_credentials() {
@@ -110,7 +110,7 @@ async fn redirect_does_not_forward_api_key() {
 fn empty_primary_env_key_falls_back_and_trims() {
     // nextest runs this test in its own process; set env before constructing a runtime.
     unsafe {
-        std::env::set_var("ANTOX_API_KEY", "  ");
+        std::env::set_var("TOPCOAT_SI_API_KEY", "  ");
         std::env::set_var("ANTHROPIC_API_KEY", "  synthetic-fallback  ");
     }
     assert_eq!(

@@ -1,9 +1,9 @@
 [package]
-name = "antox"
+name = "topcoat-si"
 version = "0.1.0"
 authors = ["Matthias Debernardini <matthias@nashvilleautomation.io>"]
 edition = "2024"
-description = "Typed Rust client for the Anthropic Messages API, built for Topcoat apps"
+description = "Superintelligence for Topcoat apps: Claude, Jev and Firecrawl"
 license = "Apache-2.0"
 repository = "https://github.com/matthiasdebernardini/claudius"
 
@@ -21,6 +21,7 @@ futures = "0.3.32"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
+schemars = { version = "1.2.3", features = ["preserve_order"] }
 time = { version = "0.3.47", features = ["serde", "macros", "formatting", "parsing"] }
 tokio = { version = "1.52.3", features = ["sync", "time"] }
 url = "2.5.8"

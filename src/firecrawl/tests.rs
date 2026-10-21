@@ -1,0 +1,1186 @@
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+use time::macros::date;
+
+use super::*;
+use crate::ClientTool;
+use crate::test_support::{Canned, Recorded, serve};
+use crate::types::{
+    Content, ContentBlock, ToolResultBlock, ToolResultBlockContent, ToolUnionParam, ToolUseBlock,
+};
+
+fn ok(body: Value) -> Canned {
+    Canned::json(200, body.to_string())
+}
+
+fn client(base_url: &str) -> FirecrawlClient {
+    FirecrawlClient::new("fc-test-key")
+        .unwrap()
+        .with_base_url(base_url)
+}
+
+fn tool_use(input: Value) -> ToolUseBlock {
+    ToolUseBlock::new("toolu_1", WEB_SEARCH_TOOL_NAME, input)
+}
+
+fn body_json(recorded: &Arc<Mutex<Vec<Recorded>>>, index: usize) -> Value {
+    serde_json::from_str(&recorded.lock().unwrap()[index].body).unwrap()
+}
+
+fn string_content(result: &ToolResultBlock) -> &str {
+    match &result.content {
+        Some(ToolResultBlockContent::String(text)) => text,
+        other => panic!("expected string content, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn request_json_shape_and_auth_header() {
+    let (url, recorded) = serve(vec![ok(json!({"success": true, "data": {"web": []}}))]).await;
+    let request = SearchRequest::new("rust async")
+        .with_limit(7)
+        .with_sources(vec![SearchSource::Web, SearchSource::News])
+        .with_categories(vec![SearchCategory::Research, SearchCategory::Pdf])
+        .with_include_domains(vec!["docs.rs".to_string()])
+        .with_time_range(TimeRange::Custom {
+            from: date!(2026 - 01 - 02),
+            to: date!(2026 - 03 - 04),
+        })
+        .with_sort_by_date(true)
+        .with_location("Germany")
+        .with_country("DE")
+        .with_timeout(Duration::from_secs(30))
+        .with_ignore_invalid_urls(true)
+        .with_scrape_options(
+            ScrapeOptions::new()
+                .with_only_main_content(true)
+                .with_max_age(Duration::from_secs(3600)),
+        );
+    client(&url).search(&request).await.unwrap();
+
+    let recorded_request = &recorded.lock().unwrap()[0];
+    let first_line = recorded_request.headers.lines().next().unwrap();
+    assert!(first_line.starts_with("POST /v2/search "), "{first_line}");
+    assert!(
+        recorded_request
+            .headers
+            .lines()
+            .any(|l| l.eq_ignore_ascii_case("authorization: Bearer fc-test-key"))
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&recorded_request.body).unwrap(),
+        json!({
+            "query": "rust async",
+            "limit": 7,
+            "sources": ["web", "news"],
+            "categories": ["research", "pdf"],
+            "includeDomains": ["docs.rs"],
+            "tbs": "cdr:1,cd_min:01/02/2026,cd_max:03/04/2026,sbd:1",
+            "location": "Germany",
+            "country": "DE",
+            "timeout": 30000,
+            "ignoreInvalidURLs": true,
+            "scrapeOptions": {"formats": ["markdown"], "onlyMainContent": true, "maxAge": 3600000}
+        })
+    );
+}
+
+#[tokio::test]
+async fn response_becomes_search_result_blocks() {
+    let (url, recorded) = serve(vec![ok(json!({
+        "success": true,
+        "creditsUsed": 4,
+        "warning": "one page failed to scrape",
+        "unexpected": {"nested": true},
+        "data": {
+            "research": [{"anything": 1}],
+            "web": [
+                {"url": "https://example.com/a", "title": "A", "description": "about a",
+                 "markdown": "ééééééééééééé", "position": 1, "newField": "x"},
+                {"url": "https://blocked.example.org/b", "title": "B"}
+            ],
+            "news": [
+                {"url": "https://news.example.net/c", "snippet": "breaking", "date": "2 hours ago"}
+            ]
+        }
+    }))])
+    .await;
+    let search = FirecrawlWebSearch::new(client(&url))
+        .with_max_content_chars(5)
+        .with_blocked_domains(vec!["example.org".to_string()]);
+    let result = search
+        .execute(&tool_use(
+            json!({"query": "latest", "recency": "day", "sources": ["web", "news"]}),
+        ))
+        .await
+        .unwrap();
+
+    let sent = body_json(&recorded, 0);
+    // The default 5 results are split across the two sources.
+    assert_eq!(sent["limit"], 3);
+    assert_eq!(sent["tbs"], "qdr:d");
+    assert_eq!(sent["excludeDomains"], json!(["example.org"]));
+    assert_eq!(
+        sent["scrapeOptions"],
+        json!({"formats": ["markdown"], "onlyMainContent": true})
+    );
+
+    // ToolResultBlock gets its "type" tag from the ContentBlock it is sent in.
+    assert_eq!(
+        serde_json::to_value(ContentBlock::ToolResult(result.clone())).unwrap(),
+        json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": [
+                {
+                    "type": "search_result",
+                    "source": "https://example.com/a",
+                    "title": "A",
+                    "content": [
+                        {"type": "text", "text": "about a"},
+                        {"type": "text", "text": "ééééé [truncated]"}
+                    ],
+                    "citations": {"enabled": true}
+                },
+                {
+                    "type": "search_result",
+                    "source": "https://news.example.net/c",
+                    "title": "https://news.example.net/c",
+                    "content": [
+                        {"type": "text", "text": "breaking"},
+                        {"type": "text", "text": "Published: 2 hours ago"}
+                    ],
+                    "citations": {"enabled": true}
+                },
+                {"type": "text", "text": "Firecrawl warning: one page failed to scrape"}
+            ]
+        })
+    );
+    assert_eq!(result.tool_use_id, "toolu_1");
+    assert_eq!(result.is_error, None);
+    let Some(ToolResultBlockContent::Array(items)) = &result.content else {
+        panic!("expected array content");
+    };
+    assert_eq!(items.len(), 3, "blocked result must be dropped: {items:?}");
+    let Content::SearchResult(web) = &items[0] else {
+        panic!("expected search result");
+    };
+    assert_eq!(web.source, "https://example.com/a");
+    assert_eq!(web.title, "A");
+    assert_eq!(web.citations.as_ref().map(|c| c.enabled), Some(true));
+    let texts: Vec<&str> = web.content.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(texts, ["about a", "ééééé [truncated]"]);
+    let Content::SearchResult(news) = &items[1] else {
+        panic!("expected search result");
+    };
+    assert_eq!(news.title, "https://news.example.net/c");
+    let texts: Vec<&str> = news.content.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(texts, ["breaking", "Published: 2 hours ago"]);
+    let Content::Text(warning) = &items[2] else {
+        panic!("expected warning text");
+    };
+    assert_eq!(warning.text, "Firecrawl warning: one page failed to scrape");
+}
+
+#[tokio::test]
+async fn zero_results_is_plain_text() {
+    let (url, _) = serve(vec![ok(json!({"success": true, "data": {}}))]).await;
+    let result = FirecrawlWebSearch::new(client(&url))
+        .execute(&tool_use(json!({"query": "nothing here"})))
+        .await
+        .unwrap();
+    assert_eq!(string_content(&result), "No results for nothing here");
+    assert_eq!(result.is_error, None);
+}
+
+#[tokio::test]
+async fn callable_as_dyn_client_tool() {
+    let (url, recorded) = serve(vec![ok(json!({"success": true, "data": {}}))]).await;
+    let search = FirecrawlWebSearch::new(client(&url));
+    let tool: &dyn ClientTool = &search;
+    assert_eq!(tool.name(), WEB_SEARCH_TOOL_NAME);
+    let ToolUnionParam::CustomTool(definition) = tool.definition() else {
+        panic!("expected a custom tool");
+    };
+    assert_eq!(definition.name, WEB_SEARCH_TOOL_NAME);
+    let result = tool
+        .call(&tool_use(json!({"query": "nothing here"})))
+        .await
+        .unwrap();
+    assert_eq!(result.tool_use_id, "toolu_1");
+    assert_eq!(string_content(&result), "No results for nothing here");
+    assert_eq!(body_json(&recorded, 0)["query"], "nothing here");
+}
+
+#[tokio::test]
+async fn rate_limit_with_retry_after_then_success() {
+    let (url, recorded) = serve(vec![
+        Canned::json(
+            429,
+            json!({"success": false, "error": "slow down"}).to_string(),
+        )
+        .with_header("Retry-After", "1"),
+        ok(json!({"success": true, "data": {"web": [{"url": "https://example.com"}]}})),
+    ])
+    .await;
+    let started = Instant::now();
+    let response = client(&url)
+        .search(&SearchRequest::new("retry"))
+        .await
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+    assert_eq!(response.data.unwrap().web.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn rate_limit_after_retries_is_rate_limit_error() {
+    let limited = || {
+        Canned::json(
+            429,
+            json!({"success": false, "error": "slow down", "code": "RATE_LIMIT"}).to_string(),
+        )
+        .with_header("Retry-After", "0")
+    };
+    let (url, recorded) = serve(vec![limited(), limited()]).await;
+    let err = client(&url)
+        .with_max_retries(1)
+        .search(&SearchRequest::new("retry"))
+        .await
+        .unwrap_err();
+    assert!(err.is_rate_limit(), "{err:?}");
+    assert!(err.to_string().contains("slow down (code RATE_LIMIT)"));
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn payment_required_is_err() {
+    let (url, recorded) = serve(vec![
+        Canned::json(
+            402,
+            json!({"success": false, "error": "Insufficient credits"}).to_string(),
+        ),
+        ok(json!({"success": true})),
+    ])
+    .await;
+    let err = FirecrawlWebSearch::new(client(&url))
+        .execute(&tool_use(json!({"query": "q"})))
+        .await
+        .unwrap_err();
+    assert_eq!(err.status_code(), Some(402));
+    assert!(matches!(err, Error::Api { .. }));
+    assert!(err.to_string().contains("Insufficient credits"));
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unauthorized_is_authentication_err() {
+    let (url, recorded) = serve(vec![
+        Canned::json(
+            401,
+            json!({"success": false, "error": "Unauthorized"}).to_string(),
+        ),
+        ok(json!({"success": true})),
+    ])
+    .await;
+    let err = FirecrawlWebSearch::new(client(&url))
+        .execute(&tool_use(json!({"query": "q"})))
+        .await
+        .unwrap_err();
+    assert!(err.is_authentication());
+    assert!(!format!("{err:?}").contains("fc-test-key"));
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn bad_request_is_error_tool_result() {
+    let (url, recorded) = serve(vec![Canned::json(
+        400,
+        json!({"success": false, "error": "Invalid tbs", "code": "BAD_REQUEST"}).to_string(),
+    )])
+    .await;
+    let result = FirecrawlWebSearch::new(client(&url))
+        .execute(&tool_use(json!({"query": "q"})))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
+    assert!(string_content(&result).contains("Invalid tbs (code BAD_REQUEST)"));
+    assert_eq!(recorded.lock().unwrap().len(), 1, "400 must not be retried");
+}
+
+#[tokio::test]
+async fn validation_errors_are_raised_before_sending() {
+    let client = client("http://127.0.0.1:9");
+    let cases = [
+        SearchRequest::new("  "),
+        SearchRequest::new("x".repeat(501)),
+        SearchRequest::new("q").with_limit(0),
+        SearchRequest::new("q").with_limit(101),
+        SearchRequest::new("q")
+            .with_include_domains(vec!["a.com".to_string()])
+            .with_exclude_domains(vec!["b.com".to_string()]),
+        SearchRequest::new("q").with_categories(vec![SearchCategory::Gov, SearchCategory::Pdf]),
+        SearchRequest::new("q")
+            .with_categories(vec![SearchCategory::Developer, SearchCategory::Research]),
+    ];
+    for request in cases {
+        let err = client.search(&request).await.unwrap_err();
+        assert!(err.is_validation(), "{request:?}: {err:?}");
+    }
+    assert!(SearchRequest::new("é".repeat(500)).validate().is_ok());
+    assert!(
+        SearchRequest::new("q")
+            .with_categories(vec![SearchCategory::Research, SearchCategory::Pdf])
+            .validate()
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn invalid_model_input_is_error_tool_result() {
+    let search = FirecrawlWebSearch::new(client("http://127.0.0.1:9"));
+    for input in [
+        json!({}),
+        json!({"query": "q", "recency": "decade"}),
+        json!({"query": "q", "unknown": 1}),
+        json!({"query": "q", "limit": 50}),
+        json!({"query": ""}),
+        json!({"query": "q", "include_domains": ["https://docs.rs"]}),
+        json!({"query": "q", "exclude_domains": ["docs.rs:443"]}),
+        json!({"query": "q", "include_domains": ["docs.rs/path"]}),
+        json!({"query": "q", "exclude_domains": ["..evil.com"]}),
+        json!({"query": "q", "exclude_domains": ["example..com"]}),
+        json!({"query": "q", "country": "  "}),
+    ] {
+        let result = search.execute(&tool_use(input.clone())).await.unwrap();
+        assert_eq!(result.is_error, Some(true), "{input}");
+        assert!(!string_content(&result).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn developer_domain_lists_win_over_the_model() {
+    let (url, recorded) = serve(vec![ok(json!({"success": true, "data": {}}))]).await;
+    let search = FirecrawlWebSearch::new(client(&url))
+        .with_allowed_domains(vec!["rust-lang.org".to_string(), "docs.rs".to_string()])
+        .with_blocked_domains(vec!["docs.rs".to_string()]);
+    search
+        .execute(&tool_use(json!({
+            "query": "q",
+            "include_domains": ["blog.rust-lang.org", "evil.com", "docs.rs"]
+        })))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(&recorded, 0)["includeDomains"],
+        json!(["blog.rust-lang.org"])
+    );
+    assert!(body_json(&recorded, 0).get("excludeDomains").is_none());
+
+    let refused = search
+        .execute(&tool_use(
+            json!({"query": "q", "include_domains": ["evil.com"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(refused.is_error, Some(true));
+}
+
+#[test]
+fn tool_definition_and_dispatch() {
+    let search = FirecrawlWebSearch::new(FirecrawlClient::new("fc-test-key").unwrap());
+    let ToolUnionParam::CustomTool(tool) = search.tool() else {
+        panic!("expected a custom tool");
+    };
+    assert_eq!(tool.name, "web_search");
+    assert_eq!(tool.input_schema["required"], json!(["query"]));
+    assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+    assert!(search.handles(&tool_use(json!({}))));
+    assert!(!search.handles(&ToolUseBlock::new("t", "other", json!({}))));
+    assert!(!format!("{search:?}").contains("fc-test-key"));
+}
+
+#[test]
+fn unknown_response_fields_are_ignored() {
+    let parsed: SearchResponse = serde_json::from_value(json!({
+        "success": true,
+        "id": "abc",
+        "future": [1, 2],
+        "data": {
+            "research": {"papers": []},
+            "images": [{"url": "https://e.com", "imageUrl": "https://e.com/i.png", "imageWidth": 10, "extra": null}],
+            "web": [{"url": "https://e.com", "metadata": {"sourceURL": "https://e.com", "statusCode": 200, "other": "x"}}]
+        }
+    }))
+    .unwrap();
+    let data = parsed.data.unwrap();
+    assert_eq!(data.images.unwrap()[0].image_width, Some(10));
+    let metadata = data.web.unwrap()[0].metadata.clone().unwrap();
+    assert_eq!(metadata.source_url.as_deref(), Some("https://e.com"));
+    assert_eq!(metadata.status_code, Some(200));
+}
+
+#[test]
+fn empty_api_key_is_rejected() {
+    assert!(FirecrawlClient::new(" ").unwrap_err().is_validation());
+}
+
+#[tokio::test]
+async fn retry_after_over_cap_fails_without_retrying() {
+    let limited = || {
+        Canned::json(
+            429,
+            json!({"success": false, "error": "slow down"}).to_string(),
+        )
+        .with_header("Retry-After", "120")
+    };
+    let (url, recorded) = serve(vec![limited(), limited()]).await;
+    let started = Instant::now();
+    let err = client(&url)
+        .search(&SearchRequest::new("q"))
+        .await
+        .unwrap_err();
+    assert!(err.is_rate_limit(), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+
+    let (url, recorded) = serve(vec![limited(), limited()]).await;
+    let result = FirecrawlWebSearch::new(client(&url))
+        .execute(&tool_use(json!({"query": "q"})))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn server_errors_and_timeouts_are_retried() {
+    for status in [503, 408] {
+        let (url, recorded) = serve(vec![
+            Canned::json(
+                status,
+                json!({"success": false, "error": "try again"}).to_string(),
+            )
+            .with_header("Retry-After", "0"),
+            ok(json!({"success": true, "data": {"web": [{"url": "https://example.com"}]}})),
+        ])
+        .await;
+        let response = client(&url).search(&SearchRequest::new("q")).await.unwrap();
+        assert_eq!(response.data.unwrap().web.unwrap().len(), 1, "{status}");
+        assert_eq!(recorded.lock().unwrap().len(), 2, "{status}");
+    }
+
+    // Without Retry-After the client backs off exponentially before retrying.
+    let (url, recorded) = serve(vec![
+        Canned::json(500, json!({"success": false}).to_string()),
+        ok(json!({"success": true, "data": {}})),
+    ])
+    .await;
+    client(&url).search(&SearchRequest::new("q")).await.unwrap();
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn domain_entries_are_normalized() {
+    let response = json!({"success": true, "data": {"web": [
+        {"url": "https://example.org./trailing-dot"},
+        {"url": "https://a.wild.com/"},
+        {"url": "https://dot.com/"},
+        {"url": "https://xn--bcher-kva.de/"},
+        {"url": "https://bücher.de/unicode"},
+        {"url": "https://evilexample.com/"},
+        {"url": "https://example.com/"},
+        {"url": "https://kept.net/"}
+    ]}});
+    let (url, recorded) = serve(vec![ok(response)]).await;
+    let search = FirecrawlWebSearch::new(client(&url))
+        .with_default_limit(10)
+        .with_blocked_domains(vec![
+            "Example.ORG.".to_string(),
+            "*.wild.com".to_string(),
+            ".dot.com".to_string(),
+            "bücher.de".to_string(),
+        ]);
+    let result = search
+        .execute(&tool_use(
+            json!({"query": "q", "exclude_domains": ["example.com"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(&recorded, 0)["excludeDomains"],
+        json!([
+            "example.org",
+            "wild.com",
+            "dot.com",
+            "xn--bcher-kva.de",
+            "example.com"
+        ])
+    );
+    let Some(ToolResultBlockContent::Array(items)) = &result.content else {
+        panic!("expected results: {result:?}");
+    };
+    let sources: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            Content::SearchResult(block) => Some(block.source.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sources, ["https://evilexample.com/", "https://kept.net/"]);
+}
+
+#[tokio::test]
+async fn invalid_developer_config_is_err() {
+    let configs = [
+        FirecrawlWebSearch::new(client("http://127.0.0.1:9")).with_default_limit(0),
+        FirecrawlWebSearch::new(client("http://127.0.0.1:9")).with_default_limit(11),
+        FirecrawlWebSearch::new(client("http://127.0.0.1:9")).with_max_content_chars(0),
+        FirecrawlWebSearch::new(client("http://127.0.0.1:9")).with_country(" "),
+        FirecrawlWebSearch::new(client("http://127.0.0.1:9"))
+            .with_blocked_domains(vec!["https://evil.com".to_string()]),
+        FirecrawlWebSearch::new(client("http://127.0.0.1:9"))
+            .with_blocked_domains(vec!["..evil.com".to_string()]),
+        FirecrawlWebSearch::new(client("http://127.0.0.1:9"))
+            .with_blocked_domains(vec!["*..evil.com".to_string()]),
+        FirecrawlWebSearch::new(client("http://127.0.0.1:9"))
+            .with_blocked_domains(vec!["example..com".to_string()]),
+        FirecrawlWebSearch::new(client("http://127.0.0.1:9"))
+            .with_allowed_domains(vec!["example.com/docs".to_string()]),
+        FirecrawlWebSearch::new(client("http://127.0.0.1:9"))
+            .with_allowed_domains(vec!["docs.example.com".to_string()])
+            .with_blocked_domains(vec!["example.com".to_string()]),
+    ];
+    for search in configs {
+        let err = search
+            .execute(&tool_use(json!({"query": "q"})))
+            .await
+            .unwrap_err();
+        assert!(err.is_validation(), "{search:?}: {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn exclude_domains_emptying_the_allowlist_says_so() {
+    let search = FirecrawlWebSearch::new(client("http://127.0.0.1:9"))
+        .with_allowed_domains(vec!["docs.rs".to_string()]);
+    let result = search
+        .execute(&tool_use(
+            json!({"query": "q", "exclude_domains": ["docs.rs"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
+    let message = string_content(&result);
+    assert!(
+        message.contains("exclude_domains remove every domain"),
+        "{message}"
+    );
+    assert!(message.contains("docs.rs"), "{message}");
+}
+
+#[tokio::test]
+async fn null_optional_inputs_are_absent() {
+    let (url, recorded) = serve(vec![ok(json!({"success": true, "data": {}}))]).await;
+    let result = FirecrawlWebSearch::new(client(&url))
+        .execute(&tool_use(json!({
+            "query": "q",
+            "limit": null,
+            "recency": null,
+            "sources": null,
+            "include_domains": null,
+            "exclude_domains": null,
+            "country": null
+        })))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, None, "{result:?}");
+    assert_eq!(body_json(&recorded, 0)["limit"], 5);
+}
+
+#[tokio::test]
+async fn limit_caps_total_results_across_sources() {
+    let web: Vec<Value> = (0..3)
+        .map(|i| json!({"url": format!("https://web.com/{i}")}))
+        .collect();
+    let news: Vec<Value> = (0..3)
+        .map(|i| json!({"url": format!("https://news.com/{i}")}))
+        .collect();
+    let (url, recorded) = serve(vec![ok(
+        json!({"success": true, "data": {"web": web, "news": news}}),
+    )])
+    .await;
+    let result = FirecrawlWebSearch::new(client(&url))
+        .execute(&tool_use(
+            json!({"query": "q", "limit": 5, "sources": ["web", "news"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(&recorded, 0)["limit"], 3);
+    let Some(ToolResultBlockContent::Array(items)) = &result.content else {
+        panic!("expected results: {result:?}");
+    };
+    assert_eq!(items.len(), 5);
+    let sources: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            Content::SearchResult(block) => Some(block.source.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sources,
+        [
+            "https://web.com/0",
+            "https://web.com/1",
+            "https://web.com/2",
+            "https://news.com/0",
+            "https://news.com/1"
+        ]
+    );
+}
+
+fn result_sources(result: &ToolResultBlock) -> Vec<String> {
+    match &result.content {
+        Some(ToolResultBlockContent::Array(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                Content::SearchResult(block) => Some(block.source.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn ip_entries_and_hostless_results() {
+    let response = json!({"success": true, "data": {"web": [
+        {"url": "http://10.0.0.1/blocked"},
+        {"url": "http://10.0.0.2/kept"},
+        {"url": "mailto:someone@ok.com"},
+        {"url": "data:text/plain,hello"},
+        {"url": "ftp://ok.com/file"},
+        {"url": "not a url"},
+        {"url": "https://ok.com/kept"}
+    ]}});
+    let (url, recorded) = serve(vec![ok(response)]).await;
+    let result = FirecrawlWebSearch::new(client(&url))
+        .with_default_limit(10)
+        .with_blocked_domains(vec!["10.0.0.1".to_string()])
+        .execute(&tool_use(json!({"query": "q"})))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(&recorded, 0)["excludeDomains"],
+        json!(["10.0.0.1"])
+    );
+    assert_eq!(
+        result_sources(&result),
+        ["http://10.0.0.2/kept", "https://ok.com/kept"]
+    );
+
+    let response = json!({"success": true, "data": {"web": [
+        {"url": "http://10.0.0.2/kept"},
+        {"url": "http://10.0.0.3/dropped"}
+    ]}});
+    let (url, recorded) = serve(vec![ok(response)]).await;
+    let result = FirecrawlWebSearch::new(client(&url))
+        .with_allowed_domains(vec!["10.0.0.2".to_string()])
+        .execute(&tool_use(json!({"query": "q"})))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(&recorded, 0)["includeDomains"],
+        json!(["10.0.0.2"])
+    );
+    assert_eq!(result_sources(&result), ["http://10.0.0.2/kept"]);
+}
+
+#[tokio::test]
+async fn blocked_subdomain_under_model_include_is_dropped() {
+    let response = json!({"success": true, "data": {"web": [
+        {"url": "https://blog.rust-lang.org/post"},
+        {"url": "https://forge.rust-lang.org/page"},
+        {"url": "https://www.rust-lang.org/"}
+    ]}});
+    let (url, recorded) = serve(vec![ok(response)]).await;
+    let result = FirecrawlWebSearch::new(client(&url))
+        .with_blocked_domains(vec!["blog.rust-lang.org".to_string()])
+        .execute(&tool_use(json!({
+            "query": "q",
+            "include_domains": ["rust-lang.org"],
+            "exclude_domains": ["forge.rust-lang.org"]
+        })))
+        .await
+        .unwrap();
+    let sent = body_json(&recorded, 0);
+    assert_eq!(sent["includeDomains"], json!(["rust-lang.org"]));
+    assert!(sent.get("excludeDomains").is_none());
+    assert_eq!(result_sources(&result), ["https://www.rust-lang.org/"]);
+}
+
+#[tokio::test]
+async fn snippets_only_without_scraping() {
+    let (url, recorded) = serve(vec![ok(json!({"success": true, "data": {}}))]).await;
+    let search = FirecrawlWebSearch::new(client(&url)).with_scrape_options(None);
+    let ToolUnionParam::CustomTool(tool) = search.tool() else {
+        panic!("expected a custom tool");
+    };
+    let description = tool.description.unwrap();
+    assert!(!description.contains("markdown"), "{description}");
+    assert_eq!(tool.input_schema["properties"]["limit"]["maximum"], 10);
+    search
+        .execute(&tool_use(json!({"query": "q"})))
+        .await
+        .unwrap();
+    assert!(body_json(&recorded, 0).get("scrapeOptions").is_none());
+
+    let scraping = FirecrawlWebSearch::new(client("http://127.0.0.1:9"));
+    let ToolUnionParam::CustomTool(tool) = scraping.tool() else {
+        panic!("expected a custom tool");
+    };
+    let description = tool.description.unwrap();
+    assert!(
+        description.contains("main content as markdown"),
+        "{description}"
+    );
+
+    let whole_page = FirecrawlWebSearch::new(client("http://127.0.0.1:9"))
+        .with_scrape_options(Some(ScrapeOptions::new()));
+    let ToolUnionParam::CustomTool(tool) = whole_page.tool() else {
+        panic!("expected a custom tool");
+    };
+    let description = tool.description.unwrap();
+    assert!(
+        description.contains("page content as markdown"),
+        "{description}"
+    );
+    assert!(!description.contains("main content"), "{description}");
+}
+
+#[tokio::test]
+#[ignore = "hits the live Firecrawl API; needs FIRECRAWL_API_KEY"]
+async fn live_search() {
+    let Ok(client) = FirecrawlClient::from_env() else {
+        return;
+    };
+    let result = FirecrawlWebSearch::new(client)
+        .with_default_limit(2)
+        .execute(&tool_use(json!({"query": "Rust programming language"})))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, None, "{result:?}");
+    let Some(ToolResultBlockContent::Array(items)) = &result.content else {
+        panic!("expected results: {result:?}");
+    };
+    assert!(
+        items
+            .iter()
+            .any(|item| matches!(item, Content::SearchResult(_)))
+    );
+}
+
+fn fetch_use(input: Value) -> ToolUseBlock {
+    ToolUseBlock::new("toolu_2", "fetch_page", input)
+}
+
+fn scraped(markdown: &str, metadata: Value) -> Canned {
+    ok(json!({"success": true, "data": {"markdown": markdown, "metadata": metadata}}))
+}
+
+fn only_search_result(result: &ToolResultBlock) -> &crate::types::SearchResultBlock {
+    match &result.content {
+        Some(ToolResultBlockContent::Array(items)) => match items.as_slice() {
+            [Content::SearchResult(block)] => block,
+            other => panic!("expected exactly one search_result, got {other:?}"),
+        },
+        other => panic!("expected array content, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn scrape_request_wire_body() {
+    let (url, recorded) = serve(vec![scraped("# Hi", json!({}))]).await;
+    let request = ScrapeRequest::new("https://example.com/page").with_options(
+        ScrapeOptions::new()
+            .with_only_main_content(true)
+            .with_max_age(Duration::from_secs(3600))
+            .with_timeout(Duration::from_secs(30))
+            .with_pdf_max_pages(20),
+    );
+    let response = client(&url).scrape(&request).await.unwrap();
+    assert_eq!(response.data.markdown.as_deref(), Some("# Hi"));
+
+    let recorded_request = &recorded.lock().unwrap()[0];
+    let first_line = recorded_request.headers.lines().next().unwrap();
+    assert!(first_line.starts_with("POST /v2/scrape "), "{first_line}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&recorded_request.body).unwrap(),
+        json!({
+            "url": "https://example.com/page",
+            "formats": ["markdown"],
+            "onlyMainContent": true,
+            "maxAge": 3600000,
+            "timeout": 30000,
+            "parsers": [{"type": "pdf", "maxPages": 20}]
+        })
+    );
+}
+
+#[tokio::test]
+async fn scrape_validation_errors_are_raised_before_sending() {
+    let (url, recorded) = serve(vec![]).await;
+    let client = client(&url);
+    let options = ScrapeOptions::new;
+    let cases = [
+        ScrapeRequest::new(""),
+        ScrapeRequest::new("example.com/page"),
+        ScrapeRequest::new("/relative"),
+        ScrapeRequest::new("ftp://example.com/file"),
+        ScrapeRequest::new("https://example.com")
+            .with_options(options().with_timeout(Duration::from_millis(999))),
+        ScrapeRequest::new("https://example.com")
+            .with_options(options().with_timeout(Duration::from_secs(301))),
+        ScrapeRequest::new("https://example.com").with_options(options().with_pdf_max_pages(0)),
+        ScrapeRequest::new("https://example.com")
+            .with_options(options().with_pdf_max_pages(10_001)),
+    ];
+    for request in cases {
+        let err = client.scrape(&request).await.unwrap_err();
+        assert!(err.is_validation(), "{request:?}: {err:?}");
+    }
+    assert!(recorded.lock().unwrap().is_empty());
+    assert!(
+        ScrapeRequest::new("http://example.com")
+            .with_options(
+                options()
+                    .with_timeout(Duration::from_secs(300))
+                    .with_pdf_max_pages(10_000)
+            )
+            .validate()
+            .is_ok()
+    );
+}
+
+#[test]
+fn scrape_metadata_never_fails_the_response() {
+    let parsed: ScrapeResponse = serde_json::from_value(json!({
+        "success": true,
+        "warning": "top-level warning",
+        "data": {
+            "markdown": "text",
+            "metadata": {
+                "title": ["First", "Second"],
+                "description": 42,
+                "sourceURL": "https://example.com/a",
+                "url": "https://example.com/b",
+                "statusCode": "200",
+                "contentType": "application/pdf",
+                "numPages": 20,
+                "totalPages": -1,
+                "error": null
+            }
+        }
+    }))
+    .unwrap();
+    let metadata = parsed.data.metadata.unwrap();
+    assert_eq!(metadata.title.as_deref(), Some("First"));
+    assert_eq!(metadata.description, None);
+    assert_eq!(
+        metadata.source_url.as_deref(),
+        Some("https://example.com/a")
+    );
+    assert_eq!(metadata.url.as_deref(), Some("https://example.com/b"));
+    assert_eq!(metadata.status_code, None);
+    assert_eq!(metadata.content_type.as_deref(), Some("application/pdf"));
+    assert_eq!(metadata.num_pages, Some(20));
+    assert_eq!(metadata.total_pages, None);
+    assert_eq!(metadata.error, None);
+    assert_eq!(parsed.data.warning.as_deref(), Some("top-level warning"));
+
+    let parsed: ScrapeResponse = serde_json::from_value(json!({
+        "success": true,
+        "warning": "top",
+        "data": {"warning": "inner", "metadata": "not an object"}
+    }))
+    .unwrap();
+    assert_eq!(parsed.data.warning.as_deref(), Some("inner"));
+    assert_eq!(parsed.data.metadata, Some(ResultMetadata::default()));
+}
+
+#[tokio::test]
+async fn fetch_page_returns_one_chunked_search_result() {
+    let intro = "word ".repeat(250).trim_end().to_string();
+    let second = "more ".repeat(200).trim_end().to_string();
+    let long = "x".repeat(4000);
+    let markdown = format!("{intro}\n\n{second}\n# Heading\nUnder the heading.\n\n{long}");
+    let (url, recorded) = serve(vec![ok(json!({
+        "success": true,
+        "data": {
+            "markdown": markdown,
+            "warning": "slow page",
+            "metadata": {
+                "title": ["Report"],
+                "sourceURL": "https://example.com/report.pdf",
+                "url": "https://cdn.example.com/report.pdf",
+                "statusCode": 200,
+                "numPages": 20,
+                "totalPages": 80
+            }
+        }
+    }))])
+    .await;
+    let fetch = FirecrawlFetchPage::new(client(&url)).with_max_content_chars(6000);
+    let tool: &dyn ClientTool = &fetch;
+    assert_eq!(tool.name(), "fetch_page");
+    let ToolUnionParam::CustomTool(definition) = tool.definition() else {
+        panic!("expected a custom tool");
+    };
+    assert_eq!(definition.name, "fetch_page");
+    assert_eq!(definition.input_schema["required"], json!(["url"]));
+    assert_eq!(
+        definition.input_schema["additionalProperties"],
+        json!(false)
+    );
+
+    let result = tool
+        .call(&fetch_use(json!({"url": "https://example.com/report.pdf"})))
+        .await
+        .unwrap();
+    assert_eq!(result.tool_use_id, "toolu_2");
+    assert_eq!(result.is_error, None);
+    assert_eq!(
+        body_json(&recorded, 0),
+        json!({
+            "url": "https://example.com/report.pdf",
+            "formats": ["markdown"],
+            "onlyMainContent": true,
+            "maxAge": 3600000,
+            "timeout": 30000,
+            "parsers": [{"type": "pdf", "maxPages": 20}]
+        })
+    );
+
+    let block = only_search_result(&result);
+    assert_eq!(block.source, "https://cdn.example.com/report.pdf");
+    assert_eq!(block.title, "Report");
+    assert!(block.citations.is_some());
+    let texts: Vec<&str> = block.content.iter().map(|t| t.text.as_str()).collect();
+    // The first two paragraphs do not fit one block together; the heading starts a block; the
+    // rest of the cap is cut into pieces of at most 1,500 characters.
+    assert_eq!(texts[0], intro);
+    assert_eq!(texts[1], second);
+    assert_eq!(texts[2], "# Heading\nUnder the heading.");
+    let before_long = format!("{intro}\n\n{second}\n# Heading\nUnder the heading.\n\n");
+    let kept = 6000 - before_long.len();
+    assert_eq!(texts[3], "x".repeat(1500));
+    assert_eq!(texts[4], "x".repeat(1500));
+    assert_eq!(texts[5], format!("{} [truncated]", "x".repeat(kept - 3000)));
+    assert_eq!(texts[6], "Only pages 1 to 20 of 80 were read.");
+    assert_eq!(texts[7], "Firecrawl warning: slow page");
+    assert_eq!(texts.len(), 8);
+    assert!(
+        texts
+            .iter()
+            .all(|t| t.chars().count() <= 1500 + " [truncated]".len())
+    );
+}
+
+#[tokio::test]
+async fn fetch_page_error_status_is_error_result() {
+    let (url, _) = serve(vec![scraped(
+        "Not Found",
+        json!({"statusCode": 404, "url": "https://example.com/missing"}),
+    )])
+    .await;
+    let result = FirecrawlFetchPage::new(client(&url))
+        .call(&fetch_use(json!({"url": "https://example.com/missing"})))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
+    assert!(string_content(&result).contains("404"), "{result:?}");
+}
+
+#[tokio::test]
+async fn fetch_page_refuses_blocked_domains_and_redirects() {
+    let (url, recorded) = serve(vec![scraped(
+        "secret",
+        json!({"statusCode": 200, "url": "https://evil.example.org/landing"}),
+    )])
+    .await;
+    let fetch =
+        FirecrawlFetchPage::new(client(&url)).with_blocked_domains(vec!["example.org".to_string()]);
+
+    let refused = fetch
+        .call(&fetch_use(json!({"url": "https://www.example.org/"})))
+        .await
+        .unwrap();
+    assert_eq!(refused.is_error, Some(true));
+    assert!(recorded.lock().unwrap().is_empty());
+
+    let redirected = fetch
+        .call(&fetch_use(json!({"url": "https://example.com/start"})))
+        .await
+        .unwrap();
+    assert_eq!(redirected.is_error, Some(true));
+    assert!(string_content(&redirected).contains("redirected"));
+    assert!(!string_content(&redirected).contains("secret"));
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn fetch_page_payment_required_is_err() {
+    let (url, recorded) = serve(vec![Canned::json(
+        402,
+        json!({"success": false, "error": "Insufficient credits"}).to_string(),
+    )])
+    .await;
+    let err = FirecrawlFetchPage::new(client(&url))
+        .call(&fetch_use(json!({"url": "https://example.com"})))
+        .await
+        .unwrap_err();
+    assert_eq!(err.status_code(), Some(402));
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn fetch_page_blank_markdown_is_plain_text() {
+    let (url, _) = serve(vec![scraped("  \n\n ", json!({"statusCode": 200}))]).await;
+    let result = FirecrawlFetchPage::new(client(&url))
+        .call(&fetch_use(json!({"url": "https://example.com/empty"})))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, None);
+    assert_eq!(
+        string_content(&result),
+        "https://example.com/empty has no readable text."
+    );
+}
+
+#[tokio::test]
+async fn fetch_page_bad_input_and_failures_are_error_results() {
+    let (url, recorded) = serve(vec![Canned::json(
+        500,
+        json!({"success": false, "error": "boom"}).to_string(),
+    )])
+    .await;
+    let fetch = FirecrawlFetchPage::new(client(&url).with_max_retries(0));
+    for input in [
+        json!({}),
+        json!({"url": "https://example.com", "extra": 1}),
+        json!({"url": "not a url"}),
+    ] {
+        let result = fetch.call(&fetch_use(input.clone())).await.unwrap();
+        assert_eq!(result.is_error, Some(true), "{input}");
+    }
+    assert!(recorded.lock().unwrap().is_empty());
+    let failed = fetch
+        .call(&fetch_use(json!({"url": "https://example.com"})))
+        .await
+        .unwrap();
+    assert_eq!(failed.is_error, Some(true));
+    assert!(string_content(&failed).starts_with("Could not fetch https://example.com: "));
+    assert!(string_content(&failed).contains("boom"));
+}
+
+#[tokio::test]
+async fn fetch_page_ignores_landed_urls_that_are_not_absolute() {
+    let (url, recorded) = serve(vec![
+        scraped("Body one.", json!({"statusCode": 200, "url": ""})),
+        scraped(
+            "Body two.",
+            json!({"statusCode": 200, "url": "/landing", "sourceURL": "relative/page"}),
+        ),
+        scraped(
+            "Body three.",
+            json!({"statusCode": 200, "url": "mailto:someone@example.com"}),
+        ),
+    ])
+    .await;
+    let open = FirecrawlFetchPage::new(client(&url));
+    let allowed =
+        FirecrawlFetchPage::new(client(&url)).with_allowed_domains(vec!["example.com".to_string()]);
+    for (fetch, text) in [
+        (&open, "Body one."),
+        (&open, "Body two."),
+        (&allowed, "Body three."),
+    ] {
+        let result = fetch
+            .call(&fetch_use(json!({"url": "https://example.com/start"})))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, None, "{result:?}");
+        let block = only_search_result(&result);
+        assert_eq!(block.source, "https://example.com/start");
+        assert_eq!(block.content[0].text, text);
+    }
+    assert_eq!(recorded.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn chunks_split_only_at_atx_headings_outside_fences() {
+    let markdown = [
+        "Intro.",
+        "",
+        "#hashtag is not a heading",
+        "",
+        "####### seven hashes is not a heading",
+        "",
+        "    # indented four spaces is code",
+        "",
+        "```bash",
+        "# a shell comment",
+        "",
+        "# another comment",
+        "~~~",
+        "# still inside the backtick fence",
+        "```",
+        "",
+        "~~~~",
+        "# inside a tilde fence",
+        "~~~~",
+        "",
+        "# Real heading",
+        "Under it.",
+        "",
+        "###\tTabbed heading",
+        "Under that.",
+    ]
+    .join("\n");
+    assert_eq!(
+        fetch_page::chunks(&markdown),
+        vec![
+            [
+                "Intro.",
+                "#hashtag is not a heading",
+                "####### seven hashes is not a heading",
+                "    # indented four spaces is code",
+                "```bash\n# a shell comment",
+                "# another comment\n~~~\n# still inside the backtick fence\n```",
+                "~~~~\n# inside a tilde fence\n~~~~",
+            ]
+            .join("\n\n"),
+            "# Real heading\nUnder it.".to_string(),
+            "###\tTabbed heading\nUnder that.".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn chunks_never_leave_empty_pieces_or_trailing_blank_lines() {
+    let indented = format!("  {}", "x".repeat(2000));
+    let trailing = format!("{}   ", "y ".repeat(1000));
+    let markdown = format!("Intro.\n\n{indented}\n\n{trailing}");
+    let blocks = fetch_page::chunks(&markdown);
+    for block in &blocks {
+        assert!(!block.trim().is_empty(), "{blocks:?}");
+        assert_eq!(block.trim_end(), block, "{blocks:?}");
+        assert!(block.chars().count() <= 1500, "{blocks:?}");
+    }
+    assert_eq!(blocks[0], "Intro.");
+    assert_eq!(blocks[1], format!("  {}", "x".repeat(1498)));
+    assert_eq!(blocks[2], "x".repeat(502));
+}

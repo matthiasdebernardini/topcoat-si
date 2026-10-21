@@ -28,9 +28,6 @@ pub struct ServerToolsCapability {
     /// Code execution server tool support.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_execution: Option<CapabilitySupport>,
-    /// Web search server tool support.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_search: Option<CapabilitySupport>,
 }
 
 /// Effort levels exposed by the Models API.

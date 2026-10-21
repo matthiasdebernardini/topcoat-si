@@ -1,32 +1,32 @@
-# Antox
+# Topcoat SI
 
 A fork of Robert Escriva's [claudius](https://github.com/rescrv/claudius) crate (Apache-2.0),
 trimmed to the Messages API client so Topcoat apps can call Anthropic with typed requests.
 
 A typed Rust client for the Anthropic Messages API: requests and responses for the current
-Claude models, streaming, tools (including server-side web search), prompt caching, Message
+Claude models, streaming, tools (including web search through Firecrawl), prompt caching, Message
 Batches, files, cost accounting, and monitoring.
 
 ```toml
 [dependencies]
-antox = { version = "0.1.0", default-features = false, features = ["rustls-tls"] }
+topcoat-si = { version = "0.1.0", default-features = false, features = ["rustls-tls"] }
 ```
 
 The default feature is `native-tls`; pick `rustls-tls` instead to avoid OpenSSL.
 
 ## Client
 
-`Anthropic::new(None)` reads `ANTOX_API_KEY`, then `ANTHROPIC_API_KEY`. A value of the form
-`file:///path` is read from that file. The base URL comes from `ANTOX_BASE_URL` or
+`Anthropic::new(None)` reads `TOPCOAT_SI_API_KEY`, then `ANTHROPIC_API_KEY`. A value of the form
+`file:///path` is read from that file. The base URL comes from `TOPCOAT_SI_BASE_URL` or
 `ANTHROPIC_BASE_URL` when set; pass it without the `/v1/` suffix.
 
 ```rust,no_run
 use std::time::Duration;
 
-use antox::{Anthropic, KnownModel, MessageCreateParams};
+use topcoat_si::{Anthropic, KnownModel, MessageCreateParams};
 
 #[tokio::main]
-async fn main() -> antox::Result<()> {
+async fn main() -> topcoat_si::Result<()> {
     let client = Anthropic::new(None)?
         .with_max_retries(3)
         .with_timeout(Duration::from_secs(120))?;
@@ -51,7 +51,7 @@ async fn main() -> antox::Result<()> {
 `ClaudeFable51`. Any other model ID parses to `Model::Custom`:
 
 ```rust
-use antox::{KnownModel, Model};
+use topcoat_si::{KnownModel, Model};
 
 let model: Model = "claude-opus-5-5".parse().unwrap_or_else(|()| Model::Custom("claude-opus-5-5".into()));
 assert_eq!(model, Model::Known(KnownModel::ClaudeOpus55));
@@ -67,13 +67,13 @@ deltas as they arrive and still get the assembled `Message` at the end:
 ```rust,no_run
 use std::io::Write;
 
-use antox::{
+use topcoat_si::{
     AccumulatingStream, Anthropic, ContentBlockDelta, Error, KnownModel, Message,
     MessageCreateParams, MessageParam, MessageStreamEvent, Model,
 };
 use futures::StreamExt;
 
-async fn stream_reply(client: &Anthropic, prompt: &str) -> antox::Result<Message> {
+async fn stream_reply(client: &Anthropic, prompt: &str) -> topcoat_si::Result<Message> {
     let params = MessageCreateParams::new_streaming(
         4096,
         vec![MessageParam::user(prompt)],
@@ -103,22 +103,51 @@ back as `ContentBlock::ToolUse` and you answer with `ContentBlock::ToolResult`. 
 `ToolParam::with_strict(true)` to have the input validated against the schema. See
 `examples/streaming-tool-use.rs` for the full loop.
 
-Web search runs on Anthropic's side, so one request returns the searches, their results and the
-cited answer:
+Web search goes through [Firecrawl](https://firecrawl.dev) as a client-side tool; there is no
+Anthropic server-side web search. `FirecrawlWebSearch::tool()` defines a custom `web_search` tool,
+and `execute` runs a call and returns a `tool_result` whose `search_result` blocks Claude can cite.
+Domain lists set on `FirecrawlWebSearch` cannot be widened by the model. An invalid Firecrawl key
+(401) or exhausted credits (402) come back as `Err`; every other failure is an `is_error` result
+the model can react to.
 
-```rust
-use antox::{KnownModel, MessageCreateParams, ToolUnionParam, WebSearchTool};
+```rust,no_run
+use topcoat_si::{
+    Anthropic, ContentBlock, FirecrawlClient, FirecrawlWebSearch, KnownModel,
+    MessageCreateParams, MessageParam, MessageRole, StopReason,
+};
 
-let search = WebSearchTool::new().with_max_uses(5);
-let params = MessageCreateParams::simple_streaming("What changed in Rust 1.90?", KnownModel::ClaudeSonnet55)
-    .with_tools(vec![ToolUnionParam::WebSearch20260318(search)]);
+#[tokio::main]
+async fn main() -> topcoat_si::Result<()> {
+    let client = Anthropic::new(None)?;
+    let search = FirecrawlWebSearch::new(FirecrawlClient::from_env()?)
+        .with_blocked_domains(vec!["pinterest.com".to_string()]);
+    let mut messages = vec![MessageParam::user("What changed in the latest Rust release?")];
+    loop {
+        let params = MessageCreateParams::new(2048, messages.clone(), KnownModel::ClaudeSonnet55.into())
+            .with_tools(vec![search.tool()]);
+        let message = client.send(params).await?;
+        messages.push(MessageParam::from(message.clone()));
+        if message.stop_reason != Some(StopReason::ToolUse) {
+            break;
+        }
+        let mut results = Vec::new();
+        for block in &message.content {
+            if let ContentBlock::ToolUse(tool_use) = block
+                && search.handles(tool_use)
+            {
+                results.push(ContentBlock::ToolResult(search.execute(tool_use).await?));
+            }
+        }
+        messages.push(MessageParam::new_with_blocks(results, MessageRole::User));
+    }
+    Ok(())
+}
 ```
 
-`WebSearchTool20250305` and `ToolUnionParam::WebSearch20250305` remain for callers on the older
-tool version. Web fetch is `ToolUnionParam::WebFetch20260318(WebFetchTool::new())`, with
+Web fetch is `ToolUnionParam::WebFetch20260318(WebFetchTool::new())`, with
 `with_response_inclusion(ResponseInclusion::Full)` to control what comes back. Code execution is
 `ToolUnionParam::CodeExecution20260521(CodeExecutionTool::new())`. `examples/server_tools.rs`
-uses all three in one request.
+uses both in one request, and `examples/firecrawl_web_search.rs` runs the web search loop.
 
 ## Structured outputs
 
@@ -126,7 +155,7 @@ uses all three in one request.
 no beta header is needed.
 
 ```rust
-use antox::{KnownModel, MessageCreateParams, OutputConfig, OutputFormat};
+use topcoat_si::{KnownModel, MessageCreateParams, OutputConfig, OutputFormat};
 use serde_json::json;
 
 let schema = json!({"type": "object", "properties": {"summary": {"type": "string"}},
@@ -143,7 +172,7 @@ to let the API place the breakpoint on the last cacheable block (automatic cachi
 `CacheControlEphemeral::new()` lives five minutes; `CacheControlEphemeral::one_hour()` lives an hour:
 
 ```rust
-use antox::{CacheControlEphemeral, KnownModel, MessageCreateParams, SystemPrompt, TextBlock};
+use topcoat_si::{CacheControlEphemeral, KnownModel, MessageCreateParams, SystemPrompt, TextBlock};
 
 let long_instructions = "...".repeat(2000);
 
@@ -174,13 +203,13 @@ and then `DiagnosticsRequest::after(previous_id)` on later turns. The response's
 Batches cost half as much and finish within 24 hours:
 
 ```rust,no_run
-use antox::{
+use topcoat_si::{
     Anthropic, KnownModel, MessageBatchCreateParams, MessageBatchCreateRequest,
     MessageBatchProcessingStatus, MessageCreateParams,
 };
 use futures::StreamExt;
 
-async fn run_batch(client: &Anthropic) -> antox::Result<()> {
+async fn run_batch(client: &Anthropic) -> topcoat_si::Result<()> {
     let ask = |id: &str, q: &str| {
         MessageBatchCreateRequest::new(id, MessageCreateParams::simple(q, KnownModel::ClaudeHaiku55))
     };
@@ -213,7 +242,7 @@ Rates are integer nano-cents per token (`TokenRates`); costs are micro-cents, ro
 `Usage`, including Haiku 5.5's long-prompt tier.
 
 ```rust
-use antox::{KnownModel, Usage};
+use topcoat_si::{KnownModel, Usage};
 
 let usage = Usage::new(10_000, 2_000).with_cache_read_input_tokens(50_000);
 let micro_cents = KnownModel::ClaudeSonnet55.cost_micro_cents(&usage);
@@ -227,7 +256,6 @@ exists on Opus 5.5 only and is priced from `KnownModel::fast_token_rates`. `with
 pins inference to the US at 1.1x. `cost_micro_cents` reads all three from `Usage`, so the price
 stays right without extra code.
 
-Web search requests are billed at one cent each and included by `cost_micro_cents`.
 `cost_micro_cents` prices a single response: sum the costs of responses rather than summing
 `Usage` first, because a summed usage can lose the tier, speed and geo modifiers or wrongly
 extend one response's modifiers to another's tokens.
@@ -241,31 +269,31 @@ proxy's error page, leave it unchanged. The windows `requests`, `tokens`, `input
 `output_tokens`, `priority_input_tokens`, `priority_output_tokens`, `fast_input_tokens` and
 `fast_output_tokens` each hold `limit`, `remaining` and `reset`.
 
-Every API call runs in an `antox.request` tracing span. On `send` and `stream` it records
+Every API call runs in a `topcoat_si.request` tracing span. On `send` and `stream` it records
 `request_id`, `http.status_code`, `attempts`, the token counts and `cost_micro_cents`. The crate
 also emits plain tracing events; aggregate them with any subscriber (durations in seconds):
 
 | Target | Level | Message | Fields |
 |---|---|---|---|
-| `antox::usage` | `INFO` | `usage` | `model`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `cost_micro_cents` (`None` for unknown models) |
-| `antox::client` | `DEBUG` | `request_completed` | `duration_seconds`, `ok` |
-| `antox::client` | `DEBUG` | `retry` | `backoff_seconds` |
-| `antox::stream` | `TRACE` | `event` | (none) |
-| `antox::stream` | `TRACE` | `bytes` | `bytes` |
-| `antox::stream` | `DEBUG` | `first_byte` | `ttfb_seconds` |
-| `antox::stream` | `DEBUG` | `completed` | `duration_seconds` |
-| `antox::stream` | `DEBUG` | `error` | (none) |
+| `topcoat_si::usage` | `INFO` | `usage` | `model`, `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `cost_micro_cents` (`None` for unknown models) |
+| `topcoat_si::client` | `DEBUG` | `request_completed` | `duration_seconds`, `ok` |
+| `topcoat_si::client` | `DEBUG` | `retry` | `backoff_seconds` |
+| `topcoat_si::stream` | `TRACE` | `event` | (none) |
+| `topcoat_si::stream` | `TRACE` | `bytes` | `bytes` |
+| `topcoat_si::stream` | `DEBUG` | `first_byte` | `ttfb_seconds` |
+| `topcoat_si::stream` | `DEBUG` | `completed` | `duration_seconds` |
+| `topcoat_si::stream` | `DEBUG` | `error` | (none) |
 
-`antox::usage` fires once per completed `send` and once per stream that reaches `message_stop`.
+`topcoat_si::usage` fires once per completed `send` and once per stream that reaches `message_stop`.
 
 The Admin API reports organization-wide usage and cost. It needs an Admin key, passed as
 `Anthropic::new(Some(admin_key))`:
 
 ```rust,no_run
-use antox::{Anthropic, BucketWidth, CostGroupBy, CostReportParams, UsageGroupBy, UsageReportParams};
+use topcoat_si::{Anthropic, BucketWidth, CostGroupBy, CostReportParams, UsageGroupBy, UsageReportParams};
 use time::{Duration, OffsetDateTime};
 
-async fn report(admin_key: String) -> antox::Result<()> {
+async fn report(admin_key: String) -> topcoat_si::Result<()> {
     let admin = Anthropic::new(Some(admin_key))?;
     let since = OffsetDateTime::now_utc() - Duration::days(7);
     let usage = UsageReportParams::new(since)
@@ -294,10 +322,10 @@ async fn report(admin_key: String) -> antox::Result<()> {
 and `delete_file` removes it. See `examples/files.rs`.
 
 ```rust,no_run
-use antox::{Anthropic, ContentBlock, DocumentBlock, KnownModel, MessageCreateParams};
-use antox::{MessageParam, MessageParamContent, MessageRole, TextBlock};
+use topcoat_si::{Anthropic, ContentBlock, DocumentBlock, KnownModel, MessageCreateParams};
+use topcoat_si::{MessageParam, MessageParamContent, MessageRole, TextBlock};
 
-async fn summarise(client: &Anthropic, text: &str) -> antox::Result<()> {
+async fn summarise(client: &Anthropic, text: &str) -> topcoat_si::Result<()> {
     let file = client.upload_file("notes.txt", "text/plain", text.as_bytes().to_vec(), None).await?;
     let content = MessageParamContent::Array(vec![
         ContentBlock::Document(DocumentBlock::from_file_id(&file.id)),
@@ -314,13 +342,13 @@ async fn summarise(client: &Anthropic, text: &str) -> antox::Result<()> {
 
 ## Errors and retries
 
-Every call returns `antox::Result<T>`. Rate limits, overloads, server errors, timeouts and
+Every call returns `topcoat_si::Result<T>`. Rate limits, overloads, server errors, timeouts and
 connection failures are retried up to `with_max_retries` times (default 3) with exponential
 backoff from 0.5 s capped at 8 s, or the server's `retry-after` when longer; a `retry-after`
 above 60 s is returned immediately. Errors carry the HTTP status and request ID:
 
 ```rust,no_run
-use antox::{Anthropic, Error, MessageCreateParams};
+use topcoat_si::{Anthropic, Error, MessageCreateParams};
 
 async fn send(client: &Anthropic, params: MessageCreateParams) {
     match client.send(params).await {

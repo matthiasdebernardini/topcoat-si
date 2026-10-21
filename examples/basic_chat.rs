@@ -1,13 +1,13 @@
-use antox::{
+use futures::StreamExt;
+use tokio::pin;
+use topcoat_si::{
     Anthropic, ContentBlock, KnownModel, MessageCreateParams, MessageParam, MessageRole, Model,
     Result, TextBlock,
 };
-use futures::StreamExt;
-use tokio::pin;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create a client using the API key from the environment variable ANTOX_API_KEY
+    // Create a client using the API key from the environment variable TOPCOAT_SI_API_KEY
     let client = Anthropic::new(None)?;
 
     // Example 1: Non-streaming request (old verbose way)

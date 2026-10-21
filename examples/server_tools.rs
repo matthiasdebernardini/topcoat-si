@@ -1,6 +1,6 @@
-use antox::{
+use topcoat_si::{
     Anthropic, CodeExecutionTool, ContentBlock, KnownModel, MessageCreateParams, ResponseInclusion,
-    ToolUnionParam, WebFetchTool, WebSearchTool,
+    ToolUnionParam, WebFetchTool,
 };
 
 #[tokio::main]
@@ -9,12 +9,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = KnownModel::ClaudeHaiku55;
 
     let params = MessageCreateParams::simple(
-        "Look up the current stable Rust version and fetch its release notes page title, \
+        "Fetch https://www.rust-lang.org and report its page title, \
          then compute 17 * 23 with code execution. Keep the answer short.",
         model,
     )
     .with_tools(vec![
-        ToolUnionParam::WebSearch20260318(WebSearchTool::new().with_max_uses(3)),
         ToolUnionParam::WebFetch20260318(
             WebFetchTool::new().with_response_inclusion(ResponseInclusion::Full),
         ),

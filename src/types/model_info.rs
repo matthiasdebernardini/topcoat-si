@@ -220,7 +220,6 @@ mod tests {
         let server_tools = capabilities.server_tools.unwrap();
         assert!(server_tools.supported);
         assert_eq!(server_tools.code_execution.map(|c| c.supported), Some(true));
-        assert_eq!(server_tools.web_search.map(|c| c.supported), Some(false));
         let types = capabilities.thinking.types;
         assert_eq!(types.disabled.map(|c| c.supported), Some(true));
         assert_eq!(types.between_tools.map(|c| c.supported), Some(false));

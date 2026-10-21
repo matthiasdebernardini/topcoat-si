@@ -1,7 +1,7 @@
-use antox::*;
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use serde_json::json;
+use topcoat_si::*;
 
 fn start() -> MessageStreamEvent {
     MessageStreamEvent::MessageStart(MessageStartEvent::new(Message::new(
@@ -24,7 +24,11 @@ async fn server_tool_json_deltas_must_be_accumulated() {
         Ok(start()),
         Ok(MessageStreamEvent::ContentBlockStart(
             ContentBlockStartEvent::new(
-                ContentBlock::ServerToolUse(ServerToolUseBlock::new("srvtoolu_test", json!({}))),
+                ContentBlock::ServerToolUse(ServerToolUseBlock::new(
+                    "srvtoolu_test",
+                    "web_fetch",
+                    json!({}),
+                )),
                 0,
             ),
         )),
@@ -154,7 +158,7 @@ async fn large_event_and_unknown_event_are_supported() {
     let data = "x".repeat(100_000);
     let body = format!(
         "event: future_event\ndata: {{}}\n\nevent: content_block_start\ndata: {}\n\n",
-        json!({"index":0,"content_block":{"type":"web_search_tool_result","tool_use_id":"search","content":[{"type":"web_search_result","encrypted_content":data,"title":"result","url":"https://example.test"}]}})
+        json!({"index":0,"content_block":{"type":"text","text":data}})
     );
     let events: Vec<_> = process_message_stream_sse(stream::iter(vec![Ok(Bytes::from(body))]))
         .collect()

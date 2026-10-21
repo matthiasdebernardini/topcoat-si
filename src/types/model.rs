@@ -4,12 +4,6 @@ use std::str::FromStr;
 
 use crate::types::{CacheCreation, InferenceSpeed, ServiceTier, Usage, UsageIteration};
 
-/// Price of one web search request in micro-cents: $10 per 1,000 searches, one cent each.
-///
-/// The Message Batches discount does not apply to it.  Web fetch requests cost nothing
-/// beyond their tokens.
-pub const WEB_SEARCH_MICRO_CENTS_PER_REQUEST: u64 = 1_000_000;
-
 /// Represents an Anthropic model identifier.
 ///
 /// This can be a predefined model version or a custom string value
@@ -128,10 +122,9 @@ impl TokenRates {
     /// Negative token counts count as zero.  When `usage.cache_creation` is present its
     /// 5-minute and 1-hour counts are priced separately, and any excess of
     /// `cache_creation_input_tokens` over their sum is priced as 5-minute writes; otherwise
-    /// all `cache_creation_input_tokens` are priced as 5-minute writes.  Web search requests
-    /// in `usage.server_tool_use` add [`WEB_SEARCH_MICRO_CENTS_PER_REQUEST`] each, never
-    /// discounted.  Returns `u64::MAX` on overflow.  This prices the top-level counts only;
-    /// see [`KnownModel::cost_micro_cents`] for the iteration-aware total.
+    /// all `cache_creation_input_tokens` are priced as 5-minute writes.  Returns `u64::MAX`
+    /// on overflow.  This prices the top-level counts only; see
+    /// [`KnownModel::cost_micro_cents`] for the iteration-aware total.
     pub fn cost_micro_cents(&self, usage: &Usage) -> u64 {
         let (write_5m, write_1h) = cache_writes(
             usage.cache_creation_input_tokens.unwrap_or(0),
@@ -144,7 +137,6 @@ impl TokenRates {
             write_1h,
             clamp(usage.cache_read_input_tokens.unwrap_or(0)),
         )
-        .saturating_add(web_search_cost(usage))
     }
 
     /// Cost in micro-cents, rounded up, of the given token counts.  Returns `u64::MAX` on
@@ -191,14 +183,6 @@ fn cache_writes(total: i32, breakdown: Option<CacheCreation>) -> (u64, u64) {
     (write_5m.saturating_add(excess), write_1h)
 }
 
-/// Cost in micro-cents of the top-level web search requests in `usage`.
-fn web_search_cost(usage: &Usage) -> u64 {
-    usage.server_tool_use.map_or(0, |server_tool_use| {
-        clamp(server_tool_use.web_search_requests)
-            .saturating_mul(WEB_SEARCH_MICRO_CENTS_PER_REQUEST)
-    })
-}
-
 impl KnownModel {
     /// Prompt size above which Claude Haiku 5.5 bills the whole request at the higher tier.
     pub const HAIKU_55_TIER_THRESHOLD_TOKENS: u64 = 100_000;
@@ -212,7 +196,7 @@ impl KnownModel {
     /// # Example
     ///
     /// ```rust
-    /// use antox::KnownModel;
+    /// use topcoat_si::KnownModel;
     ///
     /// let rates = KnownModel::ClaudeSonnet55.token_rates();
     /// assert_eq!(rates.input, 200_000);   // $2/MTok
@@ -330,9 +314,6 @@ impl KnownModel {
     /// cache writes are priced per lifetime when it carries a `cache_creation` breakdown and
     /// at the 5-minute rate otherwise.  When any iteration has an unknown kind, the result is
     /// the larger of the top-level cost and the sum over the known iterations.
-    ///
-    /// Web search requests in the top-level `usage.server_tool_use` add
-    /// [`WEB_SEARCH_MICRO_CENTS_PER_REQUEST`] each; the batch discount does not apply to them.
     pub fn cost_micro_cents(&self, usage: &Usage) -> u64 {
         let iterations = usage.iterations.as_deref().unwrap_or_default();
         let has_unknown = iterations
@@ -369,8 +350,7 @@ impl KnownModel {
                     .rates_for_prompt_and_modifiers(prompt_tokens, usage)
                     .cost_of_tokens(input, output, write_5m, write_1h, read)
             })
-            .fold(0, u64::saturating_add)
-            .saturating_add(web_search_cost(usage));
+            .fold(0, u64::saturating_add);
         if has_unknown {
             iterations_cost.max(top_level())
         } else {
@@ -448,7 +428,7 @@ impl FromStr for Model {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{IterationUsage, ServerToolUsage};
+    use crate::types::IterationUsage;
 
     #[test]
     fn known_model_serialization() {
@@ -614,8 +594,7 @@ mod tests {
         let usage = Usage::new(i32::MAX, i32::MAX)
             .with_cache_creation_input_tokens(i32::MAX)
             .with_cache_creation(CacheCreation::new(i32::MAX, i32::MAX))
-            .with_cache_read_input_tokens(i32::MAX)
-            .with_server_tool_use(ServerToolUsage::new(i32::MAX));
+            .with_cache_read_input_tokens(i32::MAX);
         assert_eq!(
             TokenRates::flat(u64::MAX).cost_micro_cents(&usage),
             u64::MAX
@@ -632,42 +611,6 @@ mod tests {
         assert_eq!(
             rates(200, 0, 0, 0, 0).cost_of_tokens(input, 0, 0, 0, 0),
             (u128::from(input) * 200).div_ceil(1000) as u64
-        );
-    }
-
-    #[test]
-    fn web_search_requests_cost_one_cent_each() {
-        // Sonnet 5.5: 1000 * 200_000 + 100 * 1_000_000 = 300_000_000 nano = 300_000 micro.
-        let usage = Usage::new(1000, 100).with_server_tool_use(ServerToolUsage::new(3));
-        assert_eq!(
-            KnownModel::ClaudeSonnet55.cost_micro_cents(&usage),
-            300_000 + 3_000_000
-        );
-        assert_eq!(
-            KnownModel::ClaudeSonnet55
-                .token_rates()
-                .cost_micro_cents(&usage),
-            300_000 + 3_000_000
-        );
-
-        // Batch halves the token part only.
-        let batch = usage.with_service_tier(ServiceTier::Batch);
-        assert_eq!(
-            KnownModel::ClaudeSonnet55.cost_micro_cents(&batch),
-            150_000 + 3_000_000
-        );
-
-        let negative = Usage::new(0, 0).with_server_tool_use(ServerToolUsage::new(-2));
-        assert_eq!(KnownModel::ClaudeSonnet55.cost_micro_cents(&negative), 0);
-    }
-
-    #[test]
-    fn web_search_counts_once_with_iterations() {
-        let mut usage = Usage::new(0, 0).with_server_tool_use(ServerToolUsage::new(2));
-        usage.iterations = Some(vec![UsageIteration::Message(iteration(None, 1000, 100))]);
-        assert_eq!(
-            KnownModel::ClaudeSonnet55.cost_micro_cents(&usage),
-            300_000 + 2_000_000
         );
     }
 

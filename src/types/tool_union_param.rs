@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::types::{
     CodeExecutionTool, McpToolset, MemoryTool, ToolBash20241022, ToolBash20250124, ToolParam,
     ToolSearchTool, ToolTextEditor20250124, ToolTextEditor20250429, ToolTextEditor20250728,
-    WebFetchTool, WebSearchTool,
+    WebFetchTool,
 };
 
 /// Union type for different tool parameter types.
@@ -12,7 +12,7 @@ use crate::types::{
 /// - Custom tools
 /// - Bash tools
 /// - Text editor tools
-/// - Server tools (web search, web fetch, code execution, tool search)
+/// - Server tools (web fetch, code execution, tool search)
 /// - The client-side memory tool
 /// - MCP toolsets
 ///
@@ -43,18 +43,6 @@ pub enum ToolUnionParam {
     /// A text editor tool for making changes to text (version 20250728)
     #[serde(rename = "text_editor_20250728")]
     TextEditor20250728(ToolTextEditor20250728),
-
-    /// A web search tool for retrieving information from the internet
-    #[serde(rename = "web_search_20250305")]
-    WebSearch20250305(WebSearchTool),
-
-    /// A web search tool (version 20260209)
-    #[serde(rename = "web_search_20260209")]
-    WebSearch20260209(WebSearchTool),
-
-    /// A web search tool (version 20260318)
-    #[serde(rename = "web_search_20260318")]
-    WebSearch20260318(WebSearchTool),
 
     /// A web fetch tool (version 20250910)
     #[serde(rename = "web_fetch_20250910")]
@@ -132,11 +120,6 @@ impl ToolUnionParam {
         Self::TextEditor20250728(ToolTextEditor20250728::new())
     }
 
-    /// Creates a new web search tool (version 20260318)
-    pub fn new_web_search_tool() -> Self {
-        Self::WebSearch20260318(WebSearchTool::new())
-    }
-
     /// Creates a new web fetch tool (version 20260318)
     pub fn new_web_fetch_tool() -> Self {
         Self::WebFetch20260318(WebFetchTool::new())
@@ -171,17 +154,9 @@ impl ToolUnionParam {
 
     /// Validate tool-specific constraints.
     ///
-    /// `allowed_domains` and `blocked_domains` are mutually exclusive on web search and
-    /// web fetch tools.
+    /// `allowed_domains` and `blocked_domains` are mutually exclusive on web fetch tools.
     pub fn validate(&self) -> Result<(), crate::Error> {
         let (name, allowed, blocked) = match self {
-            Self::WebSearch20250305(tool)
-            | Self::WebSearch20260209(tool)
-            | Self::WebSearch20260318(tool) => (
-                &tool.name,
-                tool.allowed_domains.is_some(),
-                tool.blocked_domains.is_some(),
-            ),
             Self::WebFetch20250910(tool)
             | Self::WebFetch20260209(tool)
             | Self::WebFetch20260309(tool)
@@ -214,9 +189,6 @@ impl ToolUnionParam {
             | Self::TextEditor20250124(_)
             | Self::TextEditor20250429(_)
             | Self::TextEditor20250728(_)
-            | Self::WebSearch20250305(_)
-            | Self::WebSearch20260209(_)
-            | Self::WebSearch20260318(_)
             | Self::WebFetch20250910(_)
             | Self::WebFetch20260209(_)
             | Self::WebFetch20260309(_)
@@ -235,7 +207,7 @@ impl ToolUnionParam {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CacheControlEphemeral, UserLocation};
+    use crate::types::CacheControlEphemeral;
     use serde_json::{json, to_value};
 
     #[test]
@@ -373,40 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn web_search_tool() {
-        let user_location = UserLocation::new()
-            .with_city("San Francisco")
-            .with_country("US");
-
-        let web_search_tool = WebSearchTool::new()
-            .with_allowed_domains(vec!["example.com".to_string(), "example.org".to_string()])
-            .with_max_uses(5)
-            .with_user_location(user_location)
-            .with_cache_control(CacheControlEphemeral::new());
-
-        let tool = ToolUnionParam::WebSearch20250305(web_search_tool);
-
-        let json = to_value(&tool).unwrap();
-        assert_eq!(
-            json,
-            json!({
-                "name": "web_search",
-                "type": "web_search_20250305",
-                "allowed_domains": ["example.com", "example.org"],
-                "cache_control": {
-                    "type": "ephemeral"
-                },
-                "max_uses": 5,
-                "user_location": {
-                    "type": "approximate",
-                    "city": "San Francisco",
-                    "country": "US"
-                }
-            })
-        );
-    }
-
-    #[test]
     fn deserialization() {
         // Test custom tool deserialization
         let json = json!({
@@ -466,14 +404,6 @@ mod tests {
     fn server_and_client_tool_variants() {
         let cases = [
             (
-                ToolUnionParam::WebSearch20260209(WebSearchTool::new()),
-                json!({"type": "web_search_20260209", "name": "web_search"}),
-            ),
-            (
-                ToolUnionParam::new_web_search_tool(),
-                json!({"type": "web_search_20260318", "name": "web_search"}),
-            ),
-            (
                 ToolUnionParam::WebFetch20250910(WebFetchTool::new()),
                 json!({"type": "web_fetch_20250910", "name": "web_fetch"}),
             ),
@@ -528,9 +458,9 @@ mod tests {
 
     #[test]
     fn validate_rejects_both_domain_lists() {
-        let mut tool = WebSearchTool::new().with_allowed_domains(vec!["a.com".to_string()]);
+        let mut tool = WebFetchTool::new().with_allowed_domains(vec!["a.com".to_string()]);
         tool.blocked_domains = Some(vec!["b.com".to_string()]);
-        let err = ToolUnionParam::WebSearch20260318(tool)
+        let err = ToolUnionParam::WebFetch20260318(tool)
             .validate()
             .unwrap_err();
         assert!(err.is_validation());
