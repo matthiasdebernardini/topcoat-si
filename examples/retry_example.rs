@@ -43,8 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("- Retried: errors whose is_retryable() is true, except as noted below");
     println!("- Never resent automatically: a Timeout");
     println!(
-        "- Interrupted (the request was sent, then the connection failed before a complete \
-         response arrived): only GET requests resend it"
+        "- Interrupted (the response started, then stopped): only GET requests resend it, \
+         since the server has already answered a POST or DELETE"
     );
     println!(
         "- Delay before retry n (from 0): 0.5 s * 2^n capped at 8 s, plus up to 25% jitter, or \

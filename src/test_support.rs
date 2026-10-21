@@ -21,6 +21,7 @@ pub(crate) struct Canned {
     content_type: String,
     stall: Option<Duration>,
     cut: bool,
+    close_unanswered: bool,
 }
 
 impl Canned {
@@ -33,6 +34,7 @@ impl Canned {
             content_type: "application/json".to_string(),
             stall: None,
             cut: false,
+            close_unanswered: false,
         }
     }
 
@@ -52,6 +54,12 @@ impl Canned {
     /// timeout must cover the body read to fire.
     pub(crate) fn with_stall(mut self, stall: Duration) -> Self {
         self.stall = Some(stall);
+        self
+    }
+
+    /// Reads the request, then closes the connection without any reply.
+    pub(crate) fn closing_unanswered(mut self) -> Self {
+        self.close_unanswered = true;
         self
     }
 
@@ -112,6 +120,9 @@ pub(crate) async fn serve(responses: Vec<Canned>) -> (String, Arc<Mutex<Vec<Reco
             let (mut socket, _) = listener.accept().await.unwrap();
             let request = read_request(&mut socket).await;
             log.lock().unwrap().push(request);
+            if canned.close_unanswered {
+                continue;
+            }
             let extra: String = canned
                 .headers
                 .iter()

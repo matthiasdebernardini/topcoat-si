@@ -111,10 +111,10 @@ impl FirecrawlClient {
     /// Run a search.
     ///
     /// The request is validated before anything is sent. Whatever [`Error::is_retryable`]
-    /// accepts (408, 409, 429, 5xx, connection failures) is retried, except timeouts and a
-    /// response cut off mid-body, which Firecrawl may already have billed. Each wait is the
-    /// backoff delay or `Retry-After`, whichever is longer; a `Retry-After` over 30 seconds fails
-    /// at once without retrying.
+    /// accepts (408, 409, 429, 5xx, connection failures) is retried, except timeouts and
+    /// `Interrupted` (the response started, then stopped), because Firecrawl has already answered
+    /// and may have billed. Each wait is the backoff delay or `Retry-After`, whichever is
+    /// longer; a `Retry-After` over 30 seconds fails at once without retrying.
     pub async fn search(&self, request: &SearchRequest) -> Result<SearchResponse> {
         request.validate()?;
         self.post("/v2/search", &request.wire(), None).await

@@ -111,19 +111,21 @@ impl MessageBatchCreateParams {
             crate::Error::validation("Failed to serialize message batch create params", None)
                 .with_source(e)
         })?;
-        if body.len() > MAX_MESSAGE_BATCH_BODY_BYTES {
-            return Err(crate::Error::validation(
-                format!(
-                    "Serialized batch request size {} exceeds limit of {} bytes",
-                    body.len(),
-                    MAX_MESSAGE_BATCH_BODY_BYTES
-                ),
-                Some("requests".to_string()),
-            ));
-        }
-
-        Ok(())
+        check_body_size(body.len(), MAX_MESSAGE_BATCH_BODY_BYTES)
     }
+}
+
+/// Fails with [`crate::ErrorKind::RequestTooLarge`] when a serialized batch of `size` bytes is
+/// over `limit`.
+fn check_body_size(size: usize, limit: usize) -> crate::Result<()> {
+    if size > limit {
+        return Err(crate::Error::request_too_large(
+            "Serialized batch request exceeds the size limit",
+            size,
+            limit,
+        ));
+    }
+    Ok(())
 }
 
 impl Serialize for MessageBatchCreateParams {
@@ -643,6 +645,21 @@ mod tests {
     fn batch_create_params_validate_success() {
         let params = MessageBatchCreateParams::new(vec![valid_batch_request("request_1")]);
         assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn batch_body_over_the_cap_is_request_too_large() {
+        let error = check_body_size(11, 10).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &crate::ErrorKind::RequestTooLarge {
+                size: 11,
+                limit: 10
+            }
+        );
+        assert!(!error.is_retryable());
+        assert!(check_body_size(10, 10).is_ok());
+        assert_eq!(MAX_MESSAGE_BATCH_BODY_BYTES, 256 * 1024 * 1024);
     }
 
     #[test]

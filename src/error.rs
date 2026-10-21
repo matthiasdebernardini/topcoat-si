@@ -68,7 +68,7 @@ pub enum ErrorKind {
         /// The parameter, setting or environment variable at fault, when there is one.
         param: Option<String>,
     },
-    /// A local size cap was exceeded.
+    /// A local size cap was exceeded: Jev's request body or the message batch size.
     #[non_exhaustive]
     RequestTooLarge {
         /// The size of the request in bytes.
@@ -82,8 +82,10 @@ pub enum ErrorKind {
         /// The Rust type name.
         type_name: String,
     },
-    /// No connection was made: DNS failure, refused, TLS failure, or a connect timeout. Nothing
-    /// reached the server.
+    /// The connection failed before any response arrived: DNS failure, refused, TLS failure, a
+    /// connect timeout, or a reset before the reply. Usually nothing reached the server; when the
+    /// request was already written it may have, which Anthropic's SDKs also accept when they
+    /// resend.
     Connection,
     /// The request was sent, but no complete response arrived in time.
     Timeout,
@@ -104,8 +106,9 @@ pub enum ErrorKind {
         /// The stream payload's own `retryable` flag, when it sent one.
         retryable: Option<bool>,
     },
-    /// The request was sent, then the connection failed before a complete response arrived. The
-    /// server may already have done the work.
+    /// The response started, then stopped: the connection dropped mid-body, or a stream ended
+    /// before `message_stop`. Only GET requests are resent automatically; the server has already
+    /// answered a POST or DELETE.
     Interrupted,
     /// A success response arrived but is not what was expected: bad JSON, bad SSE framing or
     /// UTF-8, or a bad batch result line.
@@ -191,8 +194,8 @@ impl Error {
     }
 
     /// Builds the [`ErrorKind::Api`] error for an HTTP error status. Every client parses its own
-    /// body shape, then calls this. A body without a message gets
-    /// `HTTP {status} with no error message`.
+    /// body shape, then calls this. A body without a message, or with an empty or blank one,
+    /// gets `HTTP {status} with no error message`.
     pub(crate) fn http_status(
         service: Service,
         status: u16,
@@ -210,8 +213,16 @@ impl Error {
             retry_after,
             retryable: None,
         };
-        let message = message.unwrap_or_else(|| format!("HTTP {status} with no error message"));
+        let message = message
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| format!("HTTP {status} with no error message"));
         Self::new(kind, message).with_request_id(request_id)
+    }
+
+    /// A local size cap was exceeded: the request is `size` bytes in total, against a cap of
+    /// `limit`.
+    pub(crate) fn request_too_large(message: impl Into<String>, size: usize, limit: usize) -> Self {
+        Self::new(ErrorKind::RequestTooLarge { size, limit }, message)
     }
 
     /// Keeps `source` as the cause. It never reaches the message.
@@ -355,11 +366,11 @@ impl fmt::Display for Error {
             return Ok(());
         };
         write!(f, "{service} API error: {} (", self.message)?;
-        // Anthropic's error type, else the service's own code, as the service sends it.
-        let error_type = match error_type {
-            Some(error_type) => error_type.wire_name(),
-            None => error_code.as_ref().and_then(ErrorCode::wire_name),
-        };
+        // Anthropic's error type, else the service's own code, as the service sends it. An
+        // unknown type has no wire name, so the code shows instead.
+        let error_type = error_type
+            .and_then(|error_type| error_type.wire_name())
+            .or_else(|| error_code.as_ref().and_then(ErrorCode::wire_name));
         match (status, error_type) {
             (Some(status), Some(error_type)) => write!(f, "HTTP {status} {error_type}")?,
             (Some(status), None) => write!(f, "HTTP {status}")?,
@@ -430,14 +441,19 @@ pub(crate) fn map_reqwest_error(err: reqwest::Error, phase: RequestPhase) -> Err
     } else if err.is_timeout() {
         (ErrorKind::Timeout, format!("request to {host} timed out"))
     } else {
-        // reqwest reports every failed body read as a decode error, so the phase decides.
-        let message = match phase {
-            RequestPhase::Headers => {
-                format!("connection to {host} failed before a response arrived")
-            }
-            RequestPhase::Body => format!("connection to {host} failed while reading the response"),
-        };
-        (ErrorKind::Interrupted, message)
+        // reqwest reports every failed body read as a decode error, so the phase decides. A
+        // failure before the headers is `Connection` even when the request was already written,
+        // as in Anthropic's SDKs, which resend it.
+        match phase {
+            RequestPhase::Headers => (
+                ErrorKind::Connection,
+                format!("connection to {host} failed before a response arrived"),
+            ),
+            RequestPhase::Body => (
+                ErrorKind::Interrupted,
+                format!("connection to {host} failed while reading the response"),
+            ),
+        }
     };
     Error::new(kind, message).with_source(err)
 }
@@ -492,6 +508,51 @@ mod tests {
             let error = Error::new(kind.clone(), "failed");
             assert_eq!(error.is_retryable(), retryable, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn empty_or_blank_message_gets_the_fallback() {
+        for message in ["", "  \n\t"] {
+            let error = Error::http_status(
+                Service::Jev,
+                503,
+                Some(message.to_string()),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(error.message(), "HTTP 503 with no error message");
+        }
+        let error = Error::http_status(
+            Service::Jev,
+            503,
+            Some("down".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(error.message(), "down");
+    }
+
+    #[test]
+    fn unknown_type_shows_the_error_code() {
+        let error = Error::http_status(
+            Service::Anthropic,
+            429,
+            Some("Spend limit reached".to_string()),
+            Some(ErrorType::Unknown),
+            Some(ErrorCode::Anthropic(
+                "enforced_spend_limit_reached".to_string(),
+            )),
+            Some("req_9".to_string()),
+            None,
+        );
+        assert_eq!(
+            error.to_string(),
+            "Anthropic API error: Spend limit reached (HTTP 429 enforced_spend_limit_reached, request req_9)"
+        );
     }
 
     #[test]
@@ -815,6 +876,26 @@ mod tests {
         assert_eq!(error.kind(), &ErrorKind::Timeout, "{error}");
         assert!(error.is_retryable());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn reset_before_any_reply_is_connection_and_retryable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0; 1024];
+            let _ = socket.read(&mut buffer).await;
+            // Dropping the socket closes it without a reply.
+        });
+        let url = format!("http://{address}/");
+        let error = reqwest_error(local_client(None), &url, RequestPhase::Headers).await;
+        assert_eq!(error.kind(), &ErrorKind::Connection, "{error}");
+        assert!(error.is_retryable());
+        assert_eq!(
+            error.to_string(),
+            "connection to 127.0.0.1 failed before a response arrived"
+        );
     }
 
     #[tokio::test]

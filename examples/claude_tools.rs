@@ -31,11 +31,7 @@ async fn main() -> topcoat_si::Result<()> {
         Ok(run) => run,
         Err(failed) => {
             // The failed turns were still billed, and `failed.messages` can resume the run.
-            eprintln!(
-                "run failed after {} model calls: {}",
-                failed.responses.len(),
-                failed.error
-            );
+            eprintln!("{failed}");
             return Err(failed.error);
         }
     };

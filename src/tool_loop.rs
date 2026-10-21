@@ -31,9 +31,11 @@ pub struct ToolRun {
 /// A [`Anthropic::run_tools`] run that failed part way, with everything it had paid for.
 ///
 /// `responses` holds every response received before the failure, so summing their `usage` gives
-/// the cost. `messages` is the conversation so far, ready to resume. After a failed model call it
-/// ends with the last turn that went through. After a failing tool it ends with the assistant
-/// turn whose `tool_use` blocks are unanswered: answer them before sending `messages` again. A
+/// the cost. `messages` is the conversation so far. It never ends on an assistant turn with
+/// unanswered `tool_use` blocks, so it can be sent again as is. After a failed model call it ends
+/// with the last turn that went through. After a failing tool, the assistant turn whose
+/// `tool_use` blocks went unanswered is left out of `messages` (it stays in `responses`), so
+/// resending asks the model for that turn again. A
 /// run that failed on its first call, or before sending anything, has no responses, and
 /// `messages` is the caller's own.
 #[derive(Debug, Clone)]
@@ -43,7 +45,8 @@ pub struct ToolRunError {
     pub error: Error,
     /// Every response received before the failure, in order.
     pub responses: Vec<Message>,
-    /// The conversation so far.
+    /// The conversation so far, ready to send again: it never ends on an assistant turn with
+    /// unanswered `tool_use` blocks.
     pub messages: Vec<MessageParam>,
 }
 
@@ -59,12 +62,9 @@ impl ToolRunError {
 
 impl fmt::Display for ToolRunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} (after {} model responses)",
-            self.error,
-            self.responses.len()
-        )
+        let count = self.responses.len();
+        let noun = if count == 1 { "response" } else { "responses" };
+        write!(f, "tool run failed after {count} model {noun}")
     }
 }
 
@@ -207,6 +207,9 @@ impl Anthropic {
                             Some(tool) => match tool.call(tool_use).await {
                                 Ok(result) => result,
                                 Err(error) => {
+                                    // Its `tool_use` blocks have no answers, so resending the
+                                    // turn would be rejected.
+                                    params.messages.pop();
                                     return Err(ToolRunError::boxed(
                                         error,
                                         responses,
@@ -646,13 +649,13 @@ mod tests {
         assert_eq!(err.messages.len(), 3);
         assert_eq!(err.messages[1].role, MessageRole::Assistant);
         assert_eq!(err.messages[2].role, MessageRole::User);
-        assert!(err.to_string().contains("after 1 model responses"), "{err}");
+        assert_eq!(err.to_string(), "tool run failed after 1 model response");
         assert!(std::error::Error::source(&err).is_some());
         assert_eq!(recorded.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn tool_failure_returns_the_unanswered_turn() {
+    async fn tool_failure_leaves_a_resumable_transcript() {
         let failing = Echo {
             name: "echo",
             fail: true,
@@ -669,8 +672,10 @@ mod tests {
 
         assert_eq!(err.error.kind(), &ErrorKind::Tool);
         assert_eq!(err.responses.len(), 1);
-        assert_eq!(err.messages.len(), 2);
-        assert_eq!(err.messages[1].role, MessageRole::Assistant);
+        // Only the caller's user message: the unanswered assistant turn stays in `responses`.
+        assert_eq!(err.messages.len(), 1);
+        assert_eq!(err.messages.last().unwrap().role, MessageRole::User);
+        assert_eq!(err.to_string(), "tool run failed after 1 model response");
     }
 
     #[tokio::test]

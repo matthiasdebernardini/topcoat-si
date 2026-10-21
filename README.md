@@ -352,7 +352,7 @@ The result is a `ToolRun`:
 
 `run.text()` joins the text blocks of `message`. It is `None` when there is no text, which can happen on the forced last turn: Sonnet sometimes replies there with only a thinking block.
 
-**When a run fails.** `run_tools` returns `Box<ToolRunError>`. It holds the `error`, every response received before it (`responses`, already billed) and the conversation so far (`messages`). After a failed model call, `messages` ends with your last tool results, so you can send it again, as the snippet above does. After a failing tool, it ends with the assistant turn whose `tool_use` blocks are unanswered: answer them first. Its `Display` is the error plus the number of model responses, and `source()` is the `Error`.
+**When a run fails.** `run_tools` returns `Box<ToolRunError>`. It holds the `error`, every response received before it (`responses`, already billed) and the conversation so far (`messages`). `messages` never ends on an assistant turn with unanswered `tool_use` blocks, so you can send it again as is, as the snippet above does. After a failed model call, it ends with the last turn that went through, usually your tool results. After a failing tool, the assistant turn whose `tool_use` blocks went unanswered is left out of `messages` (it stays in `responses`). Its `Display` is "tool run failed after N model responses", and `source()` is the `Error`.
 
 History is append-only, because models reject replayed thinking when earlier messages change. It therefore grows every turn. For long runs, set `context_management` or `compaction` on the request rather than trimming messages.
 
@@ -392,7 +392,7 @@ Both return each page's main content as markdown. Their other defaults:
 
 Every other failure is an `is_error` result the model can react to.
 
-The Firecrawl client resends a request after a connection failure or a 408, 409, 429 or any 5xx response, including one whose body failed to arrive. A 408 from the server is an `Api` error, not `Timeout`. A client-side timeout and a success response whose body failed (`Interrupted`) are not resent. See [Errors and retries](#errors-and-retries).
+The Firecrawl client resends a request after a connection failure or a 408, 409, 429 or any 5xx response, including one whose body failed to arrive. A 408 from the server is an `Api` error, not `Timeout`. A client-side timeout is not resent, and neither is `Interrupted` (the response started, then stopped), because Firecrawl has already answered. See [Errors and retries](#errors-and-retries).
 
 Both tools work with `run_tools`. You can also drive web search by hand:
 
@@ -507,7 +507,7 @@ For a single question, three shortcuts ask and gate in one call:
 | Retries | 2 | `with_max_retries` |
 | Total time across attempts | 30 s | `with_retry_budget` |
 
-A request is sent again when its error is retryable (see [Errors and retries](#errors-and-retries)): a timeout, a connection failure, or a 408, 409, 429 or 5xx response, including one whose body failed to arrive. A `retry-after` longer than 60 s, or past the retry budget, gives up at once. A success response whose body fails while it is read (`Interrupted`) is not resent, because Jev may already have done the work. A request body over the size cap fails before sending with `RequestTooLarge`.
+A request is sent again when its error is retryable (see [Errors and retries](#errors-and-retries)): a timeout, a connection failure, or a 408, 409, 429 or 5xx response, including an error status whose body failed to arrive (still an `Api` error). A `retry-after` longer than 60 s, or past the retry budget, gives up at once. `Interrupted` (the response started, then stopped) is never resent, because Jev has already answered. A request body over the size cap fails before sending with `RequestTooLarge`.
 
 ### Jev as a tool
 
@@ -964,17 +964,17 @@ Every call returns `topcoat_si::Result<T>`. An `Error` is `Clone + Send + Sync +
 - **Which service:** `ErrorKind::Api { service, .. }` is `Anthropic`, `Firecrawl` or `Jev`.
 - **Whether sending again might work:** `is_retryable()`.
 
-Other accessors: `request_id()` when a response carried one, `status()` and `retry_after()` for `Api` errors, and `events_delivered()` for errors yielded by a stream. `ErrorKind::Api` also carries `error_type`, Anthropic's `error.type` as an `ErrorType`, and `error_code`, an `ErrorCode`: Anthropic's `error.details.error_code`, Jev's `detail.error_type` or Firecrawl's `code`. The message says what failed and where. The cause is only in `source()`, and the message never quotes response content.
+Other accessors: `request_id()` when a response carried one, `status()` and `retry_after()` for `Api` errors, and `events_delivered()` for errors yielded by a stream. `ErrorKind::Api` also carries `error_type`, Anthropic's `error.type` as an `ErrorType`, and `error_code`, an `ErrorCode`: Anthropic's `error.details.error_code`, Jev's `detail.error_type` or Firecrawl's `code`. The message says what failed and where. The cause is only in `source()`, and decode errors never quote response content. A stream `error` event whose payload has no usable message carries up to 300 bytes of the payload.
 
 | Kind | Meaning | Retryable |
 |---|---|---|
 | `Validation` | rejected before sending: bad parameters or configuration | no |
-| `RequestTooLarge` | a local size cap was exceeded (Jev's request body) | no |
+| `RequestTooLarge` | a local size cap was exceeded (Jev's request body, the 256 MiB message batch) | no |
 | `UnsupportedSchema` | structured outputs cannot use this type, such as a recursive one | no |
-| `Connection` | no connection was made, so nothing reached the server | yes |
+| `Connection` | the connection failed before any response arrived: DNS, refused, TLS, connect timeout, or a reset before the reply. Usually nothing reached the server; when the request was already written it may have, which Anthropic's SDKs also accept when they resend | yes |
 | `Timeout` | the request was sent, but no complete response arrived in time | yes |
 | `Api` | the service refused: an HTTP error status, or an `error` event in a stream, which has no status | 408, 409, 429, 5xx; a stream event that says `retryable`, else one of type `overloaded_error`, `api_error`, `rate_limit_error` or `timeout_error` |
-| `Interrupted` | the request was sent, then the connection failed before a complete response arrived, or a stream ended early | yes |
+| `Interrupted` | the response started, then stopped: the connection dropped mid-body, or a stream ended before `message_stop` | yes |
 | `Decode` | a success response is not what was expected | no |
 | `MaxTokens` | structured output was cut off; retry with more tokens | no |
 | `Refusal` | the model refused, so the reply does not follow the schema | no |
@@ -986,7 +986,7 @@ A 429 whose `error_code` is `ErrorCode::Anthropic("enforced_spend_limit_reached"
 
 **What the client resends.** Each client sends a request again, up to `with_max_retries` times (Anthropic 3, Firecrawl 2, Jev 2), when the error is retryable, with three exceptions:
 
-- Only GET requests resend `Interrupted`, such as a `download_file` whose body fails. Any other request may already have been done and billed by the server.
+- Only GET requests resend `Interrupted`, such as a `download_file` whose body fails. POST and DELETE don't, because the server has already answered. An error status whose body failed to arrive is an `Api` error and is retried normally.
 - `Timeout` is resent only by Jev.
 - A `retry-after` over the cap gives up at once: 60 s for Anthropic, 30 s for Firecrawl, and 60 s for Jev, which also gives up when a wait would pass its 30 s retry budget.
 

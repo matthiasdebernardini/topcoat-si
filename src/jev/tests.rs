@@ -599,6 +599,21 @@ async fn server_errors_are_retried() {
 }
 
 #[tokio::test]
+async fn a_post_closed_before_any_reply_is_resent() {
+    let (url, recorded) = serve(vec![
+        Canned::json(200, "").closing_unanswered(),
+        ok(triage_response()),
+    ])
+    .await;
+    let response = client(&url)
+        .ask(json!({"message": MESSAGE}), &triage_questions())
+        .await
+        .unwrap();
+    assert_eq!(response.attempts, 2);
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn conflict_is_retried() {
     let (url, recorded) = serve(vec![
         Canned::json(409, r#"{"detail":"busy"}"#),

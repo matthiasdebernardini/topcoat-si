@@ -784,7 +784,7 @@ impl Anthropic {
     }
 
     /// Runs `operation` under the shared retry loop. Only GET requests resend an
-    /// [`ErrorKind::Interrupted`] failure, since the server may have done a POST's work already.
+    /// [`ErrorKind::Interrupted`] failure, since the server has already answered a POST or DELETE.
     async fn retry_with_backoff<F, Fut, T>(&self, method: Method, operation: F) -> Result<T>
     where
         F: Fn() -> Fut,
@@ -3785,6 +3785,35 @@ Connection: close\r\n\r\n",
             serve_raw(vec![cut_off_response(""), ok_response(file_info_json())]).await;
         let info = files_client(base_url).get_file("file_01").await.unwrap();
         assert_eq!(info.id, "file_01");
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_post_closed_before_any_reply_is_resent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        tokio::spawn(async move {
+            // The first connection is read, then dropped without a reply.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+            read_http_request(&mut socket).await;
+            drop(socket);
+            let (mut socket, _) = listener.accept().await.unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+            read_http_request(&mut socket).await;
+            socket
+                .write_all(ok_response(&reply_json()).as_bytes())
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let message = files_client(format!("http://{address}"))
+            .send(&send_params())
+            .await
+            .unwrap();
+        assert_eq!(message.id, "msg_1");
         assert_eq!(connections.load(Ordering::SeqCst), 2);
     }
 

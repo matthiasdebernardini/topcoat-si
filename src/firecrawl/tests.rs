@@ -611,6 +611,17 @@ async fn server_errors_and_timeouts_are_retried() {
 }
 
 #[tokio::test]
+async fn a_post_closed_before_any_reply_is_resent() {
+    let (url, recorded) = serve(vec![
+        Canned::json(200, "").closing_unanswered(),
+        ok(json!({"success": true, "data": {}})),
+    ])
+    .await;
+    client(&url).search(&SearchRequest::new("q")).await.unwrap();
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn domain_entries_are_normalized() {
     let response = json!({"success": true, "data": {"web": [
         {"url": "https://example.org./trailing-dot"},

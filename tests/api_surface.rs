@@ -211,7 +211,11 @@ async fn tool_run_error_exposes_the_partial_transcript() {
     assert!(failed.responses.is_empty());
     assert_eq!(failed.messages.len(), 1);
     assert!(std::error::Error::source(&*failed).is_some());
-    assert!(failed.to_string().contains("max_turns"));
+    assert_eq!(
+        failed.to_string(),
+        "tool run failed after 0 model responses"
+    );
+    assert!(failed.error.to_string().contains("max_turns"));
 }
 
 #[test]

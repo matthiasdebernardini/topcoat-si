@@ -14,7 +14,7 @@ use super::questions::WireQuestions;
 use super::{Choices, JevErrorCode, JevResponse, Levels, Outcome, Questions};
 use crate::backoff::{self, RetryPolicy};
 use crate::base_url;
-use crate::error::{Error, ErrorCode, ErrorKind, RequestPhase, Result, Service, map_reqwest_error};
+use crate::error::{Error, ErrorCode, RequestPhase, Result, Service, map_reqwest_error};
 use crate::types::retry_after_from_headers;
 
 pub(super) const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
@@ -189,10 +189,10 @@ impl JevClient {
     /// `state` must be a string, object or array nested at most 64 deep, and the request body
     /// at most 32 MiB; the questions are checked as described on [`Questions`]. A failed check
     /// sends nothing. Whatever [`Error::is_retryable`] accepts (408, 409, 429, 5xx, connection
-    /// failures, timeouts) is retried, except a response cut off mid-body, which Jev may already
-    /// have billed. Each wait is the backoff delay or `Retry-After`, whichever is longer; a
-    /// `Retry-After` over 60 seconds, or a wait that would pass the retry budget, returns the
-    /// error at once.
+    /// failures, timeouts) is retried, except `Interrupted` (the response started, then stopped),
+    /// because Jev has already answered and may have billed. Each wait is the backoff delay or
+    /// `Retry-After`, whichever is longer; a `Retry-After` over 60 seconds, or a wait that would
+    /// pass the retry budget, returns the error at once.
     pub async fn ask(&self, state: impl Into<Value>, questions: &Questions) -> Result<JevResponse> {
         let state: Value = state.into();
         questions.validate()?;
@@ -467,15 +467,13 @@ pub(super) fn serialize_body(request: &impl Serialize) -> Result<Vec<u8>> {
         Error::validation("Failed to serialize the Jev request", None).with_source(e)
     })?;
     if body.len() > MAX_BODY_BYTES {
-        return Err(Error::new(
-            ErrorKind::RequestTooLarge {
-                size: body.len(),
-                limit: MAX_BODY_BYTES,
-            },
+        return Err(Error::request_too_large(
             format!(
                 "Jev request body is {} bytes, over the 32 MiB limit",
                 body.len()
             ),
+            body.len(),
+            MAX_BODY_BYTES,
         ));
     }
     Ok(body)

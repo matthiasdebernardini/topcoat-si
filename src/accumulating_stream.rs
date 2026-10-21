@@ -147,10 +147,14 @@ impl AccumulatingStream {
 
     fn finalize(&mut self) -> Result<Message, Error> {
         let mut message = self.message.take().ok_or_else(|| {
-            Error::new(
-                ErrorKind::Interrupted,
-                "stream ended without a message start event",
-            )
+            // After `message_stop`, a missing `message_start` is malformed server output. On a
+            // stream still running (`finalize_partial`), nothing has gone wrong yet.
+            let kind = if self.completed {
+                ErrorKind::Decode
+            } else {
+                ErrorKind::Interrupted
+            };
+            Error::new(kind, "stream ended without a message start event")
         })?;
         message.content = std::mem::take(&mut self.content_blocks)
             .into_iter()
@@ -880,6 +884,34 @@ mod tests {
         assert!(error.to_string().contains("without a message start event"));
         assert!(acc_stream.next().await.is_none());
         assert!(rx.await.unwrap().is_err());
+    }
+
+    /// A finished stream with no `message_start` is malformed output, but one that ends before
+    /// `message_stop` was cut off.
+    #[tokio::test]
+    async fn stop_without_start_is_decode_and_early_end_is_interrupted() {
+        use futures::StreamExt;
+
+        let stop = vec![Ok(MessageStreamEvent::MessageStop(
+            crate::MessageStopEvent::new(),
+        ))];
+        let (mut acc_stream, _rx) = AccumulatingStream::new(stream::iter(stop));
+        assert!(acc_stream.next().await.unwrap().is_ok());
+        let error = acc_stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Decode, "{error}");
+        assert!(!error.is_retryable());
+
+        let (mut acc_stream, _rx) = AccumulatingStream::new(stream::iter(Vec::new()));
+        let error = acc_stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Interrupted, "{error}");
+    }
+
+    /// `finalize_partial` on a running stream with no `message_start` is not malformed output.
+    #[tokio::test]
+    async fn finalize_partial_before_start_is_interrupted() {
+        let (mut acc_stream, _rx) = AccumulatingStream::new(stream::iter(Vec::new()));
+        let error = acc_stream.finalize_partial().unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Interrupted, "{error}");
     }
 
     fn start_event() -> MessageStreamEvent {
