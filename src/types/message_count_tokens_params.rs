@@ -216,7 +216,7 @@ impl MessageCountTokensParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::KnownModel;
+    use crate::types::{ContextEdit, Effort, KnownModel};
     use serde_json::{json, to_value};
 
     #[test]
@@ -324,10 +324,8 @@ mod tests {
         )
         .with_speed(InferenceSpeed::Fast)
         .with_cache_control(CacheControlEphemeral::one_hour())
-        .with_output_config(OutputConfig::new().with_effort(crate::types::Effort::High))
-        .with_context_management(ContextManagement::new(vec![
-            crate::types::ContextEdit::clear_tool_uses(),
-        ]))
+        .with_output_config(OutputConfig::new().with_effort(Effort::High))
+        .with_context_management(ContextManagement::new(vec![ContextEdit::clear_tool_uses()]))
         .with_mcp_servers(vec![McpServer::new("a", "https://mcp.example.com")]);
 
         let json = to_value(&params).unwrap();

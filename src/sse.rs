@@ -5,12 +5,14 @@
 
 use bytes::Bytes;
 use futures::stream::{self, Stream, StreamExt};
+use serde::Deserialize;
 use std::time::Instant;
 
+use crate::error::RequestPhase;
 use crate::observability;
 use crate::{
-    ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent, Error,
-    MessageDeltaEvent, MessageStartEvent, MessageStopEvent, MessageStreamEvent, Result,
+    ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent, Error, ErrorCode,
+    ErrorType, MessageDeltaEvent, MessageStartEvent, MessageStopEvent, MessageStreamEvent, Result,
 };
 
 /// Maximum buffer size to prevent DoS attacks (1MB)
@@ -71,9 +73,7 @@ where
 {
     // Convert reqwest errors to our error type
     let stream = byte_stream.map(|result| {
-        result.map_err(|error| {
-            crate::error::map_reqwest_error(error, crate::error::RequestPhase::Body)
-        })
+        result.map_err(|error| crate::error::map_reqwest_error(error, RequestPhase::Body))
     });
 
     // Initialize state with production hardening
@@ -374,43 +374,31 @@ fn parse_stream_error(event_data: &str) -> Error {
             let error_object = error_json.get("error");
             let error_type = error_object
                 .and_then(|error| error.get("type"))
-                .and_then(|value| value.as_str())
-                .map(String::from);
+                .and_then(|value| ErrorType::deserialize(value).ok());
             let message = error_object
                 .and_then(|error| error.get("message"))
                 .and_then(|value| value.as_str())
                 .unwrap_or("Unknown stream error")
                 .to_string();
+            // A stream error event rarely carries a status, so it comes from the documented
+            // status of its type.
             let status_code = error_object
                 .and_then(|error| error.get("status_code"))
                 .and_then(|value| value.as_u64())
                 .and_then(|value| u16::try_from(value).ok())
-                .unwrap_or(match error_type.as_deref() {
-                    Some("overloaded_error") => 529,
-                    Some("rate_limit_error" | "rate_limit") => 429,
-                    Some("invalid_request_error") => 400,
-                    Some("authentication_error") => 401,
-                    Some("permission_error") => 403,
-                    Some("not_found_error" | "not_found") => 404,
-                    _ => 500,
-                });
+                .unwrap_or_else(|| error_type.map_or(500, ErrorType::http_status));
             let _retryable = error_object
                 .and_then(|error| error.get("retryable"))
                 .and_then(|value| value.as_bool());
 
             Error::api(
                 status_code,
-                error_type,
+                error_type.map(ErrorCode::Anthropic),
                 message,
                 error_json["request_id"].as_str().map(String::from),
             )
         }
-        Err(_) => Error::api(
-            500,
-            Some("stream_error".to_string()),
-            event_data.to_string(),
-            None,
-        ),
+        Err(_) => Error::api(500, None, event_data.to_string(), None),
     }
 }
 
@@ -740,8 +728,110 @@ mod tests {
     }
 
     #[test]
+    fn error_event_type_becomes_an_anthropic_error_code() {
+        let parse = |data: &str| {
+            parse_message_stream_event(&SseEvent::new("error", data))
+                .unwrap_err()
+                .metadata()
+                .and_then(|metadata| metadata.error_code.clone())
+        };
+        let (code, warnings) = crate::test_support::unknown_warnings(|| {
+            parse(r#"{"error":{"type":"overloaded_error","message":"busy"}}"#)
+        });
+        assert_eq!(code, Some(ErrorCode::Anthropic(ErrorType::OverloadedError)));
+        assert_eq!(warnings, Vec::<String>::new());
+
+        let (codes, warnings) = crate::test_support::unknown_warnings(|| {
+            [
+                parse(r#"{"error":{"type":"kettle_error","message":"hot"}}"#),
+                parse(r#"{"error":{"type":"kettle_error","message":"hot"}}"#),
+            ]
+        });
+        assert_eq!(
+            codes,
+            [
+                Some(ErrorCode::Anthropic(ErrorType::Unknown)),
+                Some(ErrorCode::Anthropic(ErrorType::Unknown))
+            ]
+        );
+        assert_eq!(warnings, ["rust_type=ErrorType tag=kettle_error"]);
+
+        assert_eq!(parse("not json"), None);
+    }
+
+    #[test]
+    fn stream_error_status_follows_the_documented_status_of_its_type() {
+        /// Whether an error is the expected `Error` variant.
+        type IsVariant = fn(&Error) -> bool;
+        // (type, status, variant check, retryable)
+        let cases: [(&str, u16, IsVariant, bool); 13] = [
+            ("invalid_request_error", 400, Error::is_bad_request, false),
+            ("authentication_error", 401, Error::is_authentication, false),
+            (
+                "billing_error",
+                402,
+                |e| matches!(e, Error::Api { .. }),
+                false,
+            ),
+            ("permission_error", 403, Error::is_permission, false),
+            ("not_found_error", 404, Error::is_not_found, false),
+            (
+                "conflict_error",
+                409,
+                |e| matches!(e, Error::Api { .. }),
+                true,
+            ),
+            (
+                "request_too_large",
+                413,
+                |e| matches!(e, Error::Api { .. }),
+                false,
+            ),
+            ("rate_limit_error", 429, Error::is_rate_limit, true),
+            (
+                "api_error",
+                500,
+                |e| matches!(e, Error::InternalServer { .. }),
+                true,
+            ),
+            (
+                "timeout_error",
+                504,
+                |e| matches!(e, Error::ServiceUnavailable { .. }),
+                true,
+            ),
+            (
+                "overloaded_error",
+                529,
+                |e| matches!(e, Error::Overloaded { .. }),
+                true,
+            ),
+            // The old undocumented aliases are unknown types now.
+            (
+                "rate_limit",
+                500,
+                |e| matches!(e, Error::InternalServer { .. }),
+                true,
+            ),
+            (
+                "not_found",
+                500,
+                |e| matches!(e, Error::InternalServer { .. }),
+                true,
+            ),
+        ];
+        for (error_type, status, is_variant, retryable) in cases {
+            let data = format!(r#"{{"error":{{"type":"{error_type}","message":"m"}}}}"#);
+            let err = parse_message_stream_event(&SseEvent::new("error", data)).unwrap_err();
+            assert_eq!(err.status_code(), Some(status), "{error_type}");
+            assert!(is_variant(&err), "{error_type}: {err:?}");
+            assert_eq!(err.is_retryable(), retryable, "{error_type}");
+        }
+    }
+
+    #[test]
     fn handle_structured_error_events_without_status_code() {
-        let error_json = r#"{"error":{"type":"not_found","message":"missing"}}"#;
+        let error_json = r#"{"error":{"type":"not_found_error","message":"missing"}}"#;
         let err = parse_message_stream_event(&SseEvent {
             event: "error".to_string(),
             data: error_json.to_string(),

@@ -8,7 +8,7 @@ use time::macros::date;
 
 use super::*;
 use crate::ClientTool;
-use crate::error::Error;
+use crate::error::{Error, ErrorCode};
 use crate::test_support::{Canned, Recorded, serve, uses_proxies};
 use crate::types::{
     Content, ContentBlock, SearchResultBlock, ToolResultBlock, ToolResultBlockContent,
@@ -258,6 +258,24 @@ async fn rate_limit_after_retries_is_rate_limit_error() {
     assert!(err.is_rate_limit(), "{err:?}");
     assert!(err.to_string().contains("slow down (code RATE_LIMIT)"));
     assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn error_code_is_kept_as_sent() {
+    let (url, _) = serve(vec![Canned::json(
+        429,
+        json!({"success": false, "error": "slow down", "code": "RATE_LIMIT"}).to_string(),
+    )])
+    .await;
+    let err = client(&url)
+        .with_max_retries(0)
+        .search(&SearchRequest::new("code"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.metadata().unwrap().error_code,
+        Some(ErrorCode::Firecrawl("RATE_LIMIT".to_string()))
+    );
 }
 
 #[tokio::test]

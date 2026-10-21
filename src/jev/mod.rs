@@ -34,6 +34,7 @@
 mod answer;
 mod choices;
 mod client;
+mod error_code;
 mod outcome;
 mod questions;
 mod response;
@@ -42,9 +43,10 @@ mod tool;
 #[cfg(test)]
 mod tests;
 
-pub use answer::{Answer, ChoiceAnswer, LabelProbability, ScoreAnswer};
+pub use answer::{Answer, AnswerKind, ChoiceAnswer, LabelProbability, ScoreAnswer};
 pub use choices::{ChoiceOption, Choices, Level, Levels};
 pub use client::JevClient;
+pub use error_code::JevErrorCode;
 pub use outcome::Outcome;
 pub use questions::Questions;
 pub use response::{JevResponse, JevUsage, NamedAnswer};

@@ -39,12 +39,6 @@ impl ContentBlockSourceParam {
             content: ContentBlockSourceContent::Array(content),
         }
     }
-
-    /// Create a new `ContentBlockSourceParam` with a single content item.
-    #[must_use]
-    pub fn new_with_item(content: Content) -> Self {
-        Self::new_with_array(vec![content])
-    }
 }
 
 impl FromStr for ContentBlockSourceParam {
@@ -58,7 +52,7 @@ impl FromStr for ContentBlockSourceParam {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ImageBlock, TextBlock, UrlImageSource};
+    use crate::types::{ImageBlock, ImageSource, TextBlock, UrlImageSource};
     use serde_json::{json, to_value};
 
     #[test]
@@ -78,7 +72,7 @@ mod tests {
     fn content_block_source_param_with_array() {
         let text_param = TextBlock::new("Sample text content");
         let url_source = UrlImageSource::new("https://example.com/image.jpg");
-        let image_param = ImageBlock::new_with_url(url_source);
+        let image_param = ImageBlock::new(ImageSource::Url(url_source));
 
         let content = vec![Content::Text(text_param), Content::Image(image_param)];
 
@@ -108,7 +102,7 @@ mod tests {
     #[test]
     fn content_block_source_param_with_item() {
         let text_param = TextBlock::new("Sample text content");
-        let source = ContentBlockSourceParam::new_with_item(Content::Text(text_param));
+        let source = ContentBlockSourceParam::new_with_array(vec![Content::Text(text_param)]);
 
         let json = to_value(&source).unwrap();
 

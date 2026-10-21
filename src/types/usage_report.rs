@@ -1,8 +1,10 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+use crate::types::{InferenceSpeed, open_union};
 
 /// Time-bucket width for a usage report.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -92,14 +94,14 @@ pub struct UsageReportParams {
     pub service_account_ids: Vec<String>,
     /// Filter by account identifiers.
     pub account_ids: Vec<String>,
-    /// Filter by service tier: batch, flex, flex_discount, priority, priority_on_demand, standard.
-    pub service_tiers: Vec<String>,
+    /// Filter by service tier.
+    pub service_tiers: Vec<UsageReportServiceTier>,
     /// Filter by context window: `"0-200k"` or `"200k-1M"`.
     pub context_window: Vec<String>,
     /// Filter by inference geography: global, us, not_available.
     pub inference_geos: Vec<String>,
-    /// Filter by speed: standard, fast.
-    pub speeds: Vec<String>,
+    /// Filter by speed.
+    pub speeds: Vec<InferenceSpeed>,
     /// Maximum buckets to return (31 for 1d, 168 for 1h, 1440 for 1m).
     pub limit: Option<u32>,
     /// Pagination cursor from a previous report's `next_page`.
@@ -157,24 +159,10 @@ impl UsageReportParams {
         self
     }
 
-    /// Filter by several models.
-    #[must_use]
-    pub fn with_models(mut self, models: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.models.extend(models.into_iter().map(Into::into));
-        self
-    }
-
     /// Filter by one API key.
     #[must_use]
     pub fn with_api_key_id(mut self, id: impl Into<String>) -> Self {
         self.api_key_ids.push(id.into());
-        self
-    }
-
-    /// Filter by several API keys.
-    #[must_use]
-    pub fn with_api_key_ids(mut self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.api_key_ids.extend(ids.into_iter().map(Into::into));
         self
     }
 
@@ -185,28 +173,10 @@ impl UsageReportParams {
         self
     }
 
-    /// Filter by several workspaces.
-    #[must_use]
-    pub fn with_workspace_ids(mut self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.workspace_ids.extend(ids.into_iter().map(Into::into));
-        self
-    }
-
     /// Filter by one service account.
     #[must_use]
     pub fn with_service_account_id(mut self, id: impl Into<String>) -> Self {
         self.service_account_ids.push(id.into());
-        self
-    }
-
-    /// Filter by several service accounts.
-    #[must_use]
-    pub fn with_service_account_ids(
-        mut self,
-        ids: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.service_account_ids
-            .extend(ids.into_iter().map(Into::into));
         self
     }
 
@@ -217,17 +187,10 @@ impl UsageReportParams {
         self
     }
 
-    /// Filter by several accounts.
-    #[must_use]
-    pub fn with_account_ids(mut self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.account_ids.extend(ids.into_iter().map(Into::into));
-        self
-    }
-
     /// Filter by one service tier.
     #[must_use]
-    pub fn with_service_tier(mut self, tier: impl Into<String>) -> Self {
-        self.service_tiers.push(tier.into());
+    pub fn with_service_tier(mut self, tier: UsageReportServiceTier) -> Self {
+        self.service_tiers.push(tier);
         self
     }
 
@@ -247,8 +210,8 @@ impl UsageReportParams {
 
     /// Filter by one speed.
     #[must_use]
-    pub fn with_speed(mut self, speed: impl Into<String>) -> Self {
-        self.speeds.push(speed.into());
+    pub fn with_speed(mut self, speed: InferenceSpeed) -> Self {
+        self.speeds.push(speed);
         self
     }
 
@@ -266,6 +229,26 @@ impl UsageReportParams {
         self
     }
 
+    /// Rejects an `Unknown` service tier or speed read from a reply, which has no API value to
+    /// send.
+    pub(crate) fn check_known_values(&self) -> crate::Result<()> {
+        if let Some(index) = self
+            .service_tiers
+            .iter()
+            .position(|tier| *tier == UsageReportServiceTier::Unknown)
+        {
+            return Err(open_union::unknown_in_request(format!(
+                "service_tiers[{index}]"
+            )));
+        }
+        self.speeds
+            .iter()
+            .position(|speed| *speed == InferenceSpeed::Unknown)
+            .map_or(Ok(()), |index| {
+                Err(open_union::unknown_in_request(format!("speeds[{index}]")))
+            })
+    }
+
     /// Build the URL-encoded query string, repeating array keys with a `[]` suffix.
     #[must_use]
     pub fn to_query(&self) -> String {
@@ -280,13 +263,12 @@ impl UsageReportParams {
         for group in &self.group_by {
             query.append_pair("group_by[]", group.as_str());
         }
-        let arrays: [(&str, &[String]); 8] = [
+        let arrays: [(&str, &[String]); 7] = [
             ("models[]", &self.models),
             ("api_key_ids[]", &self.api_key_ids),
             ("workspace_ids[]", &self.workspace_ids),
             ("service_account_ids[]", &self.service_account_ids),
             ("account_ids[]", &self.account_ids),
-            ("service_tiers[]", &self.service_tiers),
             ("context_window[]", &self.context_window),
             ("inference_geos[]", &self.inference_geos),
         ];
@@ -295,8 +277,11 @@ impl UsageReportParams {
                 query.append_pair(key, value);
             }
         }
+        for tier in &self.service_tiers {
+            query.append_pair("service_tiers[]", &wire_str(tier));
+        }
         for speed in &self.speeds {
-            query.append_pair("speeds[]", speed);
+            query.append_pair("speeds[]", &wire_str(speed));
         }
         if let Some(limit) = self.limit {
             query.append_pair("limit", &limit.to_string());
@@ -305,6 +290,14 @@ impl UsageReportParams {
             query.append_pair("page", page);
         }
         query.finish()
+    }
+}
+
+/// The string a string enum serializes to; a unit variant always serializes to a string.
+fn wire_str<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(text)) => text,
+        _ => String::new(),
     }
 }
 
@@ -343,10 +336,10 @@ pub struct UsageBucketResult {
     pub model: Option<String>,
     /// Service tier, when grouped by service tier.
     #[serde(default)]
-    pub service_tier: Option<String>,
+    pub service_tier: Option<UsageReportServiceTier>,
     /// Inference speed, when grouped by speed.
     #[serde(default)]
-    pub speed: Option<String>,
+    pub speed: Option<InferenceSpeed>,
     /// Context window, when grouped by context window.
     #[serde(default)]
     pub context_window: Option<String>,
@@ -375,6 +368,48 @@ impl UsageBucketResult {
             + self.cache_read_input_tokens
             + self.cache_creation.ephemeral_5m_input_tokens
             + self.cache_creation.ephemeral_1h_input_tokens
+    }
+}
+
+/// The service tier of a usage-report row.
+///
+/// The report knows more tiers than a Messages reply's [`ServiceTier`](crate::types::ServiceTier).
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum UsageReportServiceTier {
+    /// Standard capacity.
+    Standard,
+    /// Priority Tier capacity.
+    Priority,
+    /// Priority capacity bought on demand.
+    PriorityOnDemand,
+    /// Message Batches processing.
+    Batch,
+    /// Flex capacity.
+    Flex,
+    /// Flex capacity at the discounted rate.
+    FlexDiscount,
+    /// A tier this crate does not know.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for UsageReportServiceTier {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "UsageReportServiceTier",
+            |value| match value {
+                "standard" => Some(Self::Standard),
+                "priority" => Some(Self::Priority),
+                "priority_on_demand" => Some(Self::PriorityOnDemand),
+                "batch" => Some(Self::Batch),
+                "flex" => Some(Self::Flex),
+                "flex_discount" => Some(Self::FlexDiscount),
+                _ => None,
+            },
+            Self::Unknown,
+        )
     }
 }
 
@@ -428,8 +463,8 @@ mod tests {
         assert_eq!(result.cache_read_input_tokens, 200);
         assert_eq!(result.cache_creation, UsageReportCacheCreation::default());
         assert_eq!(result.model.as_deref(), Some("claude-opus-5-5"));
-        assert_eq!(result.service_tier.as_deref(), Some("standard"));
-        assert_eq!(result.speed.as_deref(), Some("standard"));
+        assert_eq!(result.service_tier, Some(UsageReportServiceTier::Standard));
+        assert_eq!(result.speed, Some(InferenceSpeed::Standard));
         assert_eq!(result.context_window.as_deref(), Some("0-200k"));
         assert_eq!(result.inference_geo.as_deref(), Some("global"));
         assert_eq!(
@@ -453,7 +488,7 @@ mod tests {
             .group_by(UsageGroupBy::Model)
             .group_by(UsageGroupBy::WorkspaceId)
             .with_model("claude-opus-5-5")
-            .with_speed("fast")
+            .with_speed(InferenceSpeed::Fast)
             .with_limit(7)
             .with_page("page_abc")
             .to_query();
@@ -463,5 +498,46 @@ mod tests {
              &bucket_width=1d&group_by%5B%5D=model&group_by%5B%5D=workspace_id\
              &models%5B%5D=claude-opus-5-5&speeds%5B%5D=fast&limit=7&page=page_abc"
         );
+    }
+
+    #[test]
+    fn unknown_result_speed_parses_and_warns_once() {
+        let row = serde_json::json!({
+            "uncached_input_tokens": 1,
+            "output_tokens": 2,
+            "cache_read_input_tokens": 0,
+            "speed": "warp"
+        });
+        let (result, warnings) = crate::test_support::unknown_warnings(|| {
+            serde_json::from_value::<UsageBucketResult>(row).unwrap()
+        });
+        assert_eq!(result.speed, Some(InferenceSpeed::Unknown));
+        assert_eq!(warnings, ["rust_type=InferenceSpeed tag=warp"]);
+    }
+
+    #[test]
+    fn typed_filters_encode_their_wire_values_and_reject_unknown() {
+        let start = OffsetDateTime::parse("2025-08-01T00:00:00Z", &Rfc3339).unwrap();
+        let params = UsageReportParams::new(start)
+            .with_service_tier(UsageReportServiceTier::PriorityOnDemand)
+            .with_service_tier(UsageReportServiceTier::FlexDiscount)
+            .with_speed(InferenceSpeed::Standard);
+        assert!(params.check_known_values().is_ok());
+        assert_eq!(
+            params.to_query(),
+            "starting_at=2025-08-01T00%3A00%3A00Z&service_tiers%5B%5D=priority_on_demand\
+             &service_tiers%5B%5D=flex_discount&speeds%5B%5D=standard"
+        );
+
+        let param = |params: UsageReportParams| match params.check_known_values() {
+            Err(crate::Error::Validation { param, .. }) => param,
+            other => panic!("expected a validation error, got {other:?}"),
+        };
+        let tier = params
+            .clone()
+            .with_service_tier(UsageReportServiceTier::Unknown);
+        assert_eq!(param(tier).as_deref(), Some("service_tiers[2]"));
+        let speed = params.with_speed(InferenceSpeed::Unknown);
+        assert_eq!(param(speed).as_deref(), Some("speeds[1]"));
     }
 }

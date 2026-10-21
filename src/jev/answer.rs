@@ -2,8 +2,10 @@
 
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::types::warn_unknown;
 
 /// One answer, by question kind.
 ///
@@ -17,19 +19,15 @@ pub enum Answer {
     Choice(ChoiceAnswer),
     /// A rating on an ordered scale.
     Score(ScoreAnswer),
-    /// An answer type this client does not know. It is kept so the response is never lost; the
-    /// typed accessors report it as an error.
-    Unknown {
-        /// The answer's `type` field, empty when missing.
-        kind: String,
-        /// The answer as Jev sent it.
-        raw: Value,
-    },
+    /// An answer type this client does not know, as Jev sent it. It is kept so the response is
+    /// never lost, and logged as a warning on `topcoat_si::unknown`; the typed accessors report
+    /// it as an error.
+    Unknown(Value),
     /// A noul, choice or score answer whose fields could not be decoded. It is kept so the
     /// other answers stay usable; the typed accessors report it as an error.
     Malformed {
-        /// The answer's `type` field: `noul`, `choice` or `score`.
-        kind: String,
+        /// The answer's `type` field.
+        kind: AnswerKind,
         /// The answer as Jev sent it.
         raw: Value,
     },
@@ -41,9 +39,9 @@ impl fmt::Debug for Answer {
             Self::Noul(p) => f.debug_tuple("Noul").field(p).finish(),
             Self::Choice(choice) => f.debug_tuple("Choice").field(choice).finish(),
             Self::Score(score) => f.debug_tuple("Score").field(score).finish(),
-            Self::Unknown { kind, raw } => f
+            Self::Unknown(raw) => f
                 .debug_struct("Unknown")
-                .field("kind", kind)
+                .field("type", &type_tag(raw))
                 .field("raw_bytes", &raw.to_string().len())
                 .finish(),
             Self::Malformed { kind, raw } => f
@@ -52,6 +50,29 @@ impl fmt::Debug for Answer {
                 .field("raw_bytes", &raw.to_string().len())
                 .finish(),
         }
+    }
+}
+
+/// The kind of a question and its answer, as in an answer's `type` field.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AnswerKind {
+    /// A yes/no answer.
+    Noul,
+    /// A pick-one answer.
+    Choice,
+    /// A rating on an ordered scale.
+    Score,
+}
+
+impl fmt::Display for AnswerKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Noul => "noul",
+            Self::Choice => "choice",
+            Self::Score => "score",
+        })
     }
 }
 
@@ -129,28 +150,37 @@ struct WireScore {
     probabilities: serde_json::Map<String, Value>,
 }
 
-pub(super) fn parse_answer(value: Value) -> Answer {
-    let kind = value
+/// An answer's `type` field, empty when missing.
+pub(super) fn type_tag(value: &Value) -> &str {
+    value
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default()
-        .to_string();
-    if !matches!(kind.as_str(), "noul" | "choice" | "score") {
-        return Answer::Unknown { kind, raw: value };
-    }
-    match decode_answer(&kind, &value) {
+}
+
+pub(super) fn parse_answer(value: Value) -> Answer {
+    let kind = match type_tag(&value) {
+        "noul" => AnswerKind::Noul,
+        "choice" => AnswerKind::Choice,
+        "score" => AnswerKind::Score,
+        tag => {
+            warn_unknown("Answer", tag);
+            return Answer::Unknown(value);
+        }
+    };
+    match decode_answer(kind, &value) {
         Some(answer) => answer,
         None => Answer::Malformed { kind, raw: value },
     }
 }
 
-fn decode_answer(kind: &str, value: &Value) -> Option<Answer> {
+fn decode_answer(kind: AnswerKind, value: &Value) -> Option<Answer> {
     match kind {
-        "noul" => {
+        AnswerKind::Noul => {
             let wire = WireNoul::deserialize(value).ok()?;
             Some(Answer::Noul(wire.noul))
         }
-        "choice" => {
+        AnswerKind::Choice => {
             let wire = WireChoice::deserialize(value).ok()?;
             // The turbofish stays: `?` alone cannot tell `collect` which `Option` to build.
             let probabilities: Vec<_> = wire
@@ -169,7 +199,7 @@ fn decode_answer(kind: &str, value: &Value) -> Option<Answer> {
                 probabilities,
             }))
         }
-        "score" => {
+        AnswerKind::Score => {
             let wire = WireScore::deserialize(value).ok()?;
             // Keys must be the level indexes 0..n in any order.
             let mut probabilities = vec![None; wire.probabilities.len()];
@@ -187,6 +217,5 @@ fn decode_answer(kind: &str, value: &Value) -> Option<Answer> {
                 probabilities: probabilities.into_iter().collect::<Option<Vec<_>>>()?,
             }))
         }
-        _ => None,
     }
 }

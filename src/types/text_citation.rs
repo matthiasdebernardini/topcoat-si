@@ -59,62 +59,6 @@ impl<'de> Deserialize<'de> for TextCitation {
     }
 }
 
-impl TextCitation {
-    /// Creates a new character-based location citation
-    #[must_use]
-    pub fn char_location(
-        cited_text: impl Into<String>,
-        document_index: i32,
-        start_char_index: i32,
-        end_char_index: i32,
-        document_title: Option<String>,
-    ) -> Self {
-        Self::CharLocation(CitationCharLocation::new(
-            cited_text,
-            document_index,
-            start_char_index,
-            end_char_index,
-            document_title,
-        ))
-    }
-
-    /// Creates a new page-based location citation
-    #[must_use]
-    pub fn page_location(
-        cited_text: impl Into<String>,
-        document_index: i32,
-        start_page_number: i32,
-        end_page_number: i32,
-        document_title: Option<String>,
-    ) -> Self {
-        Self::PageLocation(CitationPageLocation::new(
-            cited_text,
-            document_index,
-            start_page_number,
-            end_page_number,
-            document_title,
-        ))
-    }
-
-    /// Creates a new content block-based location citation
-    #[must_use]
-    pub fn content_block_location(
-        cited_text: impl Into<String>,
-        document_index: i32,
-        start_block_index: i32,
-        end_block_index: i32,
-        document_title: Option<String>,
-    ) -> Self {
-        Self::ContentBlockLocation(CitationContentBlockLocation::new(
-            cited_text,
-            document_index,
-            start_block_index,
-            end_block_index,
-            document_title,
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,13 +168,13 @@ mod tests {
 
     #[test]
     fn char_location_method() {
-        let citation = TextCitation::char_location(
+        let citation = TextCitation::CharLocation(CitationCharLocation::new(
             "example text",
             0,
             0,
             12,
             Some("Document Title".to_string()),
-        );
+        ));
 
         let json_value = serde_json::to_value(&citation).unwrap();
         let expected = json!({
@@ -247,13 +191,13 @@ mod tests {
 
     #[test]
     fn page_location_method() {
-        let citation = TextCitation::page_location(
+        let citation = TextCitation::PageLocation(CitationPageLocation::new(
             "example text",
             0,
             3,
             5,
             Some("Document Title".to_string()),
-        );
+        ));
 
         let json_value = serde_json::to_value(&citation).unwrap();
         let expected = json!({
@@ -270,13 +214,13 @@ mod tests {
 
     #[test]
     fn content_block_location_method() {
-        let citation = TextCitation::content_block_location(
+        let citation = TextCitation::ContentBlockLocation(CitationContentBlockLocation::new(
             "example text",
             0,
             2,
             4,
             Some("Document Title".to_string()),
-        );
+        ));
 
         let json_value = serde_json::to_value(&citation).unwrap();
         let expected = json!({
@@ -293,7 +237,8 @@ mod tests {
 
     #[test]
     fn optional_fields_are_omitted() {
-        let citation = TextCitation::char_location("example text", 0, 0, 12, None);
+        let citation =
+            TextCitation::CharLocation(CitationCharLocation::new("example text", 0, 0, 12, None));
 
         let json_value = serde_json::to_value(&citation).unwrap();
         let expected = json!({

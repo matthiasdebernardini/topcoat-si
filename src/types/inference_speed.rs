@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::types::open_union;
 
-/// Inference speed for a message or fallback attempt.
+/// Inference speed of a request, a fallback attempt or a report row.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]

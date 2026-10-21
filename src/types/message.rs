@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::types::wire_tag::MessageTag;
 use crate::types::{
     CacheDiagnostics, ContainerInfo, ContentBlock, ContextManagementResponse, MessageRole, Model,
     StopDetails, StopReason, Usage,
@@ -61,8 +62,8 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_management: Option<ContextManagementResponse>,
 
-    /// Object type, which is always "message".
-    pub r#type: String,
+    /// Object type, always `"message"`.
+    r#type: MessageTag,
 
     /// Billing and rate-limit usage information.
     pub usage: Usage,
@@ -88,7 +89,7 @@ impl Message {
             container: None,
             diagnostics: None,
             context_management: None,
-            r#type: "message".to_string(),
+            r#type: MessageTag,
             usage,
         }
     }
@@ -111,14 +112,14 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TextBlock;
+    use crate::types::{CacheMissType, KnownModel, TextBlock};
     use serde_json::{json, to_value};
 
     #[test]
     fn message_serialization() {
         let text_block = TextBlock::new("Hello, I'm Claude.");
         let content = vec![ContentBlock::Text(text_block)];
-        let model = Model::Known(crate::types::KnownModel::ClaudeSonnet55);
+        let model = Model::Known(KnownModel::ClaudeSonnet55);
         let usage = Usage::new(50, 100);
 
         let message = Message::new("msg_012345", content, model, usage);
@@ -149,7 +150,7 @@ mod tests {
     fn message_with_stop_reason() {
         let text_block = TextBlock::new("Hello, I'm Claude.");
         let content = vec![ContentBlock::Text(text_block)];
-        let model = Model::Known(crate::types::KnownModel::ClaudeSonnet55);
+        let model = Model::Known(KnownModel::ClaudeSonnet55);
         let usage = Usage::new(50, 100);
 
         let message =
@@ -205,7 +206,7 @@ mod tests {
         let message: Message = serde_json::from_value(json).unwrap();
         assert_eq!(message.id, "msg_012345");
         assert_eq!(message.role, MessageRole::Assistant);
-        assert_eq!(message.r#type, "message");
+        assert_eq!(message.r#type, MessageTag);
         assert_eq!(message.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(message.stop_sequence, Some("###".to_string()));
 
@@ -219,7 +220,7 @@ mod tests {
 
         match message.model {
             Model::Known(model) => {
-                assert_eq!(model, crate::types::KnownModel::ClaudeSonnet55);
+                assert_eq!(model, KnownModel::ClaudeSonnet55);
             }
             _ => panic!("Expected Known model variant"),
         }
@@ -248,7 +249,7 @@ mod tests {
         });
         let message: Message = serde_json::from_value(value).unwrap();
         let reason = message.diagnostics.unwrap().cache_miss_reason.unwrap();
-        assert_eq!(reason.r#type, "system_changed");
+        assert_eq!(reason.r#type, CacheMissType::SystemChanged);
         assert_eq!(reason.cache_missed_input_tokens, Some(41850));
     }
 

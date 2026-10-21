@@ -21,14 +21,14 @@ impl MessageStartEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ContentBlock, MessageRole, Model, TextBlock, Usage};
+    use crate::types::{ContentBlock, KnownModel, MessageRole, Model, TextBlock, Usage};
     use serde_json::{json, to_value};
 
     #[test]
     fn message_start_event_serialization() {
         let text_block = TextBlock::new("Hello, I'm Claude.");
         let content = vec![ContentBlock::Text(text_block)];
-        let model = Model::Known(crate::types::KnownModel::ClaudeSonnet55);
+        let model = Model::Known(KnownModel::ClaudeSonnet55);
         let usage = Usage::new(50, 100);
 
         let message = Message::new("msg_012345", content, model, usage);

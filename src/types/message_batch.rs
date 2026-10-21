@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 
-use serde::de::Error as DeError;
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::types::open_union;
-use crate::types::{Message, MessageCreateParams};
+use crate::types::wire_tag::{ErrorTag, MessageBatchDeletedTag, MessageBatchTag};
+use crate::types::{ErrorType, Message, MessageCreateParams};
 
 const MAX_MESSAGE_BATCH_REQUESTS: usize = 100_000;
 const MAX_MESSAGE_BATCH_BODY_BYTES: usize = 256 * 1024 * 1024;
@@ -274,8 +274,7 @@ pub struct MessageBatch {
     pub id: String,
 
     /// Object type, always `"message_batch"`.
-    #[serde(rename = "type")]
-    pub r#type: String,
+    r#type: MessageBatchTag,
 
     /// Current processing status for the batch.
     pub processing_status: MessageBatchProcessingStatus,
@@ -540,9 +539,8 @@ impl<'de> Deserialize<'de> for MessageBatchResultVariant {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MessageBatchErrorResponse {
-    /// Object type, normally `"error"`.
-    #[serde(rename = "type")]
-    pub r#type: String,
+    /// Object type, always `"error"`.
+    r#type: ErrorTag,
 
     /// Error details.
     pub error: MessageBatchError,
@@ -553,36 +551,25 @@ impl<'de> Deserialize<'de> for MessageBatchErrorResponse {
     where
         D: serde::Deserializer<'de>,
     {
+        /// The standard shape, `{"type": "error", "error": {...}}`.
         #[derive(Deserialize)]
-        struct Helper {
-            #[serde(rename = "type")]
-            r#type: Option<String>,
-            error: Option<MessageBatchError>,
-            message: Option<String>,
-            param: Option<String>,
+        struct Wrapped {
+            #[serde(default, rename = "type")]
+            _tag: ErrorTag,
+            error: MessageBatchError,
         }
 
-        let helper = Helper::deserialize(deserializer)?;
-        if let Some(error) = helper.error {
-            return Ok(Self {
-                r#type: helper.r#type.unwrap_or_else(|| "error".to_string()),
-                error,
-            });
-        }
-
-        let error_type = helper
-            .r#type
-            .ok_or_else(|| D::Error::missing_field("type"))?;
-        let message = helper
-            .message
-            .ok_or_else(|| D::Error::missing_field("message"))?;
+        // The `error` key, not a `type` value, tells the standard shape from the bare error
+        // details, so neither shape's `type` is read as the other's.
+        let value = Value::deserialize(deserializer)?;
+        let error = if value.get("error").is_some() {
+            open_union::from_value::<Wrapped, D::Error>(value)?.error
+        } else {
+            open_union::from_value(value)?
+        };
         Ok(Self {
-            r#type: "error".to_string(),
-            error: MessageBatchError {
-                r#type: error_type,
-                message,
-                param: helper.param,
-            },
+            r#type: ErrorTag,
+            error,
         })
     }
 }
@@ -592,8 +579,7 @@ impl<'de> Deserialize<'de> for MessageBatchErrorResponse {
 #[non_exhaustive]
 pub struct MessageBatchError {
     /// Anthropic error type.
-    #[serde(rename = "type")]
-    pub r#type: String,
+    pub r#type: ErrorType,
 
     /// Human-readable error message.
     pub message: String,
@@ -611,8 +597,7 @@ pub struct DeletedMessageBatch {
     pub id: String,
 
     /// Object type, always `"message_batch_deleted"`.
-    #[serde(rename = "type")]
-    pub r#type: String,
+    r#type: MessageBatchDeletedTag,
 }
 
 fn is_valid_custom_id(custom_id: &str) -> bool {
@@ -626,7 +611,10 @@ fn is_valid_custom_id(custom_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{KnownModel, MessageParam, Model, TextBlock, Usage};
+    use crate::types::{
+        CompactionRequest, InferenceSpeed, KnownModel, MessageParam, MessageRole, Model,
+        ServiceTierChoice, TextBlock, Usage,
+    };
     use serde_json::{json, to_value};
     use time::macros::datetime;
 
@@ -721,7 +709,7 @@ mod tests {
     #[test]
     fn batch_create_params_reject_speed() {
         let mut request = valid_batch_request("fast");
-        request.params.speed = Some(crate::types::InferenceSpeed::Fast);
+        request.params.speed = Some(InferenceSpeed::Fast);
         let params = MessageBatchCreateParams::new(vec![request]);
         let err = params.validate().unwrap_err();
         assert!(err.is_validation());
@@ -731,7 +719,7 @@ mod tests {
     #[test]
     fn batch_create_params_reject_unknown_role() {
         let mut request = valid_batch_request("unknown-role");
-        request.params.messages[0].role = crate::types::MessageRole::Unknown;
+        request.params.messages[0].role = MessageRole::Unknown;
         let params = MessageBatchCreateParams::new(vec![request]);
         let err = params.validate().unwrap_err();
         assert!(
@@ -744,9 +732,9 @@ mod tests {
     #[test]
     fn batch_create_params_serialize_new_request_fields() {
         let mut request = valid_batch_request("new-fields");
-        request.params.service_tier = Some(crate::types::ServiceTierChoice::StandardOnly);
+        request.params.service_tier = Some(ServiceTierChoice::StandardOnly);
         request.params.inference_geo = Some("us".to_string());
-        request.params.compaction = Some(crate::types::CompactionRequest::new());
+        request.params.compaction = Some(CompactionRequest::new());
         let json = serde_json::to_value(MessageBatchCreateParams::new(vec![request])).unwrap();
         let params = &json["requests"][0]["params"];
         assert_eq!(params["service_tier"], "standard_only");
@@ -801,7 +789,7 @@ mod tests {
     fn message_batch_list_response_deserialization() {
         let batch = MessageBatch {
             id: "msgbatch_123".to_string(),
-            r#type: "message_batch".to_string(),
+            r#type: MessageBatchTag,
             processing_status: MessageBatchProcessingStatus::Ended,
             request_counts: MessageBatchRequestCounts {
                 processing: 0,
@@ -877,8 +865,8 @@ mod tests {
         let result: MessageBatchResult = serde_json::from_value(json).unwrap();
         match result.result {
             MessageBatchResultVariant::Errored { error } => {
-                assert_eq!(error.r#type, "error");
-                assert_eq!(error.error.r#type, "invalid_request_error");
+                assert_eq!(error.r#type, ErrorTag);
+                assert_eq!(error.error.r#type, ErrorType::InvalidRequestError);
             }
             _ => panic!("expected errored result"),
         }
@@ -900,11 +888,44 @@ mod tests {
         let result: MessageBatchResult = serde_json::from_value(json).unwrap();
         match result.result {
             MessageBatchResultVariant::Errored { error } => {
-                assert_eq!(error.r#type, "error");
-                assert_eq!(error.error.r#type, "invalid_request_error");
+                assert_eq!(error.r#type, ErrorTag);
+                assert_eq!(error.error.r#type, ErrorType::InvalidRequestError);
             }
             _ => panic!("expected errored result"),
         }
+    }
+
+    #[test]
+    fn batch_error_shapes_read_their_type_without_warnings() {
+        let standard = json!({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "Overloaded"}
+        });
+        let direct = json!({"type": "overloaded_error", "message": "Overloaded"});
+        for shape in [standard.clone(), direct] {
+            let (error, warnings) = crate::test_support::unknown_warnings(|| {
+                serde_json::from_value::<MessageBatchErrorResponse>(shape).unwrap()
+            });
+            assert_eq!(warnings, Vec::<String>::new());
+            assert_eq!(error.error.r#type, ErrorType::OverloadedError);
+            assert_eq!(to_value(&error).unwrap(), standard);
+        }
+
+        let (error, warnings) = crate::test_support::unknown_warnings(|| {
+            serde_json::from_value::<MessageBatchErrorResponse>(json!({
+                "type": "error_v2",
+                "error": {"type": "brewing_error", "message": "Busy"}
+            }))
+            .unwrap()
+        });
+        assert_eq!(error.error.r#type, ErrorType::Unknown);
+        assert_eq!(
+            warnings,
+            [
+                "rust_type=ErrorTag tag=error_v2",
+                "rust_type=ErrorType tag=brewing_error"
+            ]
+        );
     }
 
     #[test]
@@ -935,7 +956,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(deleted.id, "msgbatch_123");
-        assert_eq!(deleted.r#type, "message_batch_deleted");
+        assert_eq!(deleted.r#type, MessageBatchDeletedTag);
     }
 
     #[test]

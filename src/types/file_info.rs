@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::types::wire_tag::{FileDeletedTag, FileTag};
+
 /// Metadata for a file stored through the Files API.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
@@ -8,8 +10,8 @@ pub struct FileInfo {
     /// Unique file identifier.
     pub id: String,
 
-    /// Object type; always `"file"`.
-    pub r#type: String,
+    /// Object type, always `"file"`.
+    r#type: FileTag,
 
     /// Original filename of the uploaded file.
     pub filename: String,
@@ -107,8 +109,8 @@ pub struct DeletedFile {
     /// ID of the deleted file.
     pub id: String,
 
-    /// Object type; always `"file_deleted"`.
-    pub r#type: String,
+    /// Object type, always `"file_deleted"`.
+    r#type: FileDeletedTag,
 }
 
 #[cfg(test)]

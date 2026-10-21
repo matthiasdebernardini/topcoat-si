@@ -4,18 +4,34 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{error, fmt, io};
 
+use crate::jev::JevErrorCode;
+use crate::types::ErrorType;
+
 /// Diagnostics shared by every HTTP response error.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HttpMetadata {
     /// HTTP status code.
     pub status: u16,
-    /// The API's `error.type`, when the body had one.
-    pub error_type: Option<String>,
+    /// The service's error code, when the body had one.
+    pub error_code: Option<ErrorCode>,
     /// The `request-id` header or body field.
     pub request_id: Option<String>,
     /// The delay from the `retry-after` header.
     pub retry_after: Option<Duration>,
+}
+
+/// The error code an HTTP error body carried, by service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorCode {
+    /// An Anthropic API error: the body's `error.type`.
+    Anthropic(ErrorType),
+    /// A Jev error: the body's `detail.error_type`, or a code this client sets itself.
+    Jev(JevErrorCode),
+    /// A Firecrawl error: the body's `code` as sent. Firecrawl documents codes only for some
+    /// statuses, so the set is open.
+    Firecrawl(String),
 }
 
 /// SDK failure, with original sources retained when available.
@@ -277,7 +293,7 @@ impl Error {
     #[must_use]
     pub fn api(
         status: u16,
-        error_type: Option<String>,
+        error_code: Option<ErrorCode>,
         message: impl Into<String>,
         request_id: Option<String>,
     ) -> Self {
@@ -285,7 +301,7 @@ impl Error {
             message,
             HttpMetadata {
                 status,
-                error_type,
+                error_code,
                 request_id,
                 retry_after: None,
             },

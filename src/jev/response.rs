@@ -129,8 +129,11 @@ impl JevResponse {
                 )
             })?;
         match answer {
-            Answer::Unknown { kind, .. } => Err(Error::serialization(
-                format!("Jev answer {name:?} has type {kind:?}, which this client does not know"),
+            Answer::Unknown(raw) => Err(Error::serialization(
+                format!(
+                    "Jev answer {name:?} has type {:?}, which this client does not know",
+                    answer::type_tag(raw)
+                ),
                 None,
             )),
             Answer::Malformed { kind, .. } => Err(Error::serialization(
@@ -251,7 +254,7 @@ fn wrong_type(name: &str, answer: &Answer, expected: &str) -> Error {
         Answer::Noul(_) => "noul",
         Answer::Choice(_) => "choice",
         Answer::Score(_) => "score",
-        Answer::Unknown { .. } => "unknown",
+        Answer::Unknown(_) => "unknown",
         Answer::Malformed { .. } => "malformed answer",
     };
     Error::validation(

@@ -744,7 +744,7 @@ Reads are billed at the model's cache read rate (the `cache_read` field of `Toke
 1. On the first turn, pass `DiagnosticsRequest::first_turn()` to `with_diagnostics`.
 2. On later turns, pass `DiagnosticsRequest::after(previous_id)` instead.
 3. Read `message.diagnostics`, an `Option`. Its `cache_miss_reason` names the earliest difference.
-4. The reason's `r#type` holds the kind, such as `tools_changed`.
+4. The reason's `r#type` is a `CacheMissType`, such as `CacheMissType::ToolsChanged`.
 5. `is_changed()` says whether the kind is one of the four `*_changed` kinds.
 
 ## Message Batches
@@ -859,7 +859,7 @@ The crate also emits plain tracing events. Aggregate them with any subscriber. D
 
 Each `topcoat_si::jev` event also carries `status`, `attempt`, `request_id` and `model`.
 
-An API value this crate does not know, such as a new stop reason or content block type, is kept as the type's `Unknown` variant. An unknown stream event is skipped. Either is logged as a warning on `topcoat_si::unknown` the first time each distinct value appears in the process, without its payload. The message reads "unknown API value; update topcoat-si to read it".
+An API value this crate does not know, such as a new stop reason or content block type, is kept as the type's `Unknown` variant. An unknown stream event is skipped. Either is logged as a warning on `topcoat_si::unknown` the first time each distinct value appears in the process, without its payload. The message reads "unknown API value; update topcoat-si to read it". A constant `type` tag, such as `message` on a `Message`, is checked the same way: another value is logged and the reply still parses.
 
 **Warning:** `topcoat_si::wire` logs full request and response bodies, prompts included. Turning on `topcoat_si=trace` logs user content.
 
@@ -913,6 +913,7 @@ Upload a file once and refer to it in later requests instead of resending it.
 |---|---|
 | `upload_file` | stores the file |
 | `DocumentBlock::from_file_id` | refers to it in a message |
+| `ImageSource::File` | refers to an uploaded image, inside `ImageBlock::new` |
 | `delete_file` | removes it |
 
 ```rust,no_run

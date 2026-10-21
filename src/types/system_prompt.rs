@@ -1,13 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::TextBlock;
+use crate::types::wire_tag::TextTag;
 
 /// A wrapper around TextBlock for system prompts that includes a type field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SystemTextBlock {
-    /// The type field, always "text".
-    pub r#type: String,
+    /// Block type, always `"text"`.
+    r#type: TextTag,
 
     /// The text content.
     #[serde(flatten)]
@@ -26,19 +27,13 @@ pub enum SystemPrompt {
 }
 
 impl SystemPrompt {
-    /// Create a new SystemPrompt from a string.
-    #[must_use]
-    pub fn from_string(content: impl Into<String>) -> Self {
-        Self::String(content.into())
-    }
-
     /// Create a new SystemPrompt from text blocks.
     #[must_use]
     pub fn from_blocks(blocks: Vec<TextBlock>) -> Self {
         let system_blocks = blocks
             .into_iter()
             .map(|block| SystemTextBlock {
-                r#type: "text".to_string(),
+                r#type: TextTag,
                 block,
             })
             .collect();
@@ -63,7 +58,7 @@ impl From<Vec<TextBlock>> for SystemPrompt {
         let system_blocks = blocks
             .into_iter()
             .map(|block| SystemTextBlock {
-                r#type: "text".to_string(),
+                r#type: TextTag,
                 block,
             })
             .collect();
@@ -99,7 +94,7 @@ mod tests {
 
     #[test]
     fn from_string() {
-        let prompt = SystemPrompt::from_string("Hello");
+        let prompt = SystemPrompt::from("Hello");
         assert_eq!(prompt, SystemPrompt::String("Hello".to_string()));
 
         let prompt: SystemPrompt = "Hello".into();
@@ -114,7 +109,7 @@ mod tests {
         let blocks = vec![TextBlock::new("Hello")];
         let prompt = SystemPrompt::from_blocks(blocks.clone());
         let expected_blocks = vec![SystemTextBlock {
-            r#type: "text".to_string(),
+            r#type: TextTag,
             block: TextBlock::new("Hello"),
         }];
         assert_eq!(prompt, SystemPrompt::Blocks(expected_blocks.clone()));

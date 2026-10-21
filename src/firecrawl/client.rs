@@ -13,7 +13,7 @@ use tokio::time::sleep;
 use super::{ScrapeRequest, ScrapeResponse, SearchRequest, SearchResponse};
 use crate::backoff;
 use crate::base_url;
-use crate::error::{Error, HttpMetadata, RequestPhase, Result, map_reqwest_error};
+use crate::error::{Error, ErrorCode, HttpMetadata, RequestPhase, Result, map_reqwest_error};
 use crate::types::retry_after_from_headers;
 
 const DEFAULT_BASE_URL: &str = "https://api.firecrawl.dev";
@@ -263,7 +263,7 @@ fn http_error(status: u16, body: &[u8], retry_after: Option<Duration>) -> Error 
     };
     let metadata = HttpMetadata {
         status,
-        error_type: code,
+        error_code: code.map(ErrorCode::Firecrawl),
         request_id: None,
         retry_after,
     };

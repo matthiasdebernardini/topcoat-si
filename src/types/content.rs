@@ -70,6 +70,7 @@ impl From<ImageBlock> for Content {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Base64ImageSource, ImageMediaType, ImageSource};
     use serde_json::{json, to_value};
 
     #[test]
@@ -89,11 +90,11 @@ mod tests {
 
     #[test]
     fn content_image_serialization() {
-        let base64_source = crate::types::Base64ImageSource::new(
+        let base64_source = Base64ImageSource::new(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==",
-            crate::types::ImageMediaType::Png,
+            ImageMediaType::Png,
         );
-        let image_block = ImageBlock::new_with_base64(base64_source);
+        let image_block = ImageBlock::new(ImageSource::Base64(base64_source));
         let content = Content::Image(image_block);
 
         let json = to_value(&content).unwrap();
@@ -160,9 +161,8 @@ mod tests {
 
     #[test]
     fn from_image_block() {
-        let base64_source =
-            crate::types::Base64ImageSource::new("data", crate::types::ImageMediaType::Png);
-        let image_block = ImageBlock::new_with_base64(base64_source);
+        let base64_source = Base64ImageSource::new("data", ImageMediaType::Png);
+        let image_block = ImageBlock::new(ImageSource::Base64(base64_source));
         let content = Content::from(image_block);
 
         match content {

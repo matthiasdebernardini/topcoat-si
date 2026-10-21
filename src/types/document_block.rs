@@ -121,30 +121,6 @@ impl DocumentBlock {
         }
     }
 
-    /// Create a new `DocumentBlock` with a Base64 PDF source.
-    #[must_use]
-    pub fn new_with_base64_pdf(source: Base64PdfSource) -> Self {
-        Self::new(DocumentSource::Base64Pdf(source))
-    }
-
-    /// Create a new `DocumentBlock` with a plain text source.
-    #[must_use]
-    pub fn new_with_plain_text(source: PlainTextSource) -> Self {
-        Self::new(DocumentSource::PlainText(source))
-    }
-
-    /// Create a new `DocumentBlock` with a content block source.
-    #[must_use]
-    pub fn new_with_content_block(source: ContentBlockSourceParam) -> Self {
-        Self::new(DocumentSource::ContentBlock(source))
-    }
-
-    /// Create a new `DocumentBlock` with a URL PDF source.
-    #[must_use]
-    pub fn new_with_url_pdf(source: UrlPdfSource) -> Self {
-        Self::new(DocumentSource::UrlPdf(source))
-    }
-
     /// Create a new `DocumentBlock` referencing a file uploaded through the Files API.
     #[must_use]
     pub fn from_file_id(file_id: impl Into<String>) -> Self {
@@ -190,7 +166,7 @@ mod tests {
         let base64_source =
             Base64PdfSource::new("data:application/pdf;base64,JVBERi0xLjcKJeLjz9MKN");
 
-        let document_block = DocumentBlock::new_with_base64_pdf(base64_source);
+        let document_block = DocumentBlock::new(base64_source.into());
         let json = to_value(&document_block).unwrap();
 
         assert_eq!(
@@ -209,7 +185,7 @@ mod tests {
     fn document_block_with_plain_text() {
         let text_source = PlainTextSource::new("Sample text content");
 
-        let document_block = DocumentBlock::new_with_plain_text(text_source);
+        let document_block = DocumentBlock::new(text_source.into());
         let json = to_value(&document_block).unwrap();
 
         assert_eq!(
@@ -228,7 +204,7 @@ mod tests {
     fn document_block_with_content_block() {
         let content_source = ContentBlockSourceParam::new_with_string("Sample content");
 
-        let document_block = DocumentBlock::new_with_content_block(content_source);
+        let document_block = DocumentBlock::new(content_source.into());
         let json = to_value(&document_block).unwrap();
 
         assert_eq!(
@@ -246,7 +222,7 @@ mod tests {
     fn document_block_with_url_pdf() {
         let url_source = UrlPdfSource::new("https://example.com/document.pdf");
 
-        let document_block = DocumentBlock::new_with_url_pdf(url_source);
+        let document_block = DocumentBlock::new(url_source.into());
         let json = to_value(&document_block).unwrap();
 
         assert_eq!(
@@ -266,7 +242,7 @@ mod tests {
         let cache_control = CacheControlEphemeral::new();
         let citations = CitationsConfig::enabled();
 
-        let document_block = DocumentBlock::new_with_url_pdf(url_source)
+        let document_block = DocumentBlock::new(url_source.into())
             .with_cache_control(cache_control)
             .with_citations(citations)
             .with_context("Document context")

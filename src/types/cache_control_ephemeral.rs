@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::CacheTtl;
+use crate::types::wire_tag::EphemeralTag;
 
 /// Marks a prompt-cache breakpoint: the API caches the prompt prefix up to and
 /// including the block that carries it.
@@ -10,17 +11,13 @@ use crate::types::CacheTtl;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct CacheControlEphemeral {
-    /// The type is always "ephemeral" for this struct
-    #[serde(default = "default_type")]
-    pub r#type: String,
+    /// Cache type, always `"ephemeral"`.
+    #[serde(default)]
+    r#type: EphemeralTag,
 
     /// How long the cache breakpoint lives. Omitted means five minutes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<CacheTtl>,
-}
-
-fn default_type() -> String {
-    "ephemeral".to_string()
 }
 
 impl CacheControlEphemeral {
@@ -28,7 +25,7 @@ impl CacheControlEphemeral {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            r#type: default_type(),
+            r#type: EphemeralTag,
             ttl: None,
         }
     }
@@ -72,7 +69,7 @@ mod tests {
         let json = serde_json::json!({"type": "ephemeral"});
         let cache_control: CacheControlEphemeral = serde_json::from_value(json).unwrap();
 
-        assert_eq!(cache_control.r#type, "ephemeral");
+        assert_eq!(cache_control.r#type, EphemeralTag);
         assert_eq!(cache_control.ttl, None);
     }
 

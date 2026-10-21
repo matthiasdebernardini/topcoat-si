@@ -643,8 +643,8 @@ mod tests {
     #[tokio::test]
     async fn response_fields_are_carried_into_final_message() {
         use crate::{
-            AppliedEdit, CacheDiagnostics, CacheMissReason, ContainerInfo,
-            ContextManagementResponse,
+            AppliedEdit, AppliedEditType, CacheDiagnostics, CacheMissReason, CacheMissType,
+            ContainerInfo, ContextManagementResponse,
         };
 
         let mut start_message = Message::new(
@@ -660,7 +660,7 @@ mod tests {
         });
         start_message.diagnostics = Some(CacheDiagnostics {
             cache_miss_reason: Some(CacheMissReason {
-                r#type: CacheMissReason::SYSTEM_CHANGED.to_string(),
+                r#type: CacheMissType::SystemChanged,
                 cache_missed_input_tokens: Some(10),
             }),
         });
@@ -674,7 +674,7 @@ mod tests {
         let mut delta_event = MessageDeltaEvent::new(message_delta, MessageDeltaUsage::new(5));
         delta_event.context_management = Some(ContextManagementResponse {
             applied_edits: vec![AppliedEdit {
-                r#type: "clear_tool_uses_20250919".to_string(),
+                r#type: AppliedEditType::ClearToolUses20250919,
                 cleared_input_tokens: Some(12000),
                 cleared_tool_uses: Some(4),
                 cleared_thinking_turns: None,
@@ -702,7 +702,7 @@ mod tests {
                 .cache_miss_reason
                 .unwrap()
                 .r#type,
-            "system_changed"
+            CacheMissType::SystemChanged
         );
         assert_eq!(
             message.context_management.unwrap().applied_edits[0].cleared_tool_uses,

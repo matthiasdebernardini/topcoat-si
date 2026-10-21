@@ -22,6 +22,7 @@ mod context_management;
 mod cost_report;
 mod diagnostics;
 mod document_block;
+mod error_type;
 mod fallback_block;
 mod fallback_credit;
 mod fallbacks;
@@ -33,7 +34,6 @@ mod message;
 mod message_batch;
 mod message_count_tokens_params;
 mod message_create_params;
-mod message_create_template;
 mod message_delta_event;
 mod message_delta_usage;
 mod message_param;
@@ -100,6 +100,7 @@ mod tool_search_tool;
 mod tool_search_tool_result_block;
 mod web_fetch_tool;
 mod web_fetch_tool_result_block;
+mod wire_tag;
 
 // Exports
 pub use base64_image_source::{Base64ImageSource, ImageMediaType};
@@ -129,12 +130,15 @@ pub use content_block_source_param::{ContentBlockSourceContent, ContentBlockSour
 pub use content_block_start_event::ContentBlockStartEvent;
 pub use content_block_stop_event::ContentBlockStopEvent;
 pub use context_management::{
-    AppliedEdit, ContextEdit, ContextManagement, ContextManagementResponse, ContextTrigger,
-    CountTokensContextManagement, KeepToolUses, ThinkingKeep,
+    AppliedEdit, AppliedEditType, ContextEdit, ContextManagement, ContextManagementResponse,
+    ContextTrigger, CountTokensContextManagement, KeepToolUses, ThinkingKeep,
 };
-pub use cost_report::{CostBucket, CostBucketResult, CostGroupBy, CostReport, CostReportParams};
-pub use diagnostics::{CacheDiagnostics, CacheMissReason, DiagnosticsRequest};
+pub use cost_report::{
+    CostBucket, CostBucketResult, CostGroupBy, CostReport, CostReportParams, CostType, TokenType,
+};
+pub use diagnostics::{CacheDiagnostics, CacheMissReason, CacheMissType, DiagnosticsRequest};
 pub use document_block::{DocumentBlock, DocumentSource};
+pub use error_type::ErrorType;
 pub use fallback_block::{FallbackBlock, FallbackModel};
 pub use fallback_credit::{FallbackCredit, FallbackCreditReason, FallbackCreditStatus};
 pub use fallbacks::{FallbackConfig, Fallbacks};
@@ -156,7 +160,6 @@ pub use message_batch::{
 };
 pub use message_count_tokens_params::MessageCountTokensParams;
 pub use message_create_params::MessageCreateParams;
-pub use message_create_template::MessageCreateTemplate;
 pub use message_delta_event::{MessageDelta, MessageDeltaEvent};
 pub use message_delta_usage::MessageDeltaUsage;
 pub use message_param::{MessageParam, MessageParamContent, MessageRole};
@@ -189,7 +192,7 @@ pub use server_tool_use_block::ServerToolUseBlock;
 pub use service_tier::ServiceTier;
 pub use service_tier_choice::ServiceTierChoice;
 pub use signature_delta::SignatureDelta;
-pub use stop_details::StopDetails;
+pub use stop_details::{StopDetails, StopDetailsType};
 pub use stop_reason::{StopReason, StopReasonParseError};
 pub use system_prompt::{SystemPrompt, SystemTextBlock};
 pub use text_block::TextBlock;
@@ -218,7 +221,8 @@ pub use usage::Usage;
 pub use usage_iteration::{IterationUsage, UsageIteration};
 pub use usage_report::{
     BucketWidth, UsageBucket, UsageBucketResult, UsageGroupBy, UsageReport,
-    UsageReportCacheCreation, UsageReportParams,
+    UsageReportCacheCreation, UsageReportParams, UsageReportServiceTier,
 };
 pub use web_fetch_tool::WebFetchTool;
 pub use web_fetch_tool_result_block::{WebFetchToolResultBlock, WebFetchToolResultContent};
+pub(crate) use wire_tag::PdfTag;

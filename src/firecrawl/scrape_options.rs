@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::error::{Error, Result};
+use crate::types::PdfTag;
 
 const MIN_SCRAPE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SCRAPE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -95,7 +96,7 @@ impl ScrapeOptions {
             timeout: self.timeout.map(millis),
             parsers: self.pdf_max_pages.map(|max_pages| {
                 vec![WireParser {
-                    kind: "pdf",
+                    kind: PdfTag,
                     max_pages,
                 }]
             }),
@@ -125,6 +126,6 @@ pub(super) struct WireScrapeOptions {
 #[serde(rename_all = "camelCase")]
 pub(super) struct WireParser {
     #[serde(rename = "type")]
-    kind: &'static str,
+    kind: PdfTag,
     max_pages: u32,
 }

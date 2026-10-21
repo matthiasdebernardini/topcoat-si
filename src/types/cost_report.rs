@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 
-use crate::types::usage_report;
+use crate::types::{InferenceSpeed, ServiceTier, open_union, usage_report};
 
 /// A dimension to group cost-report results by.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -115,21 +115,21 @@ pub struct CostBucketResult {
     /// Line-item description, when grouped by description.
     #[serde(default)]
     pub description: Option<String>,
-    /// Cost type, for example `"tokens"`.
+    /// What the cost is for, when grouped by description.
     #[serde(default)]
-    pub cost_type: Option<String>,
+    pub cost_type: Option<CostType>,
     /// Model identifier, when grouped by description.
     #[serde(default)]
     pub model: Option<String>,
-    /// Service tier, when grouped by description.
+    /// Service tier, when grouped by description; `standard` or `batch`.
     #[serde(default)]
-    pub service_tier: Option<String>,
+    pub service_tier: Option<ServiceTier>,
     /// Inference speed, when grouped by description.
     #[serde(default)]
-    pub speed: Option<String>,
+    pub speed: Option<InferenceSpeed>,
     /// Token type, when grouped by description.
     #[serde(default)]
-    pub token_type: Option<String>,
+    pub token_type: Option<TokenType>,
     /// Context window, when grouped by description.
     #[serde(default)]
     pub context_window: Option<String>,
@@ -165,6 +165,86 @@ impl CostBucketResult {
             .ok()?
             .checked_mul(1_000_000)?
             .checked_add(padded.parse::<u64>().ok()?)
+    }
+}
+
+/// What a cost-report line is for.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CostType {
+    /// Code execution.
+    CodeExecution,
+    /// Session usage.
+    SessionUsage,
+    /// Model tokens.
+    Tokens,
+    /// Web search.
+    WebSearch,
+    /// A cost type this crate does not know.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for CostType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "CostType",
+            |value| match value {
+                "code_execution" => Some(Self::CodeExecution),
+                "session_usage" => Some(Self::SessionUsage),
+                "tokens" => Some(Self::Tokens),
+                "web_search" => Some(Self::WebSearch),
+                _ => None,
+            },
+            Self::Unknown,
+        )
+    }
+}
+
+/// The kind of token a cost-report line bills.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
+#[non_exhaustive]
+pub enum TokenType {
+    /// Input tokens neither read from nor written to the cache.
+    #[serde(rename = "uncached_input_tokens")]
+    UncachedInputTokens,
+    /// Output tokens.
+    #[serde(rename = "output_tokens")]
+    OutputTokens,
+    /// Input tokens read from the cache.
+    #[serde(rename = "cache_read_input_tokens")]
+    CacheReadInputTokens,
+    /// Input tokens written to the 5-minute cache.
+    #[serde(rename = "cache_creation.ephemeral_5m_input_tokens")]
+    CacheCreationEphemeral5mInputTokens,
+    /// Input tokens written to the 1-hour cache.
+    #[serde(rename = "cache_creation.ephemeral_1h_input_tokens")]
+    CacheCreationEphemeral1hInputTokens,
+    /// A token type this crate does not know.
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for TokenType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "TokenType",
+            |value| match value {
+                "uncached_input_tokens" => Some(Self::UncachedInputTokens),
+                "output_tokens" => Some(Self::OutputTokens),
+                "cache_read_input_tokens" => Some(Self::CacheReadInputTokens),
+                "cache_creation.ephemeral_5m_input_tokens" => {
+                    Some(Self::CacheCreationEphemeral5mInputTokens)
+                }
+                "cache_creation.ephemeral_1h_input_tokens" => {
+                    Some(Self::CacheCreationEphemeral1hInputTokens)
+                }
+                _ => None,
+            },
+            Self::Unknown,
+        )
     }
 }
 
@@ -233,14 +313,25 @@ mod tests {
             result.description.as_deref(),
             Some("Claude Opus 5.5 Usage - Input Tokens")
         );
-        assert_eq!(result.cost_type.as_deref(), Some("tokens"));
+        assert_eq!(result.cost_type, Some(CostType::Tokens));
+        assert_eq!(result.speed, Some(InferenceSpeed::Standard));
         assert_eq!(result.model.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(
-            result.token_type.as_deref(),
-            Some("cache_creation.ephemeral_1h_input_tokens")
+            result.token_type,
+            Some(TokenType::CacheCreationEphemeral1hInputTokens)
         );
         assert_eq!(result.inference_geo.as_deref(), Some("global"));
         assert_eq!(result.amount_micro_cents(), Some(123_789_120));
+    }
+
+    #[test]
+    fn unknown_cost_speed_parses_and_warns_once() {
+        let line = serde_json::json!({"amount": "1", "currency": "USD", "speed": "ludicrous"});
+        let (result, warnings) = crate::test_support::unknown_warnings(|| {
+            serde_json::from_value::<CostBucketResult>(line).unwrap()
+        });
+        assert_eq!(result.speed, Some(InferenceSpeed::Unknown));
+        assert_eq!(warnings, ["rust_type=InferenceSpeed tag=ludicrous"]);
     }
 
     #[test]

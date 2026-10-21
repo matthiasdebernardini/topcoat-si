@@ -5,11 +5,12 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{Value, json};
+use tokio::net::TcpListener;
 
 use super::client::DEFAULT_BASE_URL;
 use super::*;
 use crate::ClientTool;
-use crate::error::Error;
+use crate::error::{Error, ErrorCode};
 use crate::test_support::{Canned, Recorded, serve, uses_proxies};
 use crate::types::{
     Content, ToolResultBlock, ToolResultBlockContent, ToolUnionParam, ToolUseBlock,
@@ -432,6 +433,46 @@ fn rounded_probabilities_are_accepted() {
     assert_eq!(response.usage, JevUsage::default());
 }
 
+#[test]
+fn detail_error_type_maps_to_a_jev_code_and_warns_once_when_unknown() {
+    let (codes, warnings) = crate::test_support::unknown_warnings(|| {
+        [
+            JevErrorCode::from_detail("max_tokens_exceeded"),
+            JevErrorCode::from_detail("quota_melted"),
+            JevErrorCode::from_detail("quota_melted"),
+        ]
+    });
+    assert_eq!(
+        codes,
+        [
+            JevErrorCode::MaxTokensExceeded,
+            JevErrorCode::Unknown,
+            JevErrorCode::Unknown
+        ]
+    );
+    assert_eq!(warnings, ["rust_type=JevErrorCode tag=quota_melted"]);
+}
+
+#[test]
+fn unknown_answer_type_is_logged_once_without_its_payload() {
+    let raw = json!({"type": "hologram_answer", "secret": "user text"});
+    let (answers, warnings) = crate::test_support::unknown_warnings(|| {
+        [
+            super::answer::parse_answer(raw.clone()),
+            super::answer::parse_answer(raw.clone()),
+        ]
+    });
+    assert_eq!(
+        answers,
+        [Answer::Unknown(raw.clone()), Answer::Unknown(raw)]
+    );
+    assert_eq!(warnings, ["rust_type=Answer tag=hologram_answer"]);
+    let debug = format!("{:?}", answers[0]);
+    assert!(debug.contains("hologram_answer"), "{debug}");
+    assert!(debug.contains("raw_bytes"), "{debug}");
+    assert!(!debug.contains("user text"), "{debug}");
+}
+
 #[tokio::test]
 async fn unknown_answer_type_is_kept_and_reported_at_extraction() {
     let (url, _) = serve(vec![ok(json!({
@@ -454,10 +495,7 @@ async fn unknown_answer_type_is_kept_and_reported_at_extraction() {
     assert_eq!(response.noul("refund").unwrap(), 0.97);
     assert_eq!(
         response.answers[1].answer,
-        Answer::Unknown {
-            kind: "ranking".to_string(),
-            raw: json!({"type": "ranking", "ranking": ["a", "b"]})
-        }
+        Answer::Unknown(json!({"type": "ranking", "ranking": ["a", "b"]}))
     );
     let error = response.noul("order").unwrap_err();
     assert!(error.to_string().contains("\"order\""), "{error}");
@@ -610,7 +648,11 @@ async fn unauthorized_json_is_an_authentication_error() {
         .unwrap_err();
     assert!(error.is_authentication(), "{error}");
     let metadata = error.metadata().unwrap();
-    assert_eq!(metadata.error_type.as_deref(), Some("authentication_error"));
+    // TypeSafe documents only `max_tokens_exceeded`, so this code is unknown.
+    assert_eq!(
+        metadata.error_code,
+        Some(ErrorCode::Jev(JevErrorCode::Unknown))
+    );
     assert_eq!(error.request_id(), Some("req_401"));
     assert!(
         error
@@ -635,8 +677,8 @@ async fn forbidden_html_is_an_edge_block() {
         .unwrap_err();
     assert!(error.is_permission(), "{error}");
     assert_eq!(
-        error.metadata().unwrap().error_type.as_deref(),
-        Some("edge_blocked")
+        error.metadata().unwrap().error_code,
+        Some(ErrorCode::Jev(JevErrorCode::EdgeBlocked))
     );
     assert_eq!(error.request_id(), Some("8f2a-IAD"));
     let text = error.to_string();
@@ -668,6 +710,10 @@ async fn bad_request_details_are_mapped() {
 
     let error = jev.ask("s", &questions).await.unwrap_err();
     assert!(error.is_bad_request(), "{error}");
+    assert_eq!(
+        error.metadata().unwrap().error_code,
+        Some(ErrorCode::Jev(JevErrorCode::MaxTokensExceeded))
+    );
     assert!(
         error
             .to_string()
@@ -677,8 +723,8 @@ async fn bad_request_details_are_mapped() {
 
     let error = jev.ask("s", &questions).await.unwrap_err();
     assert_eq!(
-        error.metadata().unwrap().error_type.as_deref(),
-        Some("api_usage_error")
+        error.metadata().unwrap().error_code,
+        Some(ErrorCode::Jev(JevErrorCode::Unknown))
     );
     assert!(error.to_string().contains("Unknown model jev-9"), "{error}");
 
@@ -1204,7 +1250,7 @@ async fn blank_and_garbage_retry_after_fall_back_to_backoff() {
 
 #[tokio::test]
 async fn connection_refused_is_retried() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
     let started = Instant::now();
@@ -1309,7 +1355,10 @@ fn malformed_known_answer_is_reported_per_question() {
     }
     assert!(matches!(
         &response.answers[1].answer,
-        Answer::Malformed { kind, .. } if kind == "noul"
+        Answer::Malformed {
+            kind: AnswerKind::Noul,
+            ..
+        }
     ));
     let error = response.noul("other").unwrap_err();
     assert!(error.to_string().contains("does not know"), "{error}");

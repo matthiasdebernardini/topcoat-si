@@ -4,9 +4,9 @@ use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Answer, JevClient, JevResponse, NamedAnswer, Questions};
+use super::{Answer, JevClient, JevErrorCode, JevResponse, NamedAnswer, Questions};
 use crate::client_tool::ClientTool;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::types::{TextBlock, ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock};
 
 const TOOL_NAME: &str = "jev";
@@ -204,7 +204,10 @@ pub(crate) fn is_fatal(error: &Error) -> bool {
     match error.status_code() {
         // A 2xx here means the body read failed after the headers arrived.
         Some(200..=299 | 400 | 408 | 413 | 422 | 429 | 500..=599) => false,
-        Some(403) => error.metadata().and_then(|m| m.error_type.as_deref()) != Some("edge_blocked"),
+        Some(403) => {
+            error.metadata().and_then(|m| m.error_code.as_ref())
+                != Some(&ErrorCode::Jev(JevErrorCode::EdgeBlocked))
+        }
         Some(_) => true,
         None => false,
     }
@@ -295,7 +298,7 @@ pub(crate) fn answers(
                     "probabilities": score.probabilities
                 })
             }
-            Answer::Unknown { raw, .. } => raw.clone(),
+            Answer::Unknown(raw) => raw.clone(),
             Answer::Malformed { kind, .. } => {
                 json!({"type": kind, "error": "Jev's answer could not be read"})
             }

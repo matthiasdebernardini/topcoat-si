@@ -110,7 +110,7 @@ fn print_result(result: &MessageBatchResult) {
         }
         MessageBatchResultVariant::Errored { error } => {
             println!(
-                "{} errored: {}: {}",
+                "{} errored: {:?}: {}",
                 result.custom_id, error.error.r#type, error.error.message
             );
         }

@@ -92,22 +92,6 @@ impl ThinkingConfig {
         Self::Enabled { budget_tokens }
     }
 
-    /// Create a new enabled thinking configuration that requests summarized thinking.
-    ///
-    /// Budget tokens must be ≥1024.
-    #[must_use]
-    pub fn enabled_summarized(budget_tokens: u32) -> Self {
-        Self::enabled(budget_tokens).with_display(ThinkingDisplay::Summarized)
-    }
-
-    /// Create a new enabled thinking configuration that omits thinking text.
-    ///
-    /// Budget tokens must be ≥1024.
-    #[must_use]
-    pub fn enabled_omitted(budget_tokens: u32) -> Self {
-        Self::enabled(budget_tokens).with_display(ThinkingDisplay::Omitted)
-    }
-
     /// Create a new disabled thinking configuration.
     #[must_use]
     pub fn disabled() -> Self {
@@ -126,26 +110,6 @@ impl ThinkingConfig {
     #[must_use]
     pub fn adaptive() -> Self {
         Self::Adaptive
-    }
-
-    /// Create a new adaptive thinking configuration that requests summarized thinking.
-    #[must_use]
-    pub fn adaptive_summarized() -> Self {
-        Self::adaptive().with_display(ThinkingDisplay::Summarized)
-    }
-
-    /// Create a new adaptive thinking configuration that omits thinking text.
-    #[must_use]
-    pub fn adaptive_omitted() -> Self {
-        Self::adaptive().with_display(ThinkingDisplay::Omitted)
-    }
-
-    /// Create adaptive thinking that emits readable progress updates.
-    ///
-    /// Requires the `thinking-display-updates-2026-08-18` beta header.
-    #[must_use]
-    pub fn adaptive_updates() -> Self {
-        Self::adaptive().with_display(ThinkingDisplay::Updates)
     }
 
     /// Set how thinking content should be returned.
@@ -237,22 +201,31 @@ impl<'de> Deserialize<'de> for ThinkingConfig {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Kind {
+            Disabled,
+            Adaptive,
+            BetweenTools,
+            Enabled,
+        }
+
+        #[derive(Deserialize)]
         struct RawThinkingConfig {
             #[serde(rename = "type")]
-            kind: String,
+            kind: Kind,
             budget_tokens: Option<u32>,
             display: Option<ThinkingDisplay>,
         }
 
         let raw = RawThinkingConfig::deserialize(deserializer)?;
-        match raw.kind.as_str() {
-            "disabled" => Ok(ThinkingConfig::Disabled),
-            "between_tools" => Ok(ThinkingConfig::BetweenTools),
-            "adaptive" => Ok(match raw.display {
+        match raw.kind {
+            Kind::Disabled => Ok(ThinkingConfig::Disabled),
+            Kind::BetweenTools => Ok(ThinkingConfig::BetweenTools),
+            Kind::Adaptive => Ok(match raw.display {
                 Some(display) => ThinkingConfig::AdaptiveWithDisplay { display },
                 None => ThinkingConfig::Adaptive,
             }),
-            "enabled" => {
+            Kind::Enabled => {
                 let budget_tokens = raw
                     .budget_tokens
                     .ok_or_else(|| de::Error::missing_field("budget_tokens"))?;
@@ -264,10 +237,6 @@ impl<'de> Deserialize<'de> for ThinkingConfig {
                     None => ThinkingConfig::Enabled { budget_tokens },
                 })
             }
-            other => Err(de::Error::unknown_variant(
-                other,
-                &["disabled", "adaptive", "between_tools", "enabled"],
-            )),
         }
     }
 }
@@ -394,7 +363,7 @@ mod tests {
 
     #[test]
     fn thinking_config_enabled_summarized_serialization() {
-        let config = ThinkingConfig::enabled_summarized(2048);
+        let config = ThinkingConfig::enabled(2048).with_display(ThinkingDisplay::Summarized);
         let json = to_value(config).unwrap();
 
         assert_eq!(
@@ -409,7 +378,7 @@ mod tests {
 
     #[test]
     fn thinking_config_adaptive_summarized_serialization() {
-        let config = ThinkingConfig::adaptive_summarized();
+        let config = ThinkingConfig::adaptive().with_display(ThinkingDisplay::Summarized);
         let json = to_value(config).unwrap();
 
         assert_eq!(

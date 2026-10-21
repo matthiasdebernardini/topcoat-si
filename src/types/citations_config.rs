@@ -17,12 +17,6 @@ impl CitationsConfig {
     pub fn enabled() -> Self {
         Self { enabled: true }
     }
-
-    /// Returns a CitationsConfig with citations disabled
-    #[must_use]
-    pub fn disabled() -> Self {
-        Self { enabled: false }
-    }
 }
 
 #[cfg(test)]
@@ -38,7 +32,7 @@ mod tests {
 
     #[test]
     fn serialization_disabled() {
-        let config = CitationsConfig::disabled();
+        let config = CitationsConfig::default();
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json, serde_json::json!({"enabled": false}));
     }

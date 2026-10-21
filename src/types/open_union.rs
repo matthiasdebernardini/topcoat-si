@@ -32,17 +32,17 @@ struct SeenUnknown {
 
 static SEEN_UNKNOWN: LazyLock<Mutex<SeenUnknown>> = LazyLock::new(Mutex::default);
 
-/// Records `tag` for `rust_type` and returns whether it was not seen before.
+/// Records `tag` for `type_name` and returns whether it was not seen before.
 ///
 /// Past [`MAX_SEEN_UNKNOWN`] values, or when the lock is poisoned, nothing is recorded and every
 /// value counts as new, so a warning is never lost.
-fn first_sighting(rust_type: &'static str, tag: &str) -> bool {
+fn first_sighting(type_name: &'static str, tag: &str) -> bool {
     let Ok(mut seen) = SEEN_UNKNOWN.lock() else {
         return true;
     };
     if seen
         .tags
-        .get(rust_type)
+        .get(type_name)
         .is_some_and(|tags| tags.contains(tag))
     {
         return false;
@@ -50,26 +50,26 @@ fn first_sighting(rust_type: &'static str, tag: &str) -> bool {
     if seen.count < MAX_SEEN_UNKNOWN {
         seen.count += 1;
         seen.tags
-            .entry(rust_type)
+            .entry(type_name)
             .or_default()
             .insert(tag.to_string());
     }
     true
 }
 
-/// Logs a warning for an API value `rust_type` does not know, the first time each distinct
+/// Logs a warning for an API value `type_name` does not know, the first time each distinct
 /// value appears in the process.
 ///
 /// Only the type name and the unknown tag or string are logged, never the payload, which can
 /// hold user content.
-pub(crate) fn warn_unknown(rust_type: &'static str, tag: &str) {
+pub(crate) fn warn_unknown(type_name: &'static str, tag: &str) {
     let tag = shortened_tag(tag);
-    if !first_sighting(rust_type, &tag) {
+    if !first_sighting(type_name, &tag) {
         return;
     }
     tracing::warn!(
         target: "topcoat_si::unknown",
-        rust_type,
+        rust_type = type_name,
         tag = &*tag,
         "unknown API value; update topcoat-si to read it"
     );
@@ -97,7 +97,7 @@ pub(crate) fn unknown_in_request(field: String) -> crate::Error {
 /// becomes `unknown` with a warning (see [`warn_unknown`]).
 pub(crate) fn deserialize_str<'de, D, T>(
     deserializer: D,
-    rust_type: &'static str,
+    type_name: &'static str,
     known: fn(&str) -> Option<T>,
     unknown: T,
 ) -> Result<T, D::Error>
@@ -105,7 +105,7 @@ where
     D: Deserializer<'de>,
 {
     struct OpenStr<T> {
-        rust_type: &'static str,
+        type_name: &'static str,
         known: fn(&str) -> Option<T>,
         unknown: T,
     }
@@ -114,32 +114,32 @@ where
         type Value = T;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(formatter, "a {} string", self.rust_type)
+            write!(formatter, "a {} string", self.type_name)
         }
 
         fn visit_str<E: de::Error>(self, value: &str) -> Result<T, E> {
             Ok((self.known)(value).unwrap_or_else(|| {
-                warn_unknown(self.rust_type, value);
+                warn_unknown(self.type_name, value);
                 self.unknown
             }))
         }
     }
 
     deserializer.deserialize_str(OpenStr {
-        rust_type,
+        type_name,
         known,
         unknown,
     })
 }
 
-/// Logs a warning for a union member whose `type` tag `rust_type` does not know (see
+/// Logs a warning for a union member whose `type` tag `type_name` does not know (see
 /// [`warn_unknown`]).
-pub(crate) fn warn_unknown_member(rust_type: &'static str, value: &Value) {
+pub(crate) fn warn_unknown_member(type_name: &'static str, value: &Value) {
     let tag = value
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    warn_unknown(rust_type, tag);
+    warn_unknown(type_name, tag);
 }
 
 /// Reads the `type` tag of a union member.
@@ -221,10 +221,11 @@ mod tests {
     use crate::sse::{SseEvent, parse_message_stream_event};
     use crate::test_support::unknown_warnings;
     use crate::types::{
-        CodeExecutionToolResultContent, ContentBlock, DocumentSource, FallbackCreditReason,
-        FallbackCreditStatus, InferenceSpeed, MessageBatchProcessingStatus, MessageBatchResult,
-        MessageBatchResultVariant, MessageRole, MessageStreamEvent, ModelLifecycle, ModelType,
-        ServiceTier, SkillType, StopReason, ToolSearchToolResultContent, UsageIteration,
+        AppliedEditType, CacheMissType, CodeExecutionToolResultContent, ContentBlock, CostType,
+        DocumentSource, ErrorType, FallbackCreditReason, FallbackCreditStatus, InferenceSpeed,
+        MessageBatchProcessingStatus, MessageBatchResult, MessageBatchResultVariant, MessageRole,
+        MessageStreamEvent, ModelLifecycle, ModelType, ServiceTier, SkillType, StopDetailsType,
+        StopReason, TokenType, ToolSearchToolResultContent, UsageIteration, UsageReportServiceTier,
         WebFetchToolResultContent,
     };
 
@@ -323,6 +324,97 @@ mod tests {
         assert_eq!(object, ModelType::Unknown);
 
         assert!(serde_json::from_value::<StopReason>(json!(7)).is_err());
+    }
+
+    #[test]
+    fn wire_value_enums_round_trip_their_documented_values() {
+        round_trips(&[
+            ErrorType::InvalidRequestError,
+            ErrorType::AuthenticationError,
+            ErrorType::BillingError,
+            ErrorType::PermissionError,
+            ErrorType::NotFoundError,
+            ErrorType::ConflictError,
+            ErrorType::RequestTooLarge,
+            ErrorType::RateLimitError,
+            ErrorType::ApiError,
+            ErrorType::TimeoutError,
+            ErrorType::OverloadedError,
+        ]);
+        round_trips(&[StopDetailsType::Refusal]);
+        round_trips(&[
+            CacheMissType::ModelChanged,
+            CacheMissType::SystemChanged,
+            CacheMissType::ToolsChanged,
+            CacheMissType::MessagesChanged,
+            CacheMissType::PreviousMessageNotFound,
+            CacheMissType::Unavailable,
+        ]);
+        round_trips(&[
+            AppliedEditType::ClearToolUses20250919,
+            AppliedEditType::ClearThinking20251015,
+        ]);
+        round_trips(&[
+            CostType::CodeExecution,
+            CostType::SessionUsage,
+            CostType::Tokens,
+            CostType::WebSearch,
+        ]);
+        round_trips(&[
+            TokenType::UncachedInputTokens,
+            TokenType::OutputTokens,
+            TokenType::CacheReadInputTokens,
+            TokenType::CacheCreationEphemeral5mInputTokens,
+            TokenType::CacheCreationEphemeral1hInputTokens,
+        ]);
+        round_trips(&[
+            UsageReportServiceTier::Standard,
+            UsageReportServiceTier::Priority,
+            UsageReportServiceTier::PriorityOnDemand,
+            UsageReportServiceTier::Batch,
+            UsageReportServiceTier::Flex,
+            UsageReportServiceTier::FlexDiscount,
+        ]);
+        assert_eq!(
+            serde_json::to_value(TokenType::CacheCreationEphemeral5mInputTokens).unwrap(),
+            json!("cache_creation.ephemeral_5m_input_tokens")
+        );
+        assert_eq!(
+            serde_json::to_value(AppliedEditType::ClearThinking20251015).unwrap(),
+            json!("clear_thinking_20251015")
+        );
+        assert_eq!(
+            serde_json::to_value(UsageReportServiceTier::PriorityOnDemand).unwrap(),
+            json!("priority_on_demand")
+        );
+    }
+
+    #[test]
+    fn wire_value_enums_read_an_unknown_value_with_one_warning() {
+        let (value, warnings) = unknown::<ErrorType>(json!("teapot_error"));
+        assert_eq!(value, ErrorType::Unknown);
+        assert_eq!(warnings, ["rust_type=ErrorType tag=teapot_error"]);
+        let (value, warnings) = unknown::<StopDetailsType>(json!("pause"));
+        assert_eq!(value, StopDetailsType::Unknown);
+        assert_eq!(warnings, ["rust_type=StopDetailsType tag=pause"]);
+        let (value, warnings) = unknown::<CacheMissType>(json!("betas_changed"));
+        assert_eq!(value, CacheMissType::Unknown);
+        assert_eq!(warnings, ["rust_type=CacheMissType tag=betas_changed"]);
+        let (value, warnings) = unknown::<AppliedEditType>(json!("compact_20260112"));
+        assert_eq!(value, AppliedEditType::Unknown);
+        assert_eq!(warnings, ["rust_type=AppliedEditType tag=compact_20260112"]);
+        let (value, warnings) = unknown::<CostType>(json!("storage"));
+        assert_eq!(value, CostType::Unknown);
+        assert_eq!(warnings, ["rust_type=CostType tag=storage"]);
+        let (value, warnings) = unknown::<TokenType>(json!("thinking_tokens"));
+        assert_eq!(value, TokenType::Unknown);
+        assert_eq!(warnings, ["rust_type=TokenType tag=thinking_tokens"]);
+        let (value, warnings) = unknown::<UsageReportServiceTier>(json!("spot"));
+        assert_eq!(value, UsageReportServiceTier::Unknown);
+        assert_eq!(warnings, ["rust_type=UsageReportServiceTier tag=spot"]);
+        let (value, warnings) = unknown::<ServiceTier>(json!("overflow"));
+        assert_eq!(value, ServiceTier::Unknown);
+        assert_eq!(warnings, ["rust_type=ServiceTier tag=overflow"]);
     }
 
     #[test]

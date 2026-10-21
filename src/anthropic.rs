@@ -13,22 +13,23 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client as ReqwestClient, Response, header, redirect};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tracing::{Span, field};
 
 use crate::AccumulatingStream;
 use crate::backoff;
 use crate::base_url;
-use crate::error::{Error, HttpMetadata, RequestPhase, Result, map_reqwest_error};
+use crate::error::{Error, ErrorCode, HttpMetadata, RequestPhase, Result, map_reqwest_error};
 use crate::observability;
 use crate::sse::process_message_stream_sse;
 use crate::types::{
     CompactionRequest, ContextManagement, CostReport, CostReportParams, DeletedFile,
-    DeletedMessageBatch, FileInfo, FileList, FileListParams, McpServer, Message, MessageBatch,
-    MessageBatchCreateParams, MessageBatchListParams, MessageBatchListResponse, MessageBatchResult,
-    MessageCountTokensParams, MessageCreateParams, MessageStreamEvent, MessageTokensCount, Model,
-    ModelInfo, ModelListParams, ModelListResponse, OutputConfig, RateLimits, ToolUnionParam, Usage,
-    UsageReport, UsageReportParams, retry_after_from_headers,
+    DeletedMessageBatch, ErrorType, FileInfo, FileList, FileListParams, McpServer, Message,
+    MessageBatch, MessageBatchCreateParams, MessageBatchListParams, MessageBatchListResponse,
+    MessageBatchResult, MessageCountTokensParams, MessageCreateParams, MessageStreamEvent,
+    MessageTokensCount, Model, ModelInfo, ModelListParams, ModelListResponse, OutputConfig,
+    RateLimits, ToolUnionParam, Usage, UsageReport, UsageReportParams, retry_after_from_headers,
 };
 
 fn final_failure(error: &Error) {
@@ -390,7 +391,7 @@ fn response_metadata(response: &Response) -> HttpMetadata {
     let retry_after = retry_after_from_headers(headers);
     HttpMetadata {
         status: response.status().as_u16(),
-        error_type: None,
+        error_code: None,
         request_id: headers
             .get("request-id")
             .and_then(|value| value.to_str().ok())
@@ -651,13 +652,6 @@ impl Anthropic {
         self
     }
 
-    /// Set both a custom base URL and timeout for this client.
-    ///
-    /// This is a convenience method that chains with_base_url and with_timeout.
-    pub fn with_base_url_and_timeout(self, base_url: String, timeout: Duration) -> Result<Self> {
-        self.with_base_url(base_url)?.with_timeout(timeout)
-    }
-
     /// Build default headers for API requests (static method for initialization).
     ///
     /// When `base_url` matches one of the entries in
@@ -826,7 +820,9 @@ impl Anthropic {
         };
         let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
         if let Some(value) = parsed.as_ref() {
-            metadata.error_type = value["error"]["type"].as_str().map(String::from);
+            metadata.error_code = ErrorType::deserialize(&value["error"]["type"])
+                .ok()
+                .map(ErrorCode::Anthropic);
             metadata.request_id = metadata
                 .request_id
                 .or_else(|| value["request_id"].as_str().map(String::from));
@@ -1532,6 +1528,12 @@ impl Anthropic {
     pub async fn usage_report(&self, params: UsageReportParams) -> Result<UsageReport> {
         let start = Instant::now();
 
+        if let Err(err) = params.check_known_values() {
+            final_failure(&err);
+            observability::request_failed(start.elapsed());
+            return Err(err);
+        }
+
         let all_betas = self.collect_betas(None, &[]);
         let headers = self.headers_with_betas(&all_betas);
         let query = params.to_query();
@@ -1758,8 +1760,8 @@ mod tests {
     use super::*;
     use crate::test_support::{Canned, record_targets, serve, uses_proxies};
     use crate::{
-        KnownModel, MessageBatchCreateParams, MessageBatchCreateRequest, MessageBatchListParams,
-        MessageBatchResultVariant, MessageParam, Model,
+        KnownModel, McpToolset, MessageBatchCreateParams, MessageBatchCreateRequest,
+        MessageBatchListParams, MessageBatchResultVariant, MessageParam, Model, TaskBudget,
     };
     use futures::StreamExt;
     use serde_json::Value;
@@ -1767,6 +1769,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::runtime::Builder;
 
     fn request_headers_end(buffer: &[u8]) -> Option<usize> {
         buffer.windows(4).position(|window| window == b"\r\n\r\n")
@@ -2011,7 +2014,7 @@ Connection: close\r\n\r\n{}",
                             // Simulate a 529 overloaded error
                             Err(Error::api(
                                 529,
-                                Some("overloaded_error".to_string()),
+                                Some(ErrorCode::Anthropic(ErrorType::OverloadedError)),
                                 "Overloaded",
                                 None,
                             ))
@@ -2033,7 +2036,7 @@ Connection: close\r\n\r\n{}",
         // Test that a 529 API error is correctly identified as retryable
         let error = Error::api(
             529,
-            Some("overloaded_error".to_string()),
+            Some(ErrorCode::Anthropic(ErrorType::OverloadedError)),
             "Overloaded",
             None,
         );
@@ -2390,9 +2393,8 @@ Connection: close\r\n\r\n{}",
 
     #[test]
     fn create_params_betas_task_budget() {
-        let params = sample_create_params().with_output_config(
-            OutputConfig::new().with_task_budget(crate::types::TaskBudget::new(64_000)),
-        );
+        let params = sample_create_params()
+            .with_output_config(OutputConfig::new().with_task_budget(TaskBudget::new(64_000)));
         assert_eq!(create_params_betas(&params), vec![TASK_BUDGETS_BETA]);
     }
 
@@ -2421,9 +2423,7 @@ Connection: close\r\n\r\n{}",
         )
         .with_context_management(ContextManagement::new(vec![ContextEdit::compact()]))
         .with_mcp_servers(vec![McpServer::new("a", "https://mcp.example.com")])
-        .with_output_config(
-            OutputConfig::new().with_task_budget(crate::types::TaskBudget::new(20_000)),
-        );
+        .with_output_config(OutputConfig::new().with_task_budget(TaskBudget::new(20_000)));
         assert_eq!(
             count_params_betas(&params),
             vec![
@@ -2817,7 +2817,10 @@ Connection: close\r\n\r\n{}",
             .with_base_url(base_url)
             .unwrap();
         let deleted = client.delete_message_batch("msgbatch_123").await.unwrap();
-        assert_eq!(deleted.r#type, "message_batch_deleted");
+        assert_eq!(
+            serde_json::to_value(&deleted).unwrap()["type"],
+            "message_batch_deleted"
+        );
     }
 
     #[tokio::test]
@@ -3021,7 +3024,8 @@ Connection: close\r\n\r\n",
 
     #[test]
     fn create_params_betas_mcp_toolset() {
-        let params = sample_create_params().with_tools(vec![ToolUnionParam::new_mcp_toolset("a")]);
+        let params = sample_create_params()
+            .with_tools(vec![ToolUnionParam::McpToolset(McpToolset::new("a"))]);
         assert_eq!(create_params_betas(&params), vec![MCP_CLIENT_BETA]);
     }
 
@@ -3148,7 +3152,10 @@ Connection: close\r\n\r\n",
 
         let deleted = files_client(base_url).delete_file("file_01").await.unwrap();
         assert_eq!(deleted.id, "file_01");
-        assert_eq!(deleted.r#type, "file_deleted");
+        assert_eq!(
+            serde_json::to_value(&deleted).unwrap()["type"],
+            "file_deleted"
+        );
     }
 
     #[tokio::test]
@@ -3337,6 +3344,43 @@ Connection: close\r\n\r\n",
             let get = |var: &str| Ok((var == name).then(|| "http://127.0.0.1:1".to_string()));
             let client = Anthropic::try_new_with(key(), get).unwrap();
             assert!(!both_use_proxies(&client), "{name}");
+        }
+    }
+
+    #[test]
+    fn error_body_type_becomes_an_anthropic_error_code() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let bodies = [
+            r#"{"type":"error","error":{"type":"request_too_large","message":"big"}}"#,
+            r#"{"type":"error","error":{"type":"saucepan_error","message":"hot"}}"#,
+            r#"{"type":"error","error":"text"}"#,
+            r#"{"type":"error","error":{"type":5,"message":"number"}}"#,
+        ];
+        let canned = bodies.iter().map(|body| Canned::json(400, *body)).collect();
+        let (base_url, _recorded) = runtime.block_on(serve(canned));
+        let client = Anthropic::try_new(Some("test_key".to_string()))
+            .unwrap()
+            .with_base_url(base_url)
+            .unwrap();
+        let send = || {
+            crate::test_support::unknown_warnings(|| {
+                let error = runtime.block_on(client.send(&send_params())).unwrap_err();
+                error
+                    .metadata()
+                    .and_then(|metadata| metadata.error_code.clone())
+            })
+        };
+
+        let (code, warnings) = send();
+        assert_eq!(code, Some(ErrorCode::Anthropic(ErrorType::RequestTooLarge)));
+        assert_eq!(warnings, Vec::<String>::new());
+        let (code, warnings) = send();
+        assert_eq!(code, Some(ErrorCode::Anthropic(ErrorType::Unknown)));
+        assert_eq!(warnings, ["rust_type=ErrorType tag=saucepan_error"]);
+        for _ in 0..2 {
+            let (code, warnings) = send();
+            assert_eq!(code, None);
+            assert_eq!(warnings, Vec::<String>::new());
         }
     }
 

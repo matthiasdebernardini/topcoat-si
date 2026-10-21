@@ -75,24 +75,6 @@ impl ImageBlock {
         }
     }
 
-    /// Create a new `ImageBlock` with a Base64 image source.
-    #[must_use]
-    pub fn new_with_base64(source: Base64ImageSource) -> Self {
-        Self::new(ImageSource::Base64(source))
-    }
-
-    /// Create a new `ImageBlock` with a URL image source.
-    #[must_use]
-    pub fn new_with_url(source: UrlImageSource) -> Self {
-        Self::new(ImageSource::Url(source))
-    }
-
-    /// Create a new `ImageBlock` referencing a file uploaded through the Files API.
-    #[must_use]
-    pub fn from_file_id(file_id: impl Into<String>) -> Self {
-        Self::new(ImageSource::File(FileSource::new(file_id)))
-    }
-
     /// Set the image transformations.
     #[must_use]
     pub fn with_transformations(mut self, transformations: ImageTransformations) -> Self {
@@ -121,7 +103,7 @@ mod tests {
             ImageMediaType::Jpeg,
         );
 
-        let image_block = ImageBlock::new_with_base64(base64_source);
+        let image_block = ImageBlock::new(ImageSource::Base64(base64_source));
         let json = to_value(&image_block).unwrap();
 
         assert_eq!(
@@ -140,7 +122,7 @@ mod tests {
     fn image_block_with_url() {
         let url_source = UrlImageSource::new("https://example.com/image.jpg");
 
-        let image_block = ImageBlock::new_with_url(url_source);
+        let image_block = ImageBlock::new(ImageSource::Url(url_source));
         let json = to_value(&image_block).unwrap();
 
         assert_eq!(
@@ -159,7 +141,8 @@ mod tests {
         let url_source = UrlImageSource::new("https://example.com/image.jpg");
         let cache_control = CacheControlEphemeral::new();
 
-        let image_block = ImageBlock::new_with_url(url_source).with_cache_control(cache_control);
+        let image_block =
+            ImageBlock::new(ImageSource::Url(url_source)).with_cache_control(cache_control);
 
         let json = to_value(&image_block).unwrap();
 
@@ -179,8 +162,8 @@ mod tests {
 
     #[test]
     fn image_block_with_file_source_and_transformations() {
-        let block =
-            ImageBlock::from_file_id("file_02").with_transformations(ImageTransformations {
+        let block = ImageBlock::new(ImageSource::File(FileSource::new("file_02")))
+            .with_transformations(ImageTransformations {
                 oversized_image: Some(OversizedImage::Downsize),
             });
         let json = to_value(&block).unwrap();

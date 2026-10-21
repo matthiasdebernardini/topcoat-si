@@ -16,7 +16,9 @@ use crate::types::{
 /// - The client-side memory tool
 /// - MCP toolsets
 ///
-/// The API accepts any of these tool types when tools are provided to Claude.
+/// The API accepts any of these tool types when tools are provided to Claude. Build one with its
+/// variant and the tool type's constructor, for example
+/// `ToolUnionParam::WebFetch20260318(WebFetchTool::new())`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 #[non_exhaustive]
@@ -95,74 +97,6 @@ impl ToolUnionParam {
     #[must_use]
     pub fn new_custom_tool(name: impl Into<String>, input_schema: serde_json::Value) -> Self {
         Self::CustomTool(ToolParam::new(name, input_schema))
-    }
-
-    /// Creates a new bash tool (version 20241022)
-    #[must_use]
-    pub fn new_bash_20241022_tool() -> Self {
-        Self::Bash20241022(ToolBash20241022::new())
-    }
-
-    /// Creates a new bash tool (version 20250124)
-    #[must_use]
-    pub fn new_bash_tool() -> Self {
-        Self::Bash20250124(ToolBash20250124::new())
-    }
-
-    /// Creates a new text editor tool
-    #[must_use]
-    pub fn new_text_editor_tool() -> Self {
-        Self::TextEditor20250124(ToolTextEditor20250124::new())
-    }
-
-    /// Creates a new text editor tool (version 20250429)
-    #[must_use]
-    pub fn new_text_editor_20250429_tool() -> Self {
-        Self::TextEditor20250429(ToolTextEditor20250429::new())
-    }
-
-    /// Creates a new text editor tool (version 20250728)
-    #[must_use]
-    pub fn new_text_editor_20250728_tool() -> Self {
-        Self::TextEditor20250728(ToolTextEditor20250728::new())
-    }
-
-    /// Creates a new web fetch tool (version 20260318)
-    #[must_use]
-    pub fn new_web_fetch_tool() -> Self {
-        Self::WebFetch20260318(WebFetchTool::new())
-    }
-
-    /// Creates a new code execution tool (version 20260521)
-    #[must_use]
-    pub fn new_code_execution_tool() -> Self {
-        Self::CodeExecution20260521(CodeExecutionTool::new())
-    }
-
-    /// Creates a new regex tool search tool
-    #[must_use]
-    pub fn new_tool_search_regex_tool() -> Self {
-        Self::ToolSearchToolRegex20251119(ToolSearchTool::regex())
-    }
-
-    /// Creates a new BM25 tool search tool
-    #[must_use]
-    pub fn new_tool_search_bm25_tool() -> Self {
-        Self::ToolSearchToolBm2520251119(ToolSearchTool::bm25())
-    }
-
-    /// Creates a new memory tool.
-    ///
-    /// This is a client-side tool: the application implements the memory commands.
-    #[must_use]
-    pub fn new_memory_tool() -> Self {
-        Self::Memory20250818(MemoryTool::new())
-    }
-
-    /// Creates a toolset exposing the tools of the named MCP server
-    #[must_use]
-    pub fn new_mcp_toolset(server_name: impl Into<String>) -> Self {
-        Self::McpToolset(McpToolset::new(server_name))
     }
 
     /// Validate tool-specific constraints.
@@ -430,7 +364,7 @@ mod tests {
                 json!({"type": "web_fetch_20260309", "name": "web_fetch", "use_cache": true}),
             ),
             (
-                ToolUnionParam::new_web_fetch_tool(),
+                ToolUnionParam::WebFetch20260318(WebFetchTool::new()),
                 json!({"type": "web_fetch_20260318", "name": "web_fetch"}),
             ),
             (
@@ -442,23 +376,23 @@ mod tests {
                 json!({"type": "code_execution_20260120", "name": "code_execution"}),
             ),
             (
-                ToolUnionParam::new_code_execution_tool(),
+                ToolUnionParam::CodeExecution20260521(CodeExecutionTool::new()),
                 json!({"type": "code_execution_20260521", "name": "code_execution"}),
             ),
             (
-                ToolUnionParam::new_tool_search_regex_tool(),
+                ToolUnionParam::ToolSearchToolRegex20251119(ToolSearchTool::regex()),
                 json!({"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"}),
             ),
             (
-                ToolUnionParam::new_tool_search_bm25_tool(),
+                ToolUnionParam::ToolSearchToolBm2520251119(ToolSearchTool::bm25()),
                 json!({"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"}),
             ),
             (
-                ToolUnionParam::new_memory_tool(),
+                ToolUnionParam::Memory20250818(MemoryTool::new()),
                 json!({"type": "memory_20250818", "name": "memory"}),
             ),
             (
-                ToolUnionParam::new_mcp_toolset("docs"),
+                ToolUnionParam::McpToolset(McpToolset::new("docs")),
                 json!({"type": "mcp_toolset", "mcp_server_name": "docs"}),
             ),
         ];
@@ -478,6 +412,10 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(err.is_validation());
-        assert!(ToolUnionParam::new_web_fetch_tool().validate().is_ok());
+        assert!(
+            ToolUnionParam::WebFetch20260318(WebFetchTool::new())
+                .validate()
+                .is_ok()
+        );
     }
 }

@@ -203,7 +203,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::{Canned, Recorded, serve};
-    use crate::types::{KnownModel, Model};
+    use crate::types::{KnownModel, Model, WebFetchTool};
 
     /// Answers with its input, or fails with an authentication error when `fail` is set.
     struct Echo {
@@ -299,7 +299,7 @@ mod tests {
             reply("end_turn", json!([{"type": "text", "text": "Done."}])),
         ])
         .await;
-        let web_fetch = ToolUnionParam::new_web_fetch_tool();
+        let web_fetch = ToolUnionParam::WebFetch20260318(WebFetchTool::new());
         let run = client(base_url)
             .run_tools(params().with_tools(vec![web_fetch]), &[&ECHO], 5)
             .await
@@ -480,7 +480,7 @@ mod tests {
         let cases = [
             (ECHO.definition(), &ECHO, "two tools are named echo"),
             (
-                ToolUnionParam::new_web_fetch_tool(),
+                ToolUnionParam::WebFetch20260318(WebFetchTool::new()),
                 &fetch,
                 "two tools are named web_fetch",
             ),

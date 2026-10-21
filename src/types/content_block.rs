@@ -532,7 +532,7 @@ impl From<CompactionBlock> for ContentBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{KnownModel, Model};
+    use crate::types::{ImageSource, KnownModel, Model, UrlImageSource};
 
     #[test]
     fn text_block_serialization() {
@@ -682,8 +682,8 @@ mod tests {
 
     #[test]
     fn image_block_serialization() {
-        let image_source = crate::types::UrlImageSource::new("https://example.com/image.jpg");
-        let image_block = ImageBlock::new_with_url(image_source);
+        let image_source = UrlImageSource::new("https://example.com/image.jpg");
+        let image_block = ImageBlock::new(ImageSource::Url(image_source));
         let content_block = ContentBlock::from(image_block);
 
         let json = serde_json::to_string(&content_block).unwrap();

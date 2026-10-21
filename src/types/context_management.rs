@@ -2,6 +2,9 @@ use serde::de::{self, Deserializer};
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 
+use crate::types::open_union;
+use crate::types::wire_tag::{ThinkingTurnsTag, ToolUsesTag};
+
 /// Server-side context management for a request.
 ///
 /// Requires the `context-management-2025-06-27` beta (plus `compact-2026-01-12`
@@ -66,7 +69,7 @@ impl KeepToolUses {
 impl Serialize for KeepToolUses {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(2))?;
-        map.serialize_entry("type", "tool_uses")?;
+        map.serialize_entry("type", &ToolUsesTag)?;
         map.serialize_entry("value", &self.value)?;
         map.end()
     }
@@ -77,13 +80,10 @@ impl<'de> Deserialize<'de> for KeepToolUses {
         #[derive(Deserialize)]
         struct Raw {
             #[serde(rename = "type")]
-            kind: String,
+            _tag: ToolUsesTag,
             value: u64,
         }
         let raw = Raw::deserialize(deserializer)?;
-        if raw.kind != "tool_uses" {
-            return Err(de::Error::unknown_variant(&raw.kind, &["tool_uses"]));
-        }
         Ok(Self { value: raw.value })
     }
 }
@@ -103,7 +103,7 @@ impl Serialize for ThinkingKeep {
         match self {
             ThinkingKeep::Turns(value) => {
                 let mut map = serializer.serialize_map(Some(2))?;
-                map.serialize_entry("type", "thinking_turns")?;
+                map.serialize_entry("type", &ThinkingTurnsTag)?;
                 map.serialize_entry("value", value)?;
                 map.end()
             }
@@ -120,17 +120,14 @@ impl<'de> Deserialize<'de> for ThinkingKeep {
             Text(String),
             Turns {
                 #[serde(rename = "type")]
-                kind: String,
+                _tag: ThinkingTurnsTag,
                 value: u64,
             },
         }
         match Raw::deserialize(deserializer)? {
             Raw::Text(text) if text == "all" => Ok(ThinkingKeep::All),
             Raw::Text(text) => Err(de::Error::unknown_variant(&text, &["all"])),
-            Raw::Turns { kind, value } if kind == "thinking_turns" => {
-                Ok(ThinkingKeep::Turns(value))
-            }
-            Raw::Turns { kind, .. } => Err(de::Error::unknown_variant(&kind, &["thinking_turns"])),
+            Raw::Turns { value, .. } => Ok(ThinkingKeep::Turns(value)),
         }
     }
 }
@@ -224,8 +221,8 @@ pub struct ContextManagementResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AppliedEdit {
-    /// The edit type, such as `clear_tool_uses_20250919`.
-    pub r#type: String,
+    /// The kind of edit.
+    pub r#type: AppliedEditType,
 
     /// Input tokens removed by the edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,6 +235,36 @@ pub struct AppliedEdit {
     /// Thinking turns removed by the edit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleared_thinking_turns: Option<u64>,
+}
+
+/// The kind of [`AppliedEdit`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
+#[non_exhaustive]
+pub enum AppliedEditType {
+    /// A [`ContextEdit::ClearToolUses20250919`] edit.
+    #[serde(rename = "clear_tool_uses_20250919")]
+    ClearToolUses20250919,
+    /// A [`ContextEdit::ClearThinking20251015`] edit.
+    #[serde(rename = "clear_thinking_20251015")]
+    ClearThinking20251015,
+    /// A kind this crate does not know.
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for AppliedEditType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "AppliedEditType",
+            |value| match value {
+                "clear_tool_uses_20250919" => Some(Self::ClearToolUses20250919),
+                "clear_thinking_20251015" => Some(Self::ClearThinking20251015),
+                _ => None,
+            },
+            Self::Unknown,
+        )
+    }
 }
 
 /// Context-management information in a count-tokens response.
@@ -346,6 +373,23 @@ mod tests {
     }
 
     #[test]
+    fn keep_counts_with_a_wrong_tag_parse_and_warn_once() {
+        let (keep, warnings) = crate::test_support::unknown_warnings(|| {
+            serde_json::from_value::<KeepToolUses>(json!({"type": "tool_calls", "value": 3}))
+                .unwrap()
+        });
+        assert_eq!(keep, KeepToolUses::new(3));
+        assert_eq!(warnings, ["rust_type=ToolUsesTag tag=tool_calls"]);
+
+        let (keep, warnings) = crate::test_support::unknown_warnings(|| {
+            serde_json::from_value::<ThinkingKeep>(json!({"type": "thinking_rounds", "value": 2}))
+                .unwrap()
+        });
+        assert_eq!(keep, ThinkingKeep::Turns(2));
+        assert_eq!(warnings, ["rust_type=ThinkingTurnsTag tag=thinking_rounds"]);
+    }
+
+    #[test]
     fn invalid_thinking_keep_rejected() {
         assert!(serde_json::from_value::<ThinkingKeep>(json!("some")).is_err());
     }
@@ -360,7 +404,7 @@ mod tests {
         .unwrap();
         assert_eq!(response.applied_edits.len(), 1);
         let edit = &response.applied_edits[0];
-        assert_eq!(edit.r#type, "clear_tool_uses_20250919");
+        assert_eq!(edit.r#type, AppliedEditType::ClearToolUses20250919);
         assert_eq!(edit.cleared_input_tokens, Some(12000));
         assert_eq!(edit.cleared_tool_uses, Some(4));
         assert_eq!(edit.cleared_thinking_turns, None);

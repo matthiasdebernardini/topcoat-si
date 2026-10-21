@@ -12,10 +12,10 @@ use serde_json::Value;
 use tokio::time::sleep;
 
 use super::questions::WireQuestions;
-use super::{Choices, JevResponse, Levels, Outcome, Questions};
+use super::{Choices, JevErrorCode, JevResponse, Levels, Outcome, Questions};
 use crate::backoff;
 use crate::base_url;
-use crate::error::{Error, HttpMetadata, RequestPhase, Result, map_reqwest_error};
+use crate::error::{Error, ErrorCode, HttpMetadata, RequestPhase, Result, map_reqwest_error};
 use crate::types::retry_after_from_headers;
 
 pub(super) const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
@@ -342,7 +342,7 @@ impl JevClient {
         let bytes = response.bytes().await.map_err(|e| {
             map_reqwest_error(e, RequestPhase::Body).with_http_metadata(HttpMetadata {
                 status,
-                error_type: None,
+                error_code: None,
                 request_id: request_id.clone(),
                 retry_after: retry_after_from_headers(&headers),
             })
@@ -389,10 +389,10 @@ fn request_id(headers: &HeaderMap) -> Option<String> {
 // Only the JSON `detail` reaches the message: a string, an object's `message`, or a 422 list
 // as `loc: msg` pairs. A 422 item's `input` echoes the caller's data and is never read.
 fn http_error(status: u16, headers: &HeaderMap, body: &[u8], request_id: Option<String>) -> Error {
-    let mut error_type = None;
+    let mut error_code = None;
     let detail = match serde_json::from_slice::<Value>(body).ok() {
         None if status == 403 => {
-            error_type = Some("edge_blocked".to_string());
+            error_code = Some(JevErrorCode::EdgeBlocked);
             Some(match header_str(headers, "cf-ray") {
                 Some(ray) => format!("blocked by an edge proxy (cf-ray {ray})"),
                 None => "blocked by an edge proxy".to_string(),
@@ -402,10 +402,10 @@ fn http_error(status: u16, headers: &HeaderMap, body: &[u8], request_id: Option<
         Some(value) => match value.get("detail") {
             Some(Value::String(detail)) => Some(detail.clone()),
             Some(Value::Object(detail)) => {
-                error_type = detail
+                error_code = detail
                     .get("error_type")
                     .and_then(Value::as_str)
-                    .map(String::from);
+                    .map(JevErrorCode::from_detail);
                 detail
                     .get("message")
                     .and_then(Value::as_str)
@@ -417,7 +417,7 @@ fn http_error(status: u16, headers: &HeaderMap, body: &[u8], request_id: Option<
             _ => None,
         },
     };
-    let detail = if error_type.as_deref() == Some("max_tokens_exceeded") {
+    let detail = if error_code == Some(JevErrorCode::MaxTokensExceeded) {
         Some(match detail {
             Some(detail) => format!("input too long: {detail}"),
             None => "input too long".to_string(),
@@ -431,7 +431,7 @@ fn http_error(status: u16, headers: &HeaderMap, body: &[u8], request_id: Option<
     };
     let metadata = HttpMetadata {
         status,
-        error_type,
+        error_code: error_code.map(ErrorCode::Jev),
         request_id,
         retry_after: retry_after_from_headers(headers),
     };

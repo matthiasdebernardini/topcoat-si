@@ -108,15 +108,6 @@ impl MessageParam {
         )
     }
 
-    /// Create a new system `MessageParam` with a string content.
-    #[must_use]
-    pub fn system(content: impl Into<String>) -> Self {
-        Self::new(
-            MessageParamContent::String(content.into()),
-            MessageRole::System,
-        )
-    }
-
     /// Echo a reply back into the conversation as an assistant message.
     #[must_use]
     pub fn from_message(message: Message) -> Self {
@@ -152,8 +143,8 @@ impl<T: AsRef<str>> From<T> for MessageParamContent {
 mod tests {
     use super::*;
     use crate::types::{
-        ImageBlock, KnownModel, Message, Model, TextBlock, ToolResultBlock, UrlImageSource, Usage,
-        WebFetchToolResultBlock, WebFetchToolResultContent,
+        ImageBlock, ImageSource, KnownModel, Message, Model, TextBlock, ToolResultBlock,
+        UrlImageSource, Usage, WebFetchToolResultBlock, WebFetchToolResultContent,
     };
     use serde_json::{json, to_value};
 
@@ -217,7 +208,7 @@ mod tests {
         let text_block = TextBlock::new("Check out this image:");
 
         let image_source = UrlImageSource::new("https://example.com/image.jpg");
-        let image_block = ImageBlock::new_with_url(image_source);
+        let image_block = ImageBlock::new(ImageSource::Url(image_source));
 
         let blocks = vec![
             ContentBlock::Text(text_block),
