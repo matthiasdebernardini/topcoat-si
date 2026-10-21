@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Omitting the TTL on a cache control means five minutes.
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CacheTtl {
     /// Five-minute cache lifetime (the API default).
     #[serde(rename = "5m")]

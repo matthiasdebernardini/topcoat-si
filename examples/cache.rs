@@ -1,9 +1,10 @@
-/// Demonstrates Anthropic prompt caching with cache write and cache read.
-///
-/// The first request populates the cache (cache_creation_input_tokens > 0).
-/// The second request reads from the cache (cache_read_input_tokens > 0).
-///
-/// Requires ANTHROPIC_API_KEY or TOPCOAT_SI_API_KEY in the environment.
+//! Demonstrates Anthropic prompt caching with cache write and cache read.
+//!
+//! The first request populates the cache (cache_creation_input_tokens > 0).
+//! The second request reads from the cache (cache_read_input_tokens > 0).
+//!
+//! Requires ANTHROPIC_API_KEY or TOPCOAT_SI_API_KEY in the environment.
+
 use topcoat_si::{
     Anthropic, CacheControlEphemeral, ContentBlock, KnownModel, MessageCreateParams, Model, Result,
     SystemPrompt, TextBlock,
@@ -34,7 +35,7 @@ fn long_system_prompt() -> SystemPrompt {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = Anthropic::new(None)?;
+    let client = Anthropic::try_new(None)?;
 
     let system = long_system_prompt();
 
@@ -46,7 +47,7 @@ async fn main() -> Result<()> {
     )
     .with_system(system.clone());
 
-    let first = client.send(params).await?;
+    let first = client.send(&params).await?;
 
     println!("First response (cache write):");
     for block in &first.content {
@@ -80,7 +81,7 @@ async fn main() -> Result<()> {
     )
     .with_system(system);
 
-    let second = client.send(params).await?;
+    let second = client.send(&params).await?;
 
     println!("\nSecond response (cache read):");
     for block in &second.content {

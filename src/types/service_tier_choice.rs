@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// reported by [`ServiceTier`](crate::types::ServiceTier).
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ServiceTierChoice {
     /// Use priority capacity when available and fall back to the standard tier.
     Auto,

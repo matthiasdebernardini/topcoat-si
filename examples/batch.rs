@@ -1,9 +1,7 @@
 use std::env;
 use std::time::Duration;
 
-use futures::StreamExt;
 use tokio::pin;
-use tokio::time::sleep;
 use topcoat_si::{
     Anthropic, KnownModel, MessageBatch, MessageBatchCreateParams, MessageBatchCreateRequest,
     MessageBatchProcessingStatus, MessageBatchResult, MessageBatchResultVariant,
@@ -15,7 +13,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = Anthropic::new(None)?;
+    use futures::StreamExt;
+
+    let client = Anthropic::try_new(None)?;
 
     let batch_id = match env::args().nth(1) {
         Some(batch_id) => {
@@ -72,14 +72,14 @@ async fn create_demo_batch(client: &Anthropic) -> Result<MessageBatch> {
 
 async fn poll_until_ended(client: &Anthropic, batch_id: &str) -> Result<MessageBatch> {
     loop {
-        let batch = client.retrieve_message_batch(batch_id).await?;
+        let batch = client.get_message_batch(batch_id).await?;
         print_batch_status(&batch);
 
         if batch.processing_status == MessageBatchProcessingStatus::Ended {
             return Ok(batch);
         }
 
-        sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -120,5 +120,6 @@ fn print_result(result: &MessageBatchResult) {
         MessageBatchResultVariant::Expired => {
             println!("{} expired", result.custom_id);
         }
+        _ => println!("{} had an unrecognized result", result.custom_id),
     }
 }

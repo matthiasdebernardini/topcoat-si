@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// An event that represents the end of a content block in a streaming response.
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ContentBlockStopEvent {
     /// The index of the content block that is ending.
     pub index: usize,
@@ -9,6 +10,7 @@ pub struct ContentBlockStopEvent {
 
 impl ContentBlockStopEvent {
     /// Create a new `ContentBlockStopEvent` with the given index.
+    #[must_use]
     pub fn new(index: usize) -> Self {
         Self { index }
     }

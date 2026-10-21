@@ -12,6 +12,7 @@ fn default_name() -> String {
 /// commands (`view`, `create`, `str_replace`, `insert`, `delete`, `rename`) and the
 /// application implements them and returns the results.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MemoryTool {
     /// Name of the tool.
     #[serde(default = "default_name")]
@@ -24,6 +25,7 @@ pub struct MemoryTool {
 
 impl MemoryTool {
     /// Creates a memory tool with default values.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             name: default_name(),
@@ -32,6 +34,7 @@ impl MemoryTool {
     }
 
     /// Sets the cache control.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self

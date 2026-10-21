@@ -6,6 +6,7 @@ use crate::types::CacheControlEphemeral;
 ///
 /// This tool allows the AI to perform text editing operations via the API.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct ToolTextEditor20250124 {
     /// Name of the tool. This is how the tool will be called by the model and in `tool_use` blocks.
     ///
@@ -14,7 +15,6 @@ pub struct ToolTextEditor20250124 {
     pub name: String,
 
     /// Create a cache control breakpoint at this content block.
-    /// If provided, this instructs the API to not cache this tool or its results.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControlEphemeral>,
 }
@@ -25,6 +25,7 @@ fn default_name() -> String {
 
 impl ToolTextEditor20250124 {
     /// Creates a new Text Editor tool parameter object with default settings.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             name: default_name(),
@@ -33,6 +34,7 @@ impl ToolTextEditor20250124 {
     }
 
     /// Sets the cache control to ephemeral for this tool.
+    #[must_use]
     pub fn with_ephemeral_cache_control(mut self) -> Self {
         self.cache_control = Some(CacheControlEphemeral::new());
         self

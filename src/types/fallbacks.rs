@@ -1,24 +1,10 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::types::{Model, OutputConfig, ThinkingConfig};
-
-/// Inference speed for a message or fallback attempt.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InferenceSpeed {
-    /// Standard inference speed and pricing.
-    Standard,
-    /// Fast inference mode, where supported.
-    Fast,
-    /// A speed this crate does not know.
-    ///
-    /// Never send it; it only models values this crate does not know.
-    #[serde(other)]
-    Unknown,
-}
+use crate::types::{InferenceSpeed, Model, OutputConfig, ThinkingConfig};
 
 /// Configuration for one named server-side fallback attempt.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FallbackConfig {
     /// Model to try for this attempt.
     pub model: Model,
@@ -38,6 +24,7 @@ pub struct FallbackConfig {
 
 impl FallbackConfig {
     /// Create a fallback attempt using the model's inherited request settings.
+    #[must_use]
     pub fn new(model: impl Into<Model>) -> Self {
         Self {
             model: model.into(),
@@ -49,24 +36,28 @@ impl FallbackConfig {
     }
 
     /// Override the output-token limit for this fallback.
+    #[must_use]
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
     }
 
     /// Override thinking configuration for this fallback.
+    #[must_use]
     pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
     }
 
     /// Override output configuration for this fallback.
+    #[must_use]
     pub fn with_output_config(mut self, output_config: OutputConfig) -> Self {
         self.output_config = Some(output_config);
         self
     }
 
     /// Override inference speed for this fallback.
+    #[must_use]
     pub fn with_speed(mut self, speed: InferenceSpeed) -> Self {
         self.speed = Some(speed);
         self

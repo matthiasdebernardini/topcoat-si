@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::str::FromStr;
 
 /// A redacted thinking block that contains encoded/obscured thinking data.
 ///
 /// This block is used when the full thinking contents are not directly accessible.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct RedactedThinkingBlock {
     /// The encoded thinking data (redacted from normal display).
     pub data: String,
@@ -11,13 +14,14 @@ pub struct RedactedThinkingBlock {
 
 impl RedactedThinkingBlock {
     /// Creates a new RedactedThinkingBlock with the specified data.
-    pub fn new<S: Into<String>>(data: S) -> Self {
+    #[must_use]
+    pub fn new(data: impl Into<String>) -> Self {
         Self { data: data.into() }
     }
 }
 
-impl std::str::FromStr for RedactedThinkingBlock {
-    type Err = std::convert::Infallible;
+impl FromStr for RedactedThinkingBlock {
+    type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self::new(s))

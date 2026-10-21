@@ -4,6 +4,7 @@ use crate::types::ToolResultBlockContent;
 
 /// A tool call the API made against a remote MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct McpToolUseBlock {
     /// Unique identifier of this tool call.
     pub id: String,
@@ -20,6 +21,7 @@ pub struct McpToolUseBlock {
 
 /// The result of an MCP tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct McpToolResultBlock {
     /// The ID of the `mcp_tool_use` block this result answers.
     pub tool_use_id: String,

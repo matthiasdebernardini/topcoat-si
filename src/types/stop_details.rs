@@ -4,6 +4,7 @@ use crate::types::Model;
 
 /// Additional details returned when generation stops with a refusal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StopDetails {
     /// Detail discriminator. Currently `refusal`.
     pub r#type: String,

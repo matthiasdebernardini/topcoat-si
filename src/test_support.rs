@@ -1,10 +1,15 @@
-//! A local fake HTTP server for tests: one canned response per connection, every request recorded.
+#![cfg(test)]
+//! Test helpers: a local fake HTTP server (one canned response per connection, every request
+//! recorded) and a recorder for the warnings logged on unknown API values.
 
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tracing::subscriber::DefaultGuard;
+use tracing::{field, span};
 
 /// One canned response: status, extra headers, body, content type and an optional stall.
 #[derive(Debug, Clone)]
@@ -123,4 +128,107 @@ pub(crate) async fn serve(responses: Vec<Canned>) -> (String, Arc<Mutex<Vec<Reco
         }
     });
     (format!("http://{address}"), recorded)
+}
+
+/// Records the warnings logged on the `topcoat_si::unknown` target, one `field=value` line each.
+struct UnknownWarnings(Arc<Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for UnknownWarnings {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+        span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let metadata = event.metadata();
+        if metadata.target() != "topcoat_si::unknown" || *metadata.level() != tracing::Level::WARN {
+            return;
+        }
+        struct Fields(Vec<String>);
+        impl field::Visit for Fields {
+            fn record_debug(&mut self, field: &field::Field, value: &dyn fmt::Debug) {
+                if field.name() != "message" {
+                    self.0.push(format!("{}={value:?}", field.name()));
+                }
+            }
+            fn record_str(&mut self, field: &field::Field, value: &str) {
+                self.0.push(format!("{}={value}", field.name()));
+            }
+        }
+        let mut fields = Fields(Vec::new());
+        event.record(&mut fields);
+        self.0.lock().unwrap().push(fields.0.join(" "));
+    }
+
+    fn enter(&self, _span: &span::Id) {}
+
+    fn exit(&self, _span: &span::Id) {}
+}
+
+/// Runs `f` and returns its result with every unknown-value warning it logged on this thread,
+/// each as `rust_type=... tag=...`.
+pub(crate) fn unknown_warnings<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let result = tracing::subscriber::with_default(UnknownWarnings(warnings.clone()), f);
+    let warnings = warnings.lock().unwrap().clone();
+    (result, warnings)
+}
+
+/// Records the target of every span and event: `span <name> <target>` or `event <target>`.
+struct Targets(Arc<Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for Targets {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, span: &span::Attributes<'_>) -> span::Id {
+        let metadata = span.metadata();
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("span {} {}", metadata.name(), metadata.target()));
+        span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("event {}", event.metadata().target()));
+    }
+
+    fn enter(&self, _span: &span::Id) {}
+
+    fn exit(&self, _span: &span::Id) {}
+}
+
+/// Records the targets of the spans and events on this thread until the guard drops. Use it in
+/// a current-thread test so every await stays on this thread.
+pub(crate) fn record_targets() -> (DefaultGuard, Arc<Mutex<Vec<String>>>) {
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let guard = tracing::subscriber::set_default(Targets(targets.clone()));
+    (guard, targets)
+}
+
+/// Whether `client` consults any proxy, system or configured.
+///
+/// reqwest 0.13's `ClientBuilder::build` always adds the system proxy matcher unless
+/// `no_proxy()` was called, and the client's `Debug` output prints a `proxies` field only when
+/// its proxy list is nonempty. So the Debug text tells whether a client may use a proxy without
+/// touching any environment variable. A reqwest upgrade that changes this Debug output makes
+/// the tests that use this helper fail loudly, not pass silently.
+pub(crate) fn uses_proxies(client: &reqwest::Client) -> bool {
+    format!("{client:?}").contains("proxies")
 }

@@ -1,12 +1,16 @@
+#![cfg(test)]
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{Value, json};
 
+use super::client::DEFAULT_BASE_URL;
 use super::*;
 use crate::ClientTool;
-use crate::test_support::{Canned, Recorded, serve};
+use crate::error::Error;
+use crate::test_support::{Canned, Recorded, serve, uses_proxies};
 use crate::types::{
     Content, ToolResultBlock, ToolResultBlockContent, ToolUnionParam, ToolUseBlock,
 };
@@ -23,14 +27,22 @@ enum Team {
 }
 
 impl Choices for Team {
-    const OPTIONS: &'static [(Self, &'static str, Option<&'static str>)] = &[
-        (
-            Team::Billing,
-            "billing",
-            Some("Charges, payments, and refunds"),
-        ),
-        (Team::Technical, "technical", Some("Software faults")),
-        (Team::Other, "other", Some("Anything else")),
+    const OPTIONS: &'static [ChoiceOption<Self>] = &[
+        ChoiceOption {
+            value: Team::Billing,
+            label: "billing",
+            description: Some("Charges, payments, and refunds"),
+        },
+        ChoiceOption {
+            value: Team::Technical,
+            label: "technical",
+            description: Some("Software faults"),
+        },
+        ChoiceOption {
+            value: Team::Other,
+            label: "other",
+            description: Some("Anything else"),
+        },
     ];
 }
 
@@ -42,15 +54,24 @@ enum Urgency {
 }
 
 impl Levels for Urgency {
-    const LEVELS: &'static [(Self, &'static str)] = &[
-        (Urgency::NoDeadline, "No deadline"),
-        (Urgency::Week, "Within a week"),
-        (Urgency::Today, "Today"),
+    const LEVELS: &'static [Level<Self>] = &[
+        Level {
+            value: Urgency::NoDeadline,
+            text: "No deadline",
+        },
+        Level {
+            value: Urgency::Week,
+            text: "Within a week",
+        },
+        Level {
+            value: Urgency::Today,
+            text: "Today",
+        },
     ];
 }
 
 fn client(base_url: &str) -> JevClient {
-    JevClient::new(KEY, "jev-1.13.0")
+    JevClient::try_new(KEY, "jev-1.13.0")
         .unwrap()
         .with_base_url(base_url)
         .unwrap()
@@ -162,7 +183,11 @@ async fn golden_request_bytes_and_headers() {
     assert_eq!(header(request, "x-typesafe-retry-count"), None);
 
     assert_eq!(response.model, "jev-1.13.0");
-    let names: Vec<&str> = response.answers.iter().map(|(n, _)| n.as_str()).collect();
+    let names: Vec<&str> = response
+        .answers
+        .iter()
+        .map(|answer| answer.name.as_str())
+        .collect();
     assert_eq!(names, ["route", "urgency", "refund_requested"]);
     assert_eq!(
         response.usage,
@@ -389,12 +414,12 @@ fn rounded_probabilities_are_accepted() {
     let route = response.choice("route").unwrap();
     assert_eq!(route.choice, "technical");
     assert_eq!(
-        route.probabilities,
-        vec![
-            ("billing".to_string(), 0.4),
-            ("technical".to_string(), 0.39),
-            ("other".to_string(), 0.2)
-        ]
+        route
+            .probabilities
+            .iter()
+            .map(|label| (label.label.as_str(), label.probability))
+            .collect::<Vec<_>>(),
+        vec![("billing", 0.4), ("technical", 0.39), ("other", 0.2)]
     );
     assert_eq!(
         response.choose::<Team>("route", 0.1).unwrap(),
@@ -428,7 +453,7 @@ async fn unknown_answer_type_is_kept_and_reported_at_extraction() {
         .unwrap();
     assert_eq!(response.noul("refund").unwrap(), 0.97);
     assert_eq!(
-        response.answers[1].1,
+        response.answers[1].answer,
         Answer::Unknown {
             kind: "ranking".to_string(),
             raw: json!({"type": "ranking", "ranking": ["a", "b"]})
@@ -920,24 +945,24 @@ fn env_config_requires_key_and_model() {
         ("TYPESAFE_BASE_URL", "http://api.typesafe.ai"),
     ]))
     .unwrap_err();
-    assert_eq!(validation_param(&error), Some("base_url"));
+    assert_eq!(validation_param(&error), Some("TYPESAFE_BASE_URL"));
 }
 
 #[test]
 fn constructor_checks_key_and_model() {
     for key in ["", "   ", "ts key", "ts-kéy", "ts-key\u{7f}"] {
-        let error = JevClient::new(key, "jev-1.13.0").unwrap_err();
+        let error = JevClient::try_new(key, "jev-1.13.0").unwrap_err();
         assert_eq!(validation_param(&error), Some("api_key"), "{key:?}");
     }
-    let error = JevClient::new(KEY, " ").unwrap_err();
+    let error = JevClient::try_new(KEY, " ").unwrap_err();
     assert_eq!(validation_param(&error), Some("model"));
-    let jev = JevClient::new(format!("  {KEY}\n"), "jev-1.13.0").unwrap();
+    let jev = JevClient::try_new(&format!("  {KEY}\n"), "jev-1.13.0").unwrap();
     assert_eq!(jev.model(), "jev-1.13.0");
 }
 
 #[test]
 fn base_url_needs_https_or_loopback_http() {
-    let jev = || JevClient::new(KEY, "jev-1.13.0").unwrap();
+    let jev = || JevClient::try_new(KEY, "jev-1.13.0").unwrap();
     for url in [
         "https://api.typesafe.ai/",
         "https://staging.example.com/jev",
@@ -966,6 +991,21 @@ fn base_url_needs_https_or_loopback_http() {
         let error = jev().with_base_url(url).unwrap_err();
         assert_eq!(validation_param(&error), Some("base_url"), "{url}");
     }
+}
+
+#[test]
+fn loopback_base_url_skips_proxies() {
+    let jev = JevClient::try_new(KEY, "jev-1.13.0").unwrap();
+    assert!(uses_proxies(&jev.http));
+    let jev = jev.with_base_url("http://127.0.0.1:1").unwrap();
+    assert!(!uses_proxies(&jev.http));
+    let jev = JevClient::from_env_with(env(&[
+        ("TYPESAFE_API_KEY", KEY),
+        ("TYPESAFE_DEFAULT_MODEL", "jev-1.13.0"),
+        ("TYPESAFE_BASE_URL", "http://127.0.0.1:1"),
+    ]))
+    .unwrap();
+    assert!(!uses_proxies(&jev.http));
 }
 
 fn tool_use(input: Value) -> ToolUseBlock {
@@ -1268,7 +1308,7 @@ fn malformed_known_answer_is_reported_per_question() {
         assert!(!error.to_string().contains(SECRET), "{error}");
     }
     assert!(matches!(
-        &response.answers[1].1,
+        &response.answers[1].answer,
         Answer::Malformed { kind, .. } if kind == "noul"
     ));
     let error = response.noul("other").unwrap_err();

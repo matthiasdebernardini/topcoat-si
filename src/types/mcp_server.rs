@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Tool configuration for an MCP (Model Context Protocol) server.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct McpToolConfiguration {
     /// Whether the server's tools are enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -15,10 +16,27 @@ pub struct McpToolConfiguration {
     pub allowed_tools: Option<Vec<String>>,
 }
 
+impl McpToolConfiguration {
+    /// Enable or disable all of the server's tools.
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = Some(enabled);
+        self
+    }
+
+    /// Restrict the model to the named tools.
+    #[must_use]
+    pub fn with_allowed_tools(mut self, allowed_tools: Vec<String>) -> Self {
+        self.allowed_tools = Some(allowed_tools);
+        self
+    }
+}
+
 /// A remote MCP server the API connects to on the model's behalf.
 ///
 /// Requires the `mcp-client-2025-11-20` beta, which is added automatically.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct McpServer {
     /// URL of the MCP server; must start with `https://`.
     pub url: String,
@@ -35,6 +53,7 @@ pub struct McpServer {
 
 impl McpServer {
     /// Create an MCP server entry.
+    #[must_use]
     pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -45,12 +64,14 @@ impl McpServer {
     }
 
     /// Set the authorization token.
+    #[must_use]
     pub fn with_authorization_token(mut self, token: impl Into<String>) -> Self {
         self.authorization_token = Some(token.into());
         self
     }
 
     /// Set the tool configuration.
+    #[must_use]
     pub fn with_tool_configuration(mut self, configuration: McpToolConfiguration) -> Self {
         self.tool_configuration = Some(configuration);
         self

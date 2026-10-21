@@ -21,11 +21,23 @@ const MAX_EVENT_SIZE: usize = MAX_BUFFER_SIZE;
 
 /// A raw server-sent event frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SseEvent {
     /// The SSE event name from the `event:` field.
     pub event: String,
     /// The SSE payload assembled from all `data:` lines.
     pub data: String,
+}
+
+impl SseEvent {
+    /// Builds a frame from its `event:` name and its `data:` payload.
+    #[must_use]
+    pub fn new(event: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            event: event.into(),
+            data: data.into(),
+        }
+    }
 }
 
 /// State for SSE processing with production hardening
@@ -176,7 +188,7 @@ where
                         state.fail();
                         return Some((
                             Err(Error::encoding(
-                                "Incomplete UTF-8 sequence at end of SSE stream".to_string(),
+                                "Incomplete UTF-8 sequence at end of SSE stream",
                                 None,
                             )),
                             (stream, state),
@@ -223,7 +235,11 @@ pub fn parse_message_stream_event(event: &SseEvent) -> Result<MessageStreamEvent
             .map(MessageStreamEvent::ContentBlockStop)
             .map_err(Into::into),
         "error" => Err(parse_stream_error(&event.data)),
-        _ => Ok(MessageStreamEvent::Unknown),
+        name => {
+            // Dropped by `process_message_stream_sse`; the event name is enough to spot it.
+            crate::types::warn_unknown("MessageStreamEvent", name);
+            Ok(MessageStreamEvent::Unknown)
+        }
     }
 }
 
@@ -239,12 +255,7 @@ where
             let output = if *finished {
                 None
             } else {
-                let decoded = result.and_then(|event| {
-                tracing::trace!(target: "topcoat_si::wire", event = %event.event, data = %event.data);
-                let result = parse_message_stream_event(&event);
-                if result.is_err() { observability::stream_error(); }
-                result
-            });
+                let decoded = decode(result);
                 if decoded.is_err() {
                     *finished = true;
                 }
@@ -259,6 +270,19 @@ where
             })
         })
         .fuse()
+}
+
+/// Decode one framed SSE event, counting a stream error only when decoding fails.
+///
+/// Framing errors pass through uncounted: `process_sse` already counted them.
+fn decode(result: Result<SseEvent>) -> Result<MessageStreamEvent> {
+    let event = result?;
+    tracing::trace!(target: "topcoat_si::wire", event = %event.event, data = %event.data);
+    let decoded = parse_message_stream_event(&event);
+    if decoded.is_err() {
+        observability::stream_error();
+    }
+    decoded
 }
 
 /// Extract a complete SSE event from a buffer string with size validation.
@@ -313,7 +337,7 @@ fn extract_event(buffer: &str) -> Result<Option<(Result<SseEvent>, String)>> {
     let Some(event) = event_type else {
         return Ok(Some((
             Err(Error::serialization(
-                "Malformed SSE event: missing event type line".to_string(),
+                "Malformed SSE event: missing event type line",
                 None,
             )),
             rest,
@@ -323,7 +347,7 @@ fn extract_event(buffer: &str) -> Result<Option<(Result<SseEvent>, String)>> {
     if data_lines.is_empty() {
         return Ok(Some((
             Err(Error::serialization(
-                "Malformed SSE event: missing data lines".to_string(),
+                "Malformed SSE event: missing data lines",
                 None,
             )),
             rest,
@@ -585,7 +609,7 @@ mod tests {
     #[tokio::test]
     async fn handle_partial_utf8() {
         let valid_part = "event: ping\ndata: test";
-        let invalid_bytes = vec![0xFF, 0xFE];
+        let invalid_bytes = vec![0xff, 0xfe];
 
         let mut data = valid_part.as_bytes().to_vec();
         data.extend_from_slice(&invalid_bytes);

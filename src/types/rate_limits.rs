@@ -6,6 +6,7 @@ use time::format_description::well_known::{Rfc2822, Rfc3339};
 
 /// One rate-limit window reported by `anthropic-ratelimit-*` response headers.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct RateLimitWindow {
     /// The maximum value permitted in the window.
     pub limit: u64,
@@ -17,6 +18,7 @@ pub struct RateLimitWindow {
 
 /// Rate-limit state read from the headers of one API response.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct RateLimits {
     /// Requests window.
     pub requests: Option<RateLimitWindow>,
@@ -87,6 +89,7 @@ impl RateLimits {
     ///
     /// A window is `Some` only when both its `-limit` and `-remaining` headers parse.
     /// Malformed values are ignored.
+    #[must_use]
     pub fn from_headers(headers: &HeaderMap) -> Self {
         Self {
             requests: window(headers, "anthropic-ratelimit-requests"),

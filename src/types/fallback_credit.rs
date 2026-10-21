@@ -1,7 +1,11 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+
+use crate::types::open_union;
 
 /// Fallback-credit outcome reported in `usage` on the fallback-credit beta.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FallbackCredit {
     /// Whether the credit was applied, and why not when it was not.
     pub status: FallbackCreditStatus,
@@ -9,14 +13,16 @@ pub struct FallbackCredit {
 
 impl FallbackCredit {
     /// Create a new `FallbackCredit` with the given status.
+    #[must_use]
     pub fn new(status: FallbackCreditStatus) -> Self {
         Self { status }
     }
 }
 
 /// Whether the fallback credit was applied, tagged by `type` on the wire.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FallbackCreditStatus {
     /// The credit was redeemed.
     Redeemed,
@@ -29,13 +35,39 @@ pub enum FallbackCreditStatus {
         remove_to_redeem: Option<Vec<String>>,
     },
     /// A status this version does not know.
-    #[serde(other)]
     Unknown,
 }
 
+impl<'de> Deserialize<'de> for FallbackCreditStatus {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct NotApplied {
+            reason: FallbackCreditReason,
+            #[serde(default)]
+            remove_to_redeem: Option<Vec<String>>,
+        }
+
+        let value = Value::deserialize(deserializer)?;
+        match open_union::type_tag::<D::Error>(&value)?.as_str() {
+            "redeemed" => Ok(Self::Redeemed),
+            "not_applied" => {
+                open_union::from_value(value).map(|not_applied: NotApplied| Self::NotApplied {
+                    reason: not_applied.reason,
+                    remove_to_redeem: not_applied.remove_to_redeem,
+                })
+            }
+            tag => {
+                open_union::warn_unknown("FallbackCreditStatus", tag);
+                Ok(Self::Unknown)
+            }
+        }
+    }
+}
+
 /// Why a fallback credit was not applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FallbackCreditReason {
     /// The request body does not match the one the credit was issued for.
     BodyMismatch,
@@ -62,8 +94,32 @@ pub enum FallbackCreditReason {
     /// The credit belongs to another workspace.
     WrongWorkspace,
     /// A reason this version does not know.
-    #[serde(other)]
     Unknown,
+}
+
+impl<'de> Deserialize<'de> for FallbackCreditReason {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "FallbackCreditReason",
+            |value| match value {
+                "body_mismatch" => Some(Self::BodyMismatch),
+                "continuation_excluded" => Some(Self::ContinuationExcluded),
+                "continuation_only" => Some(Self::ContinuationOnly),
+                "expired" => Some(Self::Expired),
+                "invalid_target_model" => Some(Self::InvalidTargetModel),
+                "not_enabled" => Some(Self::NotEnabled),
+                "reprice_unavailable" => Some(Self::RepriceUnavailable),
+                "temporarily_unavailable" => Some(Self::TemporarilyUnavailable),
+                "variant_fields_present" => Some(Self::VariantFieldsPresent),
+                "wrong_organization" => Some(Self::WrongOrganization),
+                "wrong_platform" => Some(Self::WrongPlatform),
+                "wrong_workspace" => Some(Self::WrongWorkspace),
+                _ => None,
+            },
+            Self::Unknown,
+        )
+    }
 }
 
 #[cfg(test)]

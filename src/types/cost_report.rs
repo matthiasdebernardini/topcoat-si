@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::types::usage_report::rfc3339;
+use crate::types::usage_report;
 
 /// A dimension to group cost-report results by.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CostGroupBy {
     /// Group by line-item description (also returns model, token type and tier details).
     Description,
@@ -14,7 +15,7 @@ pub enum CostGroupBy {
 }
 
 impl CostGroupBy {
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             CostGroupBy::Description => "description",
             CostGroupBy::WorkspaceId => "workspace_id",
@@ -26,6 +27,7 @@ impl CostGroupBy {
 ///
 /// The bucket width is always one day.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CostReportParams {
     /// Start of the reporting window (inclusive).
     pub starting_at: OffsetDateTime,
@@ -41,6 +43,7 @@ pub struct CostReportParams {
 
 impl CostReportParams {
     /// Create parameters reporting from `starting_at`.
+    #[must_use]
     pub fn new(starting_at: OffsetDateTime) -> Self {
         Self {
             starting_at,
@@ -52,35 +55,40 @@ impl CostReportParams {
     }
 
     /// Set the end of the reporting window.
+    #[must_use]
     pub fn with_ending_at(mut self, ending_at: OffsetDateTime) -> Self {
         self.ending_at = Some(ending_at);
         self
     }
 
     /// Add a grouping dimension.
+    #[must_use]
     pub fn group_by(mut self, group_by: CostGroupBy) -> Self {
         self.group_by.push(group_by);
         self
     }
 
     /// Set the maximum number of buckets to return.
+    #[must_use]
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
         self
     }
 
     /// Set the pagination cursor.
+    #[must_use]
     pub fn with_page(mut self, page: impl Into<String>) -> Self {
         self.page = Some(page.into());
         self
     }
 
     /// Build the URL-encoded query string, repeating array keys with a `[]` suffix.
+    #[must_use]
     pub fn to_query(&self) -> String {
         let mut query = url::form_urlencoded::Serializer::new(String::new());
-        query.append_pair("starting_at", &rfc3339(self.starting_at));
+        query.append_pair("starting_at", &usage_report::rfc3339(self.starting_at));
         if let Some(ending_at) = self.ending_at {
-            query.append_pair("ending_at", &rfc3339(ending_at));
+            query.append_pair("ending_at", &usage_report::rfc3339(ending_at));
         }
         query.append_pair("bucket_width", "1d");
         for group in &self.group_by {
@@ -98,6 +106,7 @@ impl CostReportParams {
 
 /// One cost line inside a cost bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CostBucketResult {
     /// Decimal string in the currency's lowest unit (cents): `"123.78912"` is $1.2378912.
     pub amount: String,
@@ -137,6 +146,7 @@ impl CostBucketResult {
     ///
     /// The fraction is padded or truncated to 6 digits; no floats are involved.  Returns
     /// `None` for negatives, non-digits, or values that overflow `u64`.
+    #[must_use]
     pub fn amount_micro_cents(&self) -> Option<u64> {
         let (whole, fraction) = self
             .amount
@@ -160,6 +170,7 @@ impl CostBucketResult {
 
 /// One daily bucket of a cost report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CostBucket {
     /// Start of the bucket (inclusive).
     #[serde(with = "time::serde::rfc3339")]
@@ -173,6 +184,7 @@ pub struct CostBucket {
 
 /// A page of the Admin API cost report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CostReport {
     /// The buckets on this page.
     pub data: Vec<CostBucket>,

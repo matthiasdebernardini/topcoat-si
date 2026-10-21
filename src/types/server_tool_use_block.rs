@@ -7,6 +7,7 @@ use crate::types::CacheControlEphemeral;
 ///
 /// ServerToolUseBlocks indicate the model wants to use a server-side tool (like web fetch).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct ServerToolUseBlock {
     /// A unique identifier for this tool use request.
     pub id: String,
@@ -24,7 +25,8 @@ pub struct ServerToolUseBlock {
 
 impl ServerToolUseBlock {
     /// Creates a new ServerToolUseBlock with the specified id, tool name and input.
-    pub fn new<S1: Into<String>, S2: Into<String>>(id: S1, name: S2, input: Value) -> Self {
+    #[must_use]
+    pub fn new(id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
         Self {
             id: id.into(),
             input,
@@ -34,6 +36,7 @@ impl ServerToolUseBlock {
     }
 
     /// Add a cache control to this server tool use block.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self

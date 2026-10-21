@@ -1,8 +1,13 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::convert::Infallible;
+use std::str::FromStr;
+
+use crate::types::thinking_block;
 
 /// A thinking delta, representing a piece of thinking in a streaming response.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct ThinkingDelta {
     /// The thinking content.
     pub thinking: String,
@@ -15,47 +20,28 @@ impl<'de> Deserialize<'de> for ThinkingDelta {
     {
         let value = Value::deserialize(deserializer)?;
         Ok(Self {
-            thinking: extract_thinking_text(&value).unwrap_or_default(),
+            thinking: thinking_block::thinking_text(
+                &value,
+                &["thinking", "summary", "text", "content"],
+                "",
+            )
+            .unwrap_or_default(),
         })
-    }
-}
-
-fn extract_thinking_text(value: &Value) -> Option<String> {
-    for field in ["thinking", "summary", "text", "content"] {
-        if let Some(candidate) = value.get(field)
-            && let Some(text) = extract_textish(candidate)
-        {
-            return Some(text);
-        }
-    }
-    None
-}
-
-fn extract_textish(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(items) => {
-            let text = items
-                .iter()
-                .filter_map(extract_textish)
-                .collect::<Vec<_>>()
-                .join("");
-            if text.is_empty() { None } else { Some(text) }
-        }
-        Value::Object(_) => extract_thinking_text(value),
-        _ => None,
     }
 }
 
 impl ThinkingDelta {
     /// Create a new `ThinkingDelta` with the given thinking text.
-    pub fn new(thinking: String) -> Self {
-        Self { thinking }
+    #[must_use]
+    pub fn new(thinking: impl Into<String>) -> Self {
+        Self {
+            thinking: thinking.into(),
+        }
     }
 }
 
-impl std::str::FromStr for ThinkingDelta {
-    type Err = std::convert::Infallible;
+impl FromStr for ThinkingDelta {
+    type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self::new(s.to_string()))
@@ -69,7 +55,7 @@ mod tests {
 
     #[test]
     fn thinking_delta_serialization() {
-        let delta = ThinkingDelta::new("Let me think about this...".to_string());
+        let delta = ThinkingDelta::new("Let me think about this...");
         let json = to_value(&delta).unwrap();
 
         assert_eq!(

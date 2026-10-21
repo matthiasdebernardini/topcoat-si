@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum OutputFormat {
     /// JSON schema format for structured outputs.
     ///
@@ -64,6 +65,7 @@ impl OutputFormat {
     ///     "additionalProperties": false
     /// }));
     /// ```
+    #[must_use]
     pub fn json_schema(schema: serde_json::Value) -> Self {
         Self::JsonSchema { schema }
     }

@@ -1,18 +1,19 @@
 //! The client-side `web_search` tool backed by Firecrawl.
 
+use std::collections::HashSet;
+
 use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::json;
 
+use super::filter::{self, Filter};
 use super::{
     FirecrawlClient, ScrapeOptions, SearchRequest, SearchResponse, SearchSource, TimeRange,
+    tool_result,
 };
+use crate::client_tool::ClientTool;
 use crate::error::{Error, Result};
-use crate::tool::ClientTool;
-use crate::types::{
-    CitationsConfig, Content, SearchResultBlock, TextBlock, ToolParam, ToolResultBlock,
-    ToolUnionParam, ToolUseBlock,
-};
+use crate::types::{Content, TextBlock, ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock};
 
 /// Name the model calls the Firecrawl search tool by.
 pub const WEB_SEARCH_TOOL_NAME: &str = "web_search";
@@ -40,6 +41,7 @@ pub struct FirecrawlWebSearch {
 
 impl FirecrawlWebSearch {
     /// Wrap a client with the defaults: 5 results, main-content markdown cut at 8000 characters.
+    #[must_use]
     pub fn new(client: FirecrawlClient) -> Self {
         Self {
             client,
@@ -54,42 +56,49 @@ impl FirecrawlWebSearch {
     }
 
     /// Results returned when the model does not ask for a number, 1 to 10.
+    #[must_use]
     pub fn with_default_limit(mut self, limit: u32) -> Self {
         self.default_limit = limit;
         self
     }
 
     /// Scraping applied to each result, or `None` to return search snippets only.
+    #[must_use]
     pub fn with_scrape_options(mut self, scrape_options: Option<ScrapeOptions>) -> Self {
         self.scrape_options = scrape_options;
         self
     }
 
     /// Characters of page content kept per result.
+    #[must_use]
     pub fn with_max_content_chars(mut self, max_content_chars: usize) -> Self {
         self.max_content_chars = max_content_chars;
         self
     }
 
     /// Country searched from when the model does not pick one.
+    #[must_use]
     pub fn with_country(mut self, country: impl Into<String>) -> Self {
         self.country = Some(country.into());
         self
     }
 
     /// Location searched from.
+    #[must_use]
     pub fn with_location(mut self, location: impl Into<String>) -> Self {
         self.location = Some(location.into());
         self
     }
 
     /// Only ever return results from these hostnames.
+    #[must_use]
     pub fn with_allowed_domains(mut self, domains: Vec<String>) -> Self {
         self.allowed_domains = domains;
         self
     }
 
     /// Never return results from these hostnames.
+    #[must_use]
     pub fn with_blocked_domains(mut self, domains: Vec<String>) -> Self {
         self.blocked_domains = domains;
         self
@@ -184,10 +193,10 @@ impl FirecrawlWebSearch {
     pub async fn execute(&self, tool_use: &ToolUseBlock) -> Result<ToolResultBlock> {
         let filter = self.checked_config()?;
         let id = tool_use.id.clone();
-        let input = match serde_json::from_value::<ModelInput>(tool_use.input.clone()) {
+        let input = match ModelInput::deserialize(&tool_use.input) {
             Ok(input) => input,
             Err(error) => {
-                return Ok(error_result(
+                return Ok(ToolResultBlock::error(
                     id,
                     format!(
                         "Invalid web_search input: {error}. Send an object with a \"query\" \
@@ -205,15 +214,15 @@ impl FirecrawlWebSearch {
                 Ok((response, filter, total)) => {
                     self.result(id, &input.query, response, &filter, total)
                 }
-                Err(message) => error_result(id, message),
+                Err(message) => ToolResultBlock::error(id, message),
             },
         )
     }
 
     /// Search for the sandbox's `search(...)`: the same checks and error mapping as
     /// [`FirecrawlWebSearch::execute`], returning web results as data; `markdown` is only set
-    /// when `scrape`. A `limit` over 10 is
-    /// capped at 10. The inner `Err` is a message the model can act on; `Err` is fatal.
+    /// when `scrape`. A `limit` over 10 is capped at 10. The inner `Err` is a message the model
+    /// can act on; `Err` is fatal.
     #[cfg(feature = "code-mode")]
     pub(crate) async fn search_values(
         &self,
@@ -253,7 +262,9 @@ impl FirecrawlWebSearch {
                     url: web.url.filter(|u| filter.permits(u))?,
                     title: web.title,
                     description: web.description,
-                    markdown: web.markdown.map(|m| truncate(&m, self.max_content_chars)),
+                    markdown: web
+                        .markdown
+                        .map(|m| tool_result::truncate(&m, self.max_content_chars)),
                     status: web.metadata.and_then(|m| m.status_code),
                 })
             })
@@ -311,19 +322,7 @@ impl FirecrawlWebSearch {
                 return Err(invalid(format!("{param} must not be empty"), param));
             }
         }
-        let parse = |domains: &[String], param: &str| {
-            normalize_domains(domains)
-                .map_err(|bad| invalid(format!("{param} entry {bad:?} is not a hostname"), param))
-        };
-        let allowed = parse(&self.allowed_domains, "allowed_domains")?;
-        let blocked = parse(&self.blocked_domains, "blocked_domains")?;
-        if !allowed.is_empty() && allowed.iter().all(|a| is_blocked(a, &blocked)) {
-            return Err(invalid(
-                "every allowed domain is also blocked".to_string(),
-                "allowed_domains",
-            ));
-        }
-        Ok(Filter { allowed, blocked })
+        Filter::try_new(&self.allowed_domains, &self.blocked_domains)
     }
 
     fn request(
@@ -332,7 +331,7 @@ impl FirecrawlWebSearch {
         mut filter: Filter,
     ) -> std::result::Result<(SearchRequest, Filter, u32), String> {
         let model_domains = |domains: &Option<Vec<String>>, field: &str| {
-            normalize_domains(domains.as_deref().unwrap_or_default()).map_err(|bad| {
+            filter::normalize_domains(domains.as_deref().unwrap_or_default()).map_err(|bad| {
                 format!(
                     "{field} entry {bad:?} is not a hostname. Use bare hostnames such as \
                      \"docs.rs\", without scheme, path or port."
@@ -356,7 +355,7 @@ impl FirecrawlWebSearch {
         } else {
             requested
                 .iter()
-                .filter(|d| filter.allowed.iter().any(|a| domain_matches(d, a)))
+                .filter(|d| filter.allowed.iter().any(|a| filter::domain_matches(d, a)))
                 .cloned()
                 .collect()
         };
@@ -368,7 +367,7 @@ impl FirecrawlWebSearch {
         }
         let unblocked: Vec<String> = narrowed
             .iter()
-            .filter(|d| !is_blocked(d, &filter.blocked))
+            .filter(|d| !filter::is_blocked(d, &filter.blocked))
             .cloned()
             .collect();
         if !narrowed.is_empty() && unblocked.is_empty() {
@@ -376,7 +375,7 @@ impl FirecrawlWebSearch {
         }
         let include: Vec<String> = unblocked
             .iter()
-            .filter(|d| !is_blocked(d, &excluded))
+            .filter(|d| !filter::is_blocked(d, &excluded))
             .cloned()
             .collect();
         if !unblocked.is_empty() && include.is_empty() {
@@ -390,7 +389,8 @@ impl FirecrawlWebSearch {
 
         let total = input.limit.unwrap_or(self.default_limit);
         let mut sources = Vec::new();
-        for source in input.sources.iter().flatten().map(|s| s.source()) {
+        let model_sources = input.sources.iter().flatten().map(|s| s.source());
+        for source in model_sources {
             if !sources.contains(&source) {
                 sources.push(source);
             }
@@ -434,25 +434,27 @@ impl FirecrawlWebSearch {
                 continue;
             };
             let mut content = Vec::new();
-            push_text(&mut content, web.description);
-            push_text(
+            tool_result::push_text(&mut content, web.description);
+            tool_result::push_text(
                 &mut content,
-                web.markdown.map(|m| truncate(&m, self.max_content_chars)),
+                web.markdown
+                    .map(|m| tool_result::truncate(&m, self.max_content_chars)),
             );
-            blocks.push(search_result(url, web.title, content));
+            blocks.push(tool_result::search_result(url, web.title, content));
         }
         for news in data.news.unwrap_or_default() {
             let Some(url) = news.url.filter(|u| filter.permits(u)) else {
                 continue;
             };
             let mut content = Vec::new();
-            push_text(&mut content, news.snippet);
-            push_text(&mut content, news.date.map(|d| format!("Published: {d}")));
-            push_text(
+            tool_result::push_text(&mut content, news.snippet);
+            tool_result::push_text(&mut content, news.date.map(|d| format!("Published: {d}")));
+            tool_result::push_text(
                 &mut content,
-                news.markdown.map(|m| truncate(&m, self.max_content_chars)),
+                news.markdown
+                    .map(|m| tool_result::truncate(&m, self.max_content_chars)),
             );
-            blocks.push(search_result(url, news.title, content));
+            blocks.push(tool_result::search_result(url, news.title, content));
         }
         blocks.truncate(usize::try_from(total).unwrap_or(usize::MAX));
         let warning = response
@@ -497,30 +499,6 @@ pub(crate) struct SearchHit {
     /// The page as markdown, cut to the tool's limit; only when scraped.
     markdown: Option<String>,
     status: Option<u16>,
-}
-
-/// Normalized domain lists applied to one call.
-pub(super) struct Filter {
-    pub(super) allowed: Vec<String>,
-    pub(super) blocked: Vec<String>,
-}
-
-impl Filter {
-    pub(super) fn permits(&self, url: &str) -> bool {
-        let Some(host) = url::Url::parse(url)
-            .ok()
-            .filter(|u| matches!(u.scheme(), "http" | "https"))
-            .and_then(|u| {
-                u.host_str()
-                    .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
-            })
-        else {
-            return false;
-        };
-        let allowed =
-            self.allowed.is_empty() || self.allowed.iter().any(|a| domain_matches(&host, a));
-        allowed && !is_blocked(&host, &self.blocked)
-    }
 }
 
 #[derive(Deserialize)]
@@ -585,88 +563,8 @@ fn merge_description(base: &serde_json::Value, description: &str) -> serde_json:
     value
 }
 
-pub(super) fn error_result(id: String, message: String) -> ToolResultBlock {
-    ToolResultBlock::new(id)
-        .with_string_content(message)
-        .with_error(true)
-}
-
-pub(super) fn search_result(
-    url: String,
-    title: Option<String>,
-    mut content: Vec<TextBlock>,
-) -> Content {
-    let title = title
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| url.clone());
-    // The API rejects a search result without content.
-    if content.is_empty() {
-        content.push(TextBlock::new(title.clone()));
-    }
-    Content::SearchResult(
-        SearchResultBlock::new(url, title, content).with_citations(CitationsConfig::enabled()),
-    )
-}
-
-pub(super) fn push_text(content: &mut Vec<TextBlock>, text: Option<String>) {
-    if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
-        content.push(TextBlock::new(text));
-    }
-}
-
-pub(super) fn truncate(text: &str, max_chars: usize) -> String {
-    match text.char_indices().nth(max_chars) {
-        Some((end, _)) => format!("{} [truncated]", &text[..end]),
-        None => text.to_string(),
-    }
-}
-
-/// Normalizes every entry, or returns the first one that is not a plain hostname.
-pub(super) fn normalize_domains(domains: &[String]) -> std::result::Result<Vec<String>, String> {
-    domains
-        .iter()
-        .map(|entry| normalize_domain(entry).ok_or_else(|| entry.clone()))
-        .collect()
-}
-
-/// Lowercase ASCII (punycode) form of a hostname entry, without wildcard prefix or root dot.
-fn normalize_domain(entry: &str) -> Option<String> {
-    let lower = entry.trim().to_lowercase();
-    let bare = lower
-        .strip_prefix("*.")
-        .or_else(|| lower.strip_prefix('.'))
-        .unwrap_or(&lower);
-    let bare = bare.strip_suffix('.').unwrap_or(bare);
-    let forbidden = |c: char| c.is_whitespace() || "/:?#@*[]\\".contains(c);
-    // An empty label ("..evil.com", "example..com") would never match a host, so a blocklist
-    // entry like that would silently block nothing.
-    if bare.split('.').any(str::is_empty) || bare.contains(forbidden) {
-        return None;
-    }
-    match url::Host::parse(bare).ok()? {
-        url::Host::Domain(domain) => {
-            let domain = domain.trim_end_matches('.');
-            (!domain.is_empty()).then(|| domain.to_string())
-        }
-        url::Host::Ipv4(ip) => Some(ip.to_string()),
-        url::Host::Ipv6(_) => None,
-    }
-}
-
-pub(super) fn is_blocked(host: &str, blocked: &[String]) -> bool {
-    blocked.iter().any(|b| domain_matches(host, b))
-}
-
 fn dedup(mut domains: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     domains.retain(|d| seen.insert(d.clone()));
     domains
-}
-
-/// Whether `host` is `domain` or one of its subdomains.
-fn domain_matches(host: &str, domain: &str) -> bool {
-    host == domain
-        || host
-            .strip_suffix(domain)
-            .is_some_and(|prefix| prefix.ends_with('.'))
 }

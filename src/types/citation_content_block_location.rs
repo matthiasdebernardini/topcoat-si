@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// This type is used to indicate a specific span of content blocks in a document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct CitationContentBlockLocation {
     /// The text that was cited
     pub cited_text: String,
@@ -28,15 +29,16 @@ pub struct CitationContentBlockLocation {
 
 impl CitationContentBlockLocation {
     /// Creates a new CitationContentBlockLocation
+    #[must_use]
     pub fn new(
-        cited_text: String,
+        cited_text: impl Into<String>,
         document_index: i32,
         start_block_index: i32,
         end_block_index: i32,
         document_title: Option<String>,
     ) -> Self {
         Self {
-            cited_text,
+            cited_text: cited_text.into(),
             document_index,
             document_title,
             end_block_index,
@@ -46,12 +48,14 @@ impl CitationContentBlockLocation {
     }
 
     /// Sets the ID of the cited file
+    #[must_use]
     pub fn with_file_id(mut self, file_id: impl Into<String>) -> Self {
         self.file_id = Some(file_id.into());
         self
     }
 
     /// Returns the number of content blocks in the citation span
+    #[must_use]
     pub fn block_count(&self) -> i32 {
         self.end_block_index - self.start_block_index
     }

@@ -1,10 +1,13 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::types::open_union;
 
 /// The service tier that served a request, as reported in `usage.service_tier`.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ServiceTier {
     /// Standard capacity.
     Standard,
@@ -13,8 +16,23 @@ pub enum ServiceTier {
     /// Message Batches processing, billed at 50% of standard rates.
     Batch,
     /// A tier this crate does not know.
-    #[serde(other)]
     Unknown,
+}
+
+impl<'de> Deserialize<'de> for ServiceTier {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "ServiceTier",
+            |value| match value {
+                "standard" => Some(Self::Standard),
+                "priority" => Some(Self::Priority),
+                "batch" => Some(Self::Batch),
+                _ => None,
+            },
+            Self::Unknown,
+        )
+    }
 }
 
 impl fmt::Display for ServiceTier {

@@ -5,8 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
 
-use super::to_json;
-use crate::code_mode::{Example, HostError, Pack, PyError, host_fn};
+use crate::code_mode::{Example, HostError, Pack, PyError, host_fn, value};
 use crate::error::Result;
 use crate::firecrawl::{FirecrawlFetchPage, FirecrawlWebSearch};
 
@@ -59,9 +58,10 @@ impl Credits {
 /// scrape options and content cut apply exactly as in the tool loop.
 ///
 /// `max_credits` is a per-conversation Firecrawl credit budget: a search counts its
-/// `credits_used`, or 1 when the response reports none, and a successful scrape counts 1. Once reached, both functions raise
-/// `RuntimeError`; calls already running in one `gather` finish, so the total can overshoot by
-/// those. Build a new pack for each conversation.
+/// `credits_used`, or 1 when the response reports none, and a successful scrape counts 1. Once
+/// reached, both functions raise `RuntimeError`; calls already running in one `gather` finish,
+/// so the total can overshoot by those. Build a new pack for each conversation.
+#[must_use]
 pub fn firecrawl(search: FirecrawlWebSearch, fetch: FirecrawlFetchPage, max_credits: u32) -> Pack {
     let credits = Arc::new(Credits {
         used: AtomicU64::new(0),
@@ -94,7 +94,7 @@ pub fn firecrawl(search: FirecrawlWebSearch, fetch: FirecrawlFetchPage, max_cred
                     let (results, used) = checked(found)?;
                     // A search that reports no credits still cost at least one.
                     credits.add(used.unwrap_or(1));
-                    to_json(results)
+                    value::to_json(results)
                 }
             },
         ))
@@ -109,7 +109,7 @@ pub fn firecrawl(search: FirecrawlWebSearch, fetch: FirecrawlFetchPage, max_cred
                     credits.check()?;
                     let page = checked(fetch.page_value(&args.url).await)?;
                     credits.add(1);
-                    to_json(page)
+                    value::to_json(page)
                 }
             },
         ))

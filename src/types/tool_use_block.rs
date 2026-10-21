@@ -7,6 +7,7 @@ use crate::types::CacheControlEphemeral;
 ///
 /// ToolUseBlocks indicate the model wants to use a specific tool with certain inputs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct ToolUseBlock {
     /// A unique identifier for this tool use request.
     pub id: String,
@@ -24,7 +25,8 @@ pub struct ToolUseBlock {
 
 impl ToolUseBlock {
     /// Creates a new ToolUseBlock with the specified id, name, and input.
-    pub fn new<S1: Into<String>, S2: Into<String>>(id: S1, name: S2, input: Value) -> Self {
+    #[must_use]
+    pub fn new(id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
@@ -34,6 +36,7 @@ impl ToolUseBlock {
     }
 
     /// Add a cache control to this tool use block.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self

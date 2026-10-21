@@ -1,6 +1,7 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 
+use crate::types::open_union;
 use crate::types::{ModelCapabilities, ModelLifecycle};
 
 /// Information about a specific model.
@@ -8,6 +9,7 @@ use crate::types::{ModelCapabilities, ModelLifecycle};
 /// This struct contains details about an Anthropic model, including its
 /// unique identifier, creation time, display name, and type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ModelInfo {
     /// Unique model identifier.
     pub id: String,
@@ -68,11 +70,27 @@ pub struct ModelInfo {
 /// Type of the model object.
 ///
 /// For model objects, this is always "model".
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ModelType {
     /// Model type
     Model,
+    /// An object type this crate does not know.
+    ///
+    /// Never send it; it only models values this crate does not know.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for ModelType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "ModelType",
+            |value| (value == "model").then_some(Self::Model),
+            Self::Unknown,
+        )
+    }
 }
 
 #[cfg(test)]

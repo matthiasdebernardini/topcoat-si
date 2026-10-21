@@ -1,7 +1,6 @@
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::Read;
+use std::io;
 use std::path::Path;
 
 /// Represents a base64-encoded PDF source.
@@ -9,6 +8,7 @@ use std::path::Path;
 /// This can be created from either a base64-encoded string or from a file path.
 /// The media_type is always "application/pdf".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct Base64PdfSource {
     /// The base64-encoded data of the PDF
     pub data: String,
@@ -24,9 +24,10 @@ fn default_media_type() -> String {
 
 impl Base64PdfSource {
     /// Create a new Base64PdfSource from a base64-encoded string
-    pub fn new(data: String) -> Self {
+    #[must_use]
+    pub fn new(data: impl Into<String>) -> Self {
         Self {
-            data,
+            data: data.into(),
             media_type: default_media_type(),
         }
     }
@@ -35,15 +36,18 @@ impl Base64PdfSource {
     ///
     /// This will read the file and encode it as base64.
     /// The file extension should be ".pdf".
-    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, std::io::Error> {
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
+        use base64::Engine;
+        use std::io::Read;
+
         let path = path.as_ref();
 
         // Verify file extension is .pdf
         match path.extension().and_then(|ext| ext.to_str()) {
             Some("pdf") => {}
             _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
                     "File extension must be .pdf",
                 ));
             }

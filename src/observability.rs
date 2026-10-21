@@ -67,11 +67,11 @@ pub(crate) fn stream_bytes(bytes: u64) {
     tracing::trace!(target: "topcoat_si::stream", bytes, "bytes");
 }
 
-/// The first byte of a stream arrived `ttfb` after the stream started.
-pub(crate) fn stream_first_byte(ttfb: Duration) {
+/// The first byte of a stream arrived `time_to_first_byte` after the stream started.
+pub(crate) fn stream_first_byte(time_to_first_byte: Duration) {
     tracing::debug!(
         target: "topcoat_si::stream",
-        ttfb_seconds = ttfb.as_secs_f64(),
+        ttfb_seconds = time_to_first_byte.as_secs_f64(),
         "first_byte"
     );
 }

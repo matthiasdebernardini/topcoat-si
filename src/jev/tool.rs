@@ -4,9 +4,9 @@ use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Answer, JevClient, JevResponse, Questions};
+use super::{Answer, JevClient, JevResponse, NamedAnswer, Questions};
+use crate::client_tool::ClientTool;
 use crate::error::{Error, Result};
-use crate::tool::ClientTool;
 use crate::types::{TextBlock, ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock};
 
 const TOOL_NAME: &str = "jev";
@@ -24,16 +24,17 @@ pub struct JevTool {
 
 impl JevTool {
     /// Wrap a client. The client's model, timeout and retries apply to every call.
+    #[must_use]
     pub fn new(client: JevClient) -> Self {
         Self { client }
     }
 
     async fn run(&self, tool_use: &ToolUseBlock) -> Result<ToolResultBlock> {
         let id = tool_use.id.clone();
-        let input = match serde_json::from_value::<ToolInput>(tool_use.input.clone()) {
+        let input = match ToolInput::deserialize(&tool_use.input) {
             Ok(input) => input,
             Err(error) => {
-                return Ok(error_result(
+                return Ok(ToolResultBlock::error(
                     id,
                     format!(
                         "Invalid jev input: {error}. Send an object with \"state\" (a string, \
@@ -42,15 +43,16 @@ impl JevTool {
                 ));
             }
         };
-        let questions = questions(&input.questions);
+        let questions = Questions::from_tool(&input.questions);
         match self.client.ask(input.state, &questions).await {
             Ok(response) => Ok(ToolResultBlock::new(id)
                 .with_text_content(TextBlock::new(render(&response, &input.questions)))),
             Err(error) if is_fatal(&error) => Err(error),
-            Err(Error::Validation { message, .. }) => {
-                Ok(error_result(id, format!("Invalid jev call: {message}")))
-            }
-            Err(error) => Ok(error_result(id, format!("Jev failed: {error}"))),
+            Err(Error::Validation { message, .. }) => Ok(ToolResultBlock::error(
+                id,
+                format!("Invalid jev call: {message}"),
+            )),
+            Err(error) => Ok(ToolResultBlock::error(id, format!("Jev failed: {error}"))),
         }
     }
 }
@@ -208,43 +210,40 @@ pub(crate) fn is_fatal(error: &Error) -> bool {
     }
 }
 
-fn error_result(id: String, message: String) -> ToolResultBlock {
-    ToolResultBlock::new(id)
-        .with_string_content(message)
-        .with_error(true)
-}
-
-/// The model's questions as [`Questions`], in order.
-pub(crate) fn questions(items: &[ToolQuestion]) -> Questions {
-    let mut questions = Questions::new();
-    for question in items {
-        questions = match question {
-            ToolQuestion::Noul { name, instructions } => {
-                questions.noul(name.as_str(), instructions.as_str())
-            }
-            ToolQuestion::Choice {
-                name,
-                instructions,
-                options,
-            } => questions.choice(
-                name.as_str(),
-                instructions.as_str(),
-                options
-                    .iter()
-                    .map(|o| (o.label.as_str(), o.description.as_deref())),
-            ),
-            ToolQuestion::Score {
-                name,
-                instructions,
-                levels,
-            } => questions.score(
-                name.as_str(),
-                instructions.as_str(),
-                levels.iter().map(String::as_str),
-            ),
-        };
+impl Questions {
+    /// The model's questions as [`Questions`], in order.
+    #[must_use]
+    pub(crate) fn from_tool(items: &[ToolQuestion]) -> Self {
+        let mut questions = Self::new();
+        for question in items {
+            questions = match question {
+                ToolQuestion::Noul { name, instructions } => {
+                    questions.noul(name.as_str(), instructions.as_str())
+                }
+                ToolQuestion::Choice {
+                    name,
+                    instructions,
+                    options,
+                } => questions.choice(
+                    name.as_str(),
+                    instructions.as_str(),
+                    options
+                        .iter()
+                        .map(|o| (o.label.as_str(), o.description.as_deref())),
+                ),
+                ToolQuestion::Score {
+                    name,
+                    instructions,
+                    levels,
+                } => questions.score(
+                    name.as_str(),
+                    instructions.as_str(),
+                    levels.iter().map(String::as_str),
+                ),
+            };
+        }
+        questions
     }
-    questions
 }
 
 fn render(response: &JevResponse, questions: &[ToolQuestion]) -> String {
@@ -268,14 +267,14 @@ pub(crate) fn answers(
         })
     };
     let mut answers = serde_json::Map::new();
-    for (name, answer) in &response.answers {
+    for NamedAnswer { name, answer } in &response.answers {
         let value = match answer {
             Answer::Noul(p) => json!({"type": "noul", "probability_yes": p}),
             Answer::Choice(choice) => {
                 let probabilities: serde_json::Map<String, Value> = choice
                     .probabilities
                     .iter()
-                    .map(|(label, p)| (label.clone(), json!(p)))
+                    .map(|option| (option.label.clone(), json!(option.probability)))
                     .collect();
                 json!({
                     "type": "choice",

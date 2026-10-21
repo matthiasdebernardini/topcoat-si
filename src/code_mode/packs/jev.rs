@@ -5,10 +5,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use super::to_json;
-use crate::code_mode::{Example, HostError, Pack, PyError, host_fn};
+use crate::code_mode::{Example, HostError, Pack, PyError, host_fn, value};
 use crate::error::{Error, Result};
-use crate::jev::{JevClient, JevResponse, Questions, ToolQuestion, answers, is_fatal, questions};
+use crate::jev::{self, JevClient, JevResponse, Questions, ToolQuestion};
 
 // The one question the shortcuts ask. Jev never sees names.
 const QUESTION: &str = "answer";
@@ -60,6 +59,7 @@ fn default_confidence() -> f64 {
 /// `ask`, `yes_no`, `choose` and `rate` over one Jev client. Errors map as
 /// [`JevTool`](crate::jev::JevTool) maps them: a rejected key ends the run, everything else
 /// raises.
+#[must_use]
 pub fn jev(client: JevClient) -> Pack {
     let client = Arc::new(client);
     let (yes_no_client, choose_client, rate_client) =
@@ -73,8 +73,9 @@ pub fn jev(client: JevClient) -> Pack {
             move |args: AskArgs| {
                 let client = client.clone();
                 async move {
-                    let response = mapped(client.ask(args.state, &questions(&args.questions)).await)?;
-                    Ok(Value::Object(answers(&response, &args.questions)))
+                    let questions = Questions::from_tool(&args.questions);
+                    let response = mapped(client.ask(args.state, &questions).await)?;
+                    Ok(Value::Object(jev::answers(&response, &args.questions)))
                 }
             },
         ))
@@ -109,7 +110,7 @@ pub fn jev(client: JevClient) -> Pack {
                         args.options.into_iter().map(|o| (o, None::<String>)),
                     );
                     let response = mapped(client.ask(args.state, &questions).await)?;
-                    to_json(choice(&response, args.min_confidence)?)
+                    value::to_json(choice(&response, args.min_confidence)?)
                 }
             },
         ))
@@ -123,9 +124,9 @@ pub fn jev(client: JevClient) -> Pack {
                 let client = rate_client.clone();
                 async move {
                     let questions =
-                        Questions::new().score(QUESTION, args.question, args.levels.clone());
+                        Questions::new().score(QUESTION, args.question, &args.levels);
                     let response = mapped(client.ask(args.state, &questions).await)?;
-                    to_json(score(&response, &args.levels, args.min_confidence)?)
+                    value::to_json(score(&response, &args.levels, args.min_confidence)?)
                 }
             },
         ))
@@ -161,9 +162,9 @@ pub fn jev(client: JevClient) -> Pack {
 
 /// A gated pick: `answer` is `None` when unsure.
 #[derive(Serialize)]
-struct Judgment<'a> {
-    answer: Option<&'a str>,
-    best: Option<&'a str>,
+struct Judgment<'label> {
+    answer: Option<&'label str>,
+    best: Option<&'label str>,
     confidence: f64,
     probabilities: Map<String, Value>,
 }
@@ -180,7 +181,7 @@ fn choice(
         probabilities: answer
             .probabilities
             .iter()
-            .map(|(label, p)| (label.clone(), json!(p)))
+            .map(|option| (option.label.clone(), json!(option.probability)))
             .collect(),
     })
 }
@@ -211,7 +212,7 @@ fn score<'a>(
 /// `ValueError`, anything else `RuntimeError`.
 fn mapped<T>(outcome: Result<T>) -> std::result::Result<T, HostError> {
     outcome.map_err(|error| match error {
-        error if is_fatal(&error) => HostError::Fatal(error),
+        error if jev::is_fatal(&error) => HostError::Fatal(error),
         Error::Validation { message, .. } => HostError::Raise {
             kind: PyError::ValueError,
             message: format!("Invalid jev call: {message}"),

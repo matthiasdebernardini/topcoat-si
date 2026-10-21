@@ -1,9 +1,13 @@
 //! Values crossing between the sandbox and host functions: Python objects to JSON and back.
 
-use std::fmt::{self, Write};
+use std::fmt;
 
 use monty_types::{CallArgs, ExcType, MontyException, MontyObject, ObjectRef};
+use serde::Serialize;
 use serde_json::{Map, Number, Value};
+
+use super::HostError;
+use crate::error::Error;
 
 // Bounds the host's recursion. Cycles arrive as `cycle` leaves, which do not convert.
 const MAX_DEPTH: usize = 64;
@@ -16,9 +20,9 @@ pub(super) fn kwargs_to_json(args: &CallArgs) -> Result<Value, MontyException> {
     let mut walk = Walk { items: 0 };
     let mut map = Map::new();
     for (key, value) in args.kwargs() {
-        let key = key
-            .as_str()
-            .ok_or_else(|| raise(ExcType::TypeError, "keyword names must be str".to_string()))?;
+        let key = key.as_str().ok_or_else(|| {
+            exception(ExcType::TypeError, "keyword names must be str".to_string())
+        })?;
         map.insert(key.to_string(), walk.convert(&value, 0)?);
     }
     Ok(Value::Object(map))
@@ -33,7 +37,7 @@ impl Walk {
     fn count(&mut self, items: usize) -> Result<(), MontyException> {
         self.items += items;
         if self.items > MAX_ITEMS {
-            return Err(raise(
+            return Err(exception(
                 ExcType::ValueError,
                 format!("value too large: more than {MAX_ITEMS} items"),
             ));
@@ -43,13 +47,13 @@ impl Walk {
 
     fn convert(&mut self, value: &ObjectRef<'_>, depth: usize) -> Result<Value, MontyException> {
         if depth > MAX_DEPTH {
-            return Err(raise(
+            return Err(exception(
                 ExcType::ValueError,
                 format!("value nested deeper than {MAX_DEPTH} levels"),
             ));
         }
         let not_converted = || {
-            raise(
+            exception(
                 ExcType::TypeError,
                 format!(
                     "cannot pass a {} to a host function; use None, bool, int, float, str, \
@@ -62,7 +66,7 @@ impl Walk {
             "NoneType" => Ok(Value::Null),
             "bool" => value.as_bool().map(Value::Bool).ok_or_else(not_converted),
             "int" => value.as_int().map(Value::from).ok_or_else(|| {
-                raise(
+                exception(
                     ExcType::ValueError,
                     "int does not fit in 64 bits".to_string(),
                 )
@@ -71,7 +75,7 @@ impl Walk {
                 .as_float()
                 .and_then(Number::from_f64)
                 .map(Value::Number)
-                .ok_or_else(|| raise(ExcType::ValueError, "float is not finite".to_string())),
+                .ok_or_else(|| exception(ExcType::ValueError, "float is not finite".to_string())),
             "str" => value
                 .as_str()
                 .map(|s| Value::String(s.to_string()))
@@ -91,7 +95,7 @@ impl Walk {
                 let mut map = Map::new();
                 for (key, item) in pairs {
                     let key = key.as_str().ok_or_else(|| {
-                        raise(
+                        exception(
                             ExcType::TypeError,
                             format!("dict keys must be str, got {}", key.type_name()),
                         )
@@ -128,6 +132,8 @@ pub(super) fn json_to_object(value: &Value) -> MontyObject {
 /// Streams the value rather than building its whole repr, which for a graph with shared
 /// references can be exponentially longer than the value is in memory.
 pub(super) fn capped_repr(value: &MontyObject, max_chars: usize) -> (String, bool) {
+    use std::fmt::Write;
+
     let mut out = Capped {
         text: String::new(),
         room: max_chars,
@@ -159,8 +165,14 @@ impl fmt::Write for Capped {
     }
 }
 
-pub(super) fn raise(kind: ExcType, message: String) -> MontyException {
+/// A Python exception to hand the sandbox, which raises it; building one raises nothing.
+pub(super) fn exception(kind: ExcType, message: String) -> MontyException {
     MontyException::new(kind, Some(message))
+}
+
+/// A host function's typed result as JSON.
+pub(super) fn to_json(value: impl Serialize) -> Result<Value, HostError> {
+    serde_json::to_value(value).map_err(|error| HostError::Fatal(Error::from(error)))
 }
 
 #[cfg(test)]

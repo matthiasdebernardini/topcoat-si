@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::str::FromStr;
 
 use crate::types::Content;
 
 /// Parameter for a content block source.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct ContentBlockSourceParam {
     /// The content of the source, which can be either a string or an array of content items.
     pub content: ContentBlockSourceContent,
@@ -22,18 +25,15 @@ pub enum ContentBlockSourceContent {
 
 impl ContentBlockSourceParam {
     /// Create a new `ContentBlockSourceParam` with a string content.
-    pub fn new_with_string(content: String) -> Self {
+    #[must_use]
+    pub fn new_with_string(content: impl Into<String>) -> Self {
         Self {
-            content: ContentBlockSourceContent::String(content),
+            content: ContentBlockSourceContent::String(content.into()),
         }
     }
 
-    /// Create a new `ContentBlockSourceParam` with string content from a str reference.
-    pub fn from_string_ref(content: &str) -> Self {
-        Self::new_with_string(content.to_string())
-    }
-
     /// Create a new `ContentBlockSourceParam` with an array of content items.
+    #[must_use]
     pub fn new_with_array(content: Vec<Content>) -> Self {
         Self {
             content: ContentBlockSourceContent::Array(content),
@@ -41,16 +41,17 @@ impl ContentBlockSourceParam {
     }
 
     /// Create a new `ContentBlockSourceParam` with a single content item.
+    #[must_use]
     pub fn new_with_item(content: Content) -> Self {
         Self::new_with_array(vec![content])
     }
 }
 
-impl std::str::FromStr for ContentBlockSourceParam {
-    type Err = std::convert::Infallible;
+impl FromStr for ContentBlockSourceParam {
+    type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::from_string_ref(s))
+        Ok(Self::new_with_string(s))
     }
 }
 
@@ -62,7 +63,7 @@ mod tests {
 
     #[test]
     fn content_block_source_param_with_string() {
-        let source = ContentBlockSourceParam::new_with_string("Sample content".to_string());
+        let source = ContentBlockSourceParam::new_with_string("Sample content");
         let json = to_value(&source).unwrap();
 
         assert_eq!(
@@ -75,8 +76,8 @@ mod tests {
 
     #[test]
     fn content_block_source_param_with_array() {
-        let text_param = TextBlock::new("Sample text content".to_string());
-        let url_source = UrlImageSource::new("https://example.com/image.jpg".to_string());
+        let text_param = TextBlock::new("Sample text content");
+        let url_source = UrlImageSource::new("https://example.com/image.jpg");
         let image_param = ImageBlock::new_with_url(url_source);
 
         let content = vec![Content::Text(text_param), Content::Image(image_param)];
@@ -106,7 +107,7 @@ mod tests {
 
     #[test]
     fn content_block_source_param_with_item() {
-        let text_param = TextBlock::new("Sample text content".to_string());
+        let text_param = TextBlock::new("Sample text content");
         let source = ContentBlockSourceParam::new_with_item(Content::Text(text_param));
 
         let json = to_value(&source).unwrap();
@@ -125,8 +126,8 @@ mod tests {
     }
 
     #[test]
-    fn from_string_ref() {
-        let source = ContentBlockSourceParam::from_string_ref("Sample content");
+    fn new_with_string_from_literal() {
+        let source = ContentBlockSourceParam::new_with_string("Sample content");
 
         match &source.content {
             ContentBlockSourceContent::String(content) => {

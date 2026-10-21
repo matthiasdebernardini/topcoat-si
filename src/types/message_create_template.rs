@@ -24,6 +24,7 @@ use crate::types::{
 /// assert_eq!(params.max_tokens, 2048);
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageCreateTemplate {
     /// The maximum number of tokens to generate before stopping.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,41 +105,48 @@ impl MessageCreateTemplate {
     }
 
     /// Create a new empty template.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the max_tokens field.
+    #[must_use]
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
         self
     }
 
     /// Set the messages field.
+    #[must_use]
     pub fn with_messages(mut self, messages: Vec<MessageParam>) -> Self {
         self.messages = Some(messages);
         self
     }
 
     /// Set the model field.
+    #[must_use]
     pub fn with_model(mut self, model: impl Into<Model>) -> Self {
         self.model = Some(model.into());
         self
     }
 
     /// Set the metadata field.
+    #[must_use]
     pub fn with_metadata(mut self, metadata: Metadata) -> Self {
         self.metadata = Some(metadata);
         self
     }
 
     /// Set the stop_sequences field.
+    #[must_use]
     pub fn with_stop_sequences(mut self, stop_sequences: Vec<String>) -> Self {
         self.stop_sequences = Some(stop_sequences);
         self
     }
 
     /// Set the system prompt field.
+    #[must_use]
     pub fn with_system(mut self, system: impl Into<SystemPrompt>) -> Self {
         self.system = Some(system.into());
         self
@@ -152,30 +160,35 @@ impl MessageCreateTemplate {
     }
 
     /// Set the output configuration.
+    #[must_use]
     pub fn with_output_config(mut self, output_config: OutputConfig) -> Self {
         self.output_config = Some(output_config);
         self
     }
 
     /// Set the thinking configuration field.
+    #[must_use]
     pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
     }
 
     /// Set the tool_choice field.
+    #[must_use]
     pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = Some(tool_choice);
         self
     }
 
     /// Set the tools field.
+    #[must_use]
     pub fn with_tools(mut self, tools: Vec<ToolUnionParam>) -> Self {
         self.tools = Some(tools);
         self
     }
 
     /// Set the top_k field.
+    #[must_use]
     pub fn with_top_k(mut self, top_k: u32) -> Self {
         self.top_k = Some(top_k);
         self
@@ -189,12 +202,14 @@ impl MessageCreateTemplate {
     }
 
     /// Set the stream field.
+    #[must_use]
     pub fn with_stream(mut self, stream: bool) -> Self {
         self.stream = Some(stream);
         self
     }
 
     /// Merge another template into this one, overriding any fields set in `other`.
+    #[must_use]
     pub fn merge(mut self, other: MessageCreateTemplate) -> Self {
         if other.max_tokens.is_some() {
             self.max_tokens = other.max_tokens;
@@ -246,6 +261,7 @@ impl MessageCreateTemplate {
     /// Fields that are `Some` in the template will override the corresponding
     /// fields in the params. Fields that are `None` in the template will leave
     /// the params unchanged.
+    #[must_use]
     pub fn apply(self, mut params: MessageCreateParams) -> MessageCreateParams {
         if let Some(max_tokens) = self.max_tokens {
             params.max_tokens = max_tokens;

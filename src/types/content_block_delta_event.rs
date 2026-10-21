@@ -4,6 +4,7 @@ use crate::types::ContentBlockDelta;
 
 /// An event that represents a delta update to a content block in a streaming response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ContentBlockDeltaEvent {
     /// The delta update to the content block.
     pub delta: ContentBlockDelta,
@@ -14,6 +15,7 @@ pub struct ContentBlockDeltaEvent {
 
 impl ContentBlockDeltaEvent {
     /// Create a new `ContentBlockDeltaEvent` with the given delta and index.
+    #[must_use]
     pub fn new(delta: ContentBlockDelta, index: usize) -> Self {
         Self { delta, index }
     }
@@ -27,7 +29,7 @@ mod tests {
 
     #[test]
     fn content_block_delta_event_serialization() {
-        let text_delta = TextDelta::new("Hello world".to_string());
+        let text_delta = TextDelta::new("Hello world");
         let delta = ContentBlockDelta::TextDelta(text_delta);
         let event = ContentBlockDeltaEvent::new(delta, 0);
 

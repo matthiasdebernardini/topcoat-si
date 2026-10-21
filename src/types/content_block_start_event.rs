@@ -4,6 +4,7 @@ use crate::types::ContentBlock;
 
 /// An event that represents the start of a content block in a streaming response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ContentBlockStartEvent {
     /// The content block that is starting.
     pub content_block: ContentBlock,
@@ -14,6 +15,7 @@ pub struct ContentBlockStartEvent {
 
 impl ContentBlockStartEvent {
     /// Create a new `ContentBlockStartEvent` with the given content block and index.
+    #[must_use]
     pub fn new(content_block: ContentBlock, index: usize) -> Self {
         Self {
             content_block,
@@ -30,7 +32,7 @@ mod tests {
 
     #[test]
     fn content_block_start_event_serialization() {
-        let text_block = TextBlock::new("Hello world".to_string());
+        let text_block = TextBlock::new("Hello world");
         let content_block = ContentBlock::Text(text_block);
         let event = ContentBlockStartEvent::new(content_block, 0);
 

@@ -9,6 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Mutually exclusive with `context_management`. Requires the
 /// `compact-2026-09-04` beta, which is added automatically.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CompactionRequest {
     /// Custom summarization instructions.
     pub instructions: Option<String>,
@@ -16,11 +17,13 @@ pub struct CompactionRequest {
 
 impl CompactionRequest {
     /// Create a compaction request with default instructions.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set custom summarization instructions.
+    #[must_use]
     pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
         self.instructions = Some(instructions.into());
         self

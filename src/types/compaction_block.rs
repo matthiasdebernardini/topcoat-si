@@ -6,6 +6,7 @@ use crate::types::CacheControlEphemeral;
 ///
 /// Only fields that are `Some` are serialized; the API rejects null fields on this block.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct CompactionBlock {
     /// The summary text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -30,6 +31,7 @@ pub struct CompactionBlock {
 
 impl CompactionBlock {
     /// Creates a compaction block with the given summary text.
+    #[must_use]
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             content: Some(content.into()),
@@ -38,6 +40,7 @@ impl CompactionBlock {
     }
 
     /// Sets the signature.
+    #[must_use]
     pub fn with_signature(mut self, signature: impl Into<String>) -> Self {
         self.signature = Some(signature.into());
         self

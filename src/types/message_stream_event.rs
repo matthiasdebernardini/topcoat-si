@@ -1,5 +1,7 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
+use crate::types::open_union;
 use crate::types::{
     ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent, MessageDeltaEvent,
     MessageStartEvent, MessageStopEvent,
@@ -11,8 +13,9 @@ use crate::types::{
 /// messages from the Anthropic API. Events are delivered in a specific order:
 /// message_start, then potentially multiple content_block events, and finally
 /// message_stop.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum MessageStreamEvent {
     /// A periodic ping event to keep the connection alive.
     ///
@@ -58,8 +61,26 @@ pub enum MessageStreamEvent {
     #[serde(rename = "message_stop")]
     MessageStop(MessageStopEvent),
     /// An event introduced by a newer API version.
-    #[serde(other)]
     Unknown,
+}
+
+impl<'de> Deserialize<'de> for MessageStreamEvent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        match open_union::type_tag::<D::Error>(&value)?.as_str() {
+            "ping" => Ok(Self::Ping),
+            "message_start" => open_union::from_value(value).map(Self::MessageStart),
+            "message_delta" => open_union::from_value(value).map(Self::MessageDelta),
+            "content_block_start" => open_union::from_value(value).map(Self::ContentBlockStart),
+            "content_block_delta" => open_union::from_value(value).map(Self::ContentBlockDelta),
+            "content_block_stop" => open_union::from_value(value).map(Self::ContentBlockStop),
+            "message_stop" => open_union::from_value(value).map(Self::MessageStop),
+            tag => {
+                open_union::warn_unknown("MessageStreamEvent", tag);
+                Ok(Self::Unknown)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

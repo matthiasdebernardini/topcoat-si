@@ -4,6 +4,7 @@ use crate::types::CountTokensContextManagement;
 
 /// Count of tokens in a message.
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageTokensCount {
     /// The total number of tokens across the provided list of messages, system prompt,
     /// and tools.
@@ -16,6 +17,7 @@ pub struct MessageTokensCount {
 
 impl MessageTokensCount {
     /// Create a new `MessageTokensCount` with the given input tokens.
+    #[must_use]
     pub fn new(input_tokens: u32) -> Self {
         Self {
             input_tokens,

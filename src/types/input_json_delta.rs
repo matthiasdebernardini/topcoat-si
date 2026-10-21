@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::str::FromStr;
 
 /// A JSON delta, representing a piece of JSON in a streaming response.
 ///
@@ -6,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// content, typically for tool input parameters. The JSON is streamed as fragments
 /// that need to be concatenated to form the complete JSON object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct InputJsonDelta {
     /// The partial JSON content.
     ///
@@ -17,13 +20,16 @@ pub struct InputJsonDelta {
 
 impl InputJsonDelta {
     /// Create a new `InputJsonDelta` with the given partial JSON.
-    pub fn new(partial_json: String) -> Self {
-        Self { partial_json }
+    #[must_use]
+    pub fn new(partial_json: impl Into<String>) -> Self {
+        Self {
+            partial_json: partial_json.into(),
+        }
     }
 }
 
-impl std::str::FromStr for InputJsonDelta {
-    type Err = std::convert::Infallible;
+impl FromStr for InputJsonDelta {
+    type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self::new(s.to_string()))

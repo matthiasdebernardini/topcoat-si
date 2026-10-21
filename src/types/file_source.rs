@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Used as the `file` source of document and image blocks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FileSource {
     /// The ID of the uploaded file.
     pub file_id: String,
@@ -11,6 +12,7 @@ pub struct FileSource {
 
 impl FileSource {
     /// Creates a file source for the given file ID.
+    #[must_use]
     pub fn new(file_id: impl Into<String>) -> Self {
         Self {
             file_id: file_id.into(),

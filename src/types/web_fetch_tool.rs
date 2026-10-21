@@ -12,6 +12,7 @@ fn default_name() -> String {
 /// by the [`ToolUnionParam`](crate::ToolUnionParam) variant. `allowed_domains` and
 /// `blocked_domains` are mutually exclusive; the builders enforce this.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct WebFetchTool {
     /// Name of the tool.
     #[serde(default = "default_name")]
@@ -60,6 +61,7 @@ pub struct WebFetchTool {
 
 impl WebFetchTool {
     /// Creates a web fetch tool with default values.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             name: default_name(),
@@ -77,6 +79,7 @@ impl WebFetchTool {
     }
 
     /// Only allow these domains; clears `blocked_domains`.
+    #[must_use]
     pub fn with_allowed_domains(mut self, domains: Vec<String>) -> Self {
         self.allowed_domains = Some(domains);
         self.blocked_domains = None;
@@ -84,6 +87,7 @@ impl WebFetchTool {
     }
 
     /// Block these domains; clears `allowed_domains`.
+    #[must_use]
     pub fn with_blocked_domains(mut self, domains: Vec<String>) -> Self {
         self.blocked_domains = Some(domains);
         self.allowed_domains = None;
@@ -91,48 +95,56 @@ impl WebFetchTool {
     }
 
     /// Sets the citation configuration.
+    #[must_use]
     pub fn with_citations(mut self, citations: CitationsConfig) -> Self {
         self.citations = Some(citations);
         self
     }
 
     /// Sets the maximum content tokens per fetched page.
+    #[must_use]
     pub fn with_max_content_tokens(mut self, max_content_tokens: u64) -> Self {
         self.max_content_tokens = Some(max_content_tokens);
         self
     }
 
     /// Sets the maximum number of uses per request.
+    #[must_use]
     pub fn with_max_uses(mut self, max_uses: u32) -> Self {
         self.max_uses = Some(max_uses);
         self
     }
 
     /// Sets whether cached content may be used.
+    #[must_use]
     pub fn with_use_cache(mut self, use_cache: bool) -> Self {
         self.use_cache = Some(use_cache);
         self
     }
 
     /// Sets whether fetched content is included in full or excluded.
+    #[must_use]
     pub fn with_response_inclusion(mut self, response_inclusion: ResponseInclusion) -> Self {
         self.response_inclusion = Some(response_inclusion);
         self
     }
 
     /// Sets the cache control.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self
     }
 
     /// Sets whether the tool definition is deferred until found by tool search.
+    #[must_use]
     pub fn with_defer_loading(mut self, defer_loading: bool) -> Self {
         self.defer_loading = Some(defer_loading);
         self
     }
 
     /// Sets the callers allowed to invoke this tool.
+    #[must_use]
     pub fn with_allowed_callers(mut self, allowed_callers: Vec<String>) -> Self {
         self.allowed_callers = Some(allowed_callers);
         self

@@ -1,112 +1,115 @@
 //! Errors preserve transport sources and HTTP diagnostics without response bodies.
-use std::{error, fmt, io, str::Utf8Error, sync::Arc, time::Duration};
+use std::str::Utf8Error;
+use std::sync::Arc;
+use std::time::Duration;
+use std::{error, fmt, io};
 
 /// Diagnostics shared by every HTTP response error.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HttpMetadata {
-    /// Status.
+    /// HTTP status code.
     pub status: u16,
-    /// Error type.
+    /// The API's `error.type`, when the body had one.
     pub error_type: Option<String>,
-    /// Request id.
+    /// The `request-id` header or body field.
     pub request_id: Option<String>,
-    /// Retry after.
+    /// The delay from the `retry-after` header.
     pub retry_after: Option<Duration>,
 }
 
 /// SDK failure, with original sources retained when available.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Error {
-    /// Api failure.
+    /// Any other HTTP status.
     Api {
-        /// message associated with this failure.
+        /// The API's error text.
         message: String,
-        /// metadata associated with this failure.
+        /// Status, error type, request id and `retry-after` of the response.
         metadata: HttpMetadata,
-        /// source associated with this failure.
+        /// The underlying failure, when there was one.
         source: Option<Arc<dyn error::Error + Send + Sync>>,
     },
-    /// Authentication failure.
+    /// HTTP 401.
     Authentication {
-        /// message associated with this failure.
+        /// The API's error text.
         message: String,
-        /// metadata associated with this failure.
+        /// Status, error type, request id and `retry-after` of the response.
         metadata: HttpMetadata,
-        /// source associated with this failure.
+        /// The underlying failure, when there was one.
         source: Option<Arc<dyn error::Error + Send + Sync>>,
     },
-    /// Permission failure.
+    /// HTTP 403.
     Permission {
-        /// message associated with this failure.
+        /// The API's error text.
         message: String,
-        /// metadata associated with this failure.
+        /// Status, error type, request id and `retry-after` of the response.
         metadata: HttpMetadata,
-        /// source associated with this failure.
+        /// The underlying failure, when there was one.
         source: Option<Arc<dyn error::Error + Send + Sync>>,
     },
-    /// NotFound failure.
+    /// HTTP 404.
     NotFound {
-        /// message associated with this failure.
+        /// The API's error text.
         message: String,
-        /// metadata associated with this failure.
+        /// Status, error type, request id and `retry-after` of the response.
         metadata: HttpMetadata,
-        /// source associated with this failure.
+        /// The underlying failure, when there was one.
         source: Option<Arc<dyn error::Error + Send + Sync>>,
     },
-    /// RateLimit failure.
+    /// HTTP 429.
     RateLimit {
-        /// message associated with this failure.
+        /// The API's error text.
         message: String,
-        /// metadata associated with this failure.
+        /// Status, error type, request id and `retry-after` of the response.
         metadata: HttpMetadata,
-        /// source associated with this failure.
+        /// The underlying failure, when there was one.
         source: Option<Arc<dyn error::Error + Send + Sync>>,
     },
-    /// BadRequest failure.
+    /// HTTP 400.
     BadRequest {
-        /// message associated with this failure.
+        /// The API's error text.
         message: String,
-        /// metadata associated with this failure.
+        /// Status, error type, request id and `retry-after` of the response.
         metadata: HttpMetadata,
-        /// source associated with this failure.
+        /// The underlying failure, when there was one.
         source: Option<Arc<dyn error::Error + Send + Sync>>,
     },
-    /// InternalServer failure.
+    /// HTTP 500.
     InternalServer {
-        /// message associated with this failure.
+        /// The API's error text.
         message: String,
-        /// metadata associated with this failure.
+        /// Status, error type, request id and `retry-after` of the response.
         metadata: HttpMetadata,
-        /// source associated with this failure.
+        /// The underlying failure, when there was one.
         source: Option<Arc<dyn error::Error + Send + Sync>>,
     },
-    /// ServiceUnavailable failure.
+    /// HTTP 502, 503 or 504.
     ServiceUnavailable {
-        /// message associated with this failure.
+        /// The API's error text.
         message: String,
-        /// metadata associated with this failure.
+        /// Status, error type, request id and `retry-after` of the response.
         metadata: HttpMetadata,
-        /// source associated with this failure.
+        /// The underlying failure, when there was one.
         source: Option<Arc<dyn error::Error + Send + Sync>>,
     },
-    /// Overloaded failure.
+    /// HTTP 529.
     Overloaded {
-        /// message associated with this failure.
+        /// The API's error text.
         message: String,
-        /// metadata associated with this failure.
+        /// Status, error type, request id and `retry-after` of the response.
         metadata: HttpMetadata,
-        /// source associated with this failure.
+        /// The underlying failure, when there was one.
         source: Option<Arc<dyn error::Error + Send + Sync>>,
     },
-    /// Timeout failure.
+    /// The request timed out.
     Timeout {
         /// Response diagnostics, when headers were received.
         metadata: Option<Box<HttpMetadata>>,
-        /// message associated with this failure.
+        /// Human-readable error message.
         message: String,
-        /// duration associated with this failure.
-        duration: Option<f64>,
-        /// source associated with this failure.
+        /// The underlying failure, when there was one.
         source: Option<Arc<dyn error::Error + Send + Sync>>,
     },
     /// Request was aborted by the client.
@@ -201,13 +204,27 @@ pub enum Error {
 }
 
 impl Error {
-    /// From http.
+    /// Builds the variant that matches `metadata.status`:
+    ///
+    /// | Status | Variant |
+    /// |---|---|
+    /// | 400 | [`Error::BadRequest`] |
+    /// | 401 | [`Error::Authentication`] |
+    /// | 403 | [`Error::Permission`] |
+    /// | 404 | [`Error::NotFound`] |
+    /// | 429 | [`Error::RateLimit`] |
+    /// | 500 | [`Error::InternalServer`] |
+    /// | 502, 503, 504 | [`Error::ServiceUnavailable`] |
+    /// | 529 | [`Error::Overloaded`] |
+    /// | any other | [`Error::Api`] |
+    #[must_use]
     pub fn from_http(
         message: impl Into<String>,
         metadata: HttpMetadata,
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
+        source: Option<Box<dyn error::Error + Send + Sync>>,
     ) -> Self {
-        let message = message.into();
+        let message: String = message.into();
+        let source: Option<Arc<dyn error::Error + Send + Sync>> = source.map(Arc::from);
         match metadata.status {
             400 => Self::BadRequest {
                 message,
@@ -256,11 +273,12 @@ impl Error {
             },
         }
     }
-    /// Api.
+    /// Builds the [`Error::from_http`] variant for `status`, with no source or `retry-after`.
+    #[must_use]
     pub fn api(
         status: u16,
         error_type: Option<String>,
-        message: String,
+        message: impl Into<String>,
         request_id: Option<String>,
     ) -> Self {
         Self::from_http(
@@ -274,16 +292,17 @@ impl Error {
             None,
         )
     }
-    /// Timeout.
-    pub fn timeout(message: impl Into<String>, duration: Option<f64>) -> Self {
+    /// Creates a new timeout error.
+    #[must_use]
+    pub fn timeout(message: impl Into<String>) -> Self {
         Self::Timeout {
             message: message.into(),
-            duration,
             source: None,
             metadata: None,
         }
     }
-    /// Authentication.
+    /// Creates a new HTTP 401 authentication error.
+    #[must_use]
     pub fn authentication(message: impl Into<String>) -> Self {
         Self::from_http(
             message,
@@ -294,7 +313,8 @@ impl Error {
             None,
         )
     }
-    /// Permission.
+    /// Creates a new HTTP 403 permission error.
+    #[must_use]
     pub fn permission(message: impl Into<String>) -> Self {
         Self::from_http(
             message,
@@ -305,12 +325,9 @@ impl Error {
             None,
         )
     }
-    /// Not found.
-    pub fn not_found(
-        message: impl Into<String>,
-        _resource_type: Option<String>,
-        _resource_id: Option<String>,
-    ) -> Self {
+    /// Creates a new HTTP 404 not-found error.
+    #[must_use]
+    pub fn not_found(message: impl Into<String>) -> Self {
         Self::from_http(
             message,
             HttpMetadata {
@@ -320,20 +337,22 @@ impl Error {
             None,
         )
     }
-    /// Rate limit.
-    pub fn rate_limit(message: impl Into<String>, retry_after: Option<u64>) -> Self {
+    /// Creates a new HTTP 429 rate-limit error.
+    #[must_use]
+    pub fn rate_limit(message: impl Into<String>, retry_after: Option<Duration>) -> Self {
         Self::from_http(
             message,
             HttpMetadata {
                 status: 429,
-                retry_after: retry_after.map(Duration::from_secs),
+                retry_after,
                 ..Default::default()
             },
             None,
         )
     }
-    /// Bad request.
-    pub fn bad_request(message: impl Into<String>, _param: Option<String>) -> Self {
+    /// Creates a new HTTP 400 bad-request error.
+    #[must_use]
+    pub fn bad_request(message: impl Into<String>) -> Self {
         Self::from_http(
             message,
             HttpMetadata {
@@ -343,7 +362,8 @@ impl Error {
             None,
         )
     }
-    /// Internal server.
+    /// Creates a new HTTP 500 internal-server error.
+    #[must_use]
     pub fn internal_server(message: impl Into<String>, request_id: Option<String>) -> Self {
         Self::from_http(
             message,
@@ -355,19 +375,21 @@ impl Error {
             None,
         )
     }
-    /// Service unavailable.
-    pub fn service_unavailable(message: impl Into<String>, retry_after: Option<u64>) -> Self {
+    /// Creates a new HTTP 503 service-unavailable error.
+    #[must_use]
+    pub fn service_unavailable(message: impl Into<String>, retry_after: Option<Duration>) -> Self {
         Self::from_http(
             message,
             HttpMetadata {
                 status: 503,
-                retry_after: retry_after.map(Duration::from_secs),
+                retry_after,
                 ..Default::default()
             },
             None,
         )
     }
     /// Creates a new abort error.
+    #[must_use]
     pub fn abort(message: impl Into<String>) -> Self {
         Error::Abort {
             message: message.into(),
@@ -375,6 +397,7 @@ impl Error {
     }
 
     /// Creates a new connection error.
+    #[must_use]
     pub fn connection(
         message: impl Into<String>,
         source: Option<Box<dyn error::Error + Send + Sync>>,
@@ -386,6 +409,7 @@ impl Error {
     }
 
     /// Creates a new serialization error.
+    #[must_use]
     pub fn serialization(
         message: impl Into<String>,
         source: Option<Box<dyn error::Error + Send + Sync>>,
@@ -397,6 +421,7 @@ impl Error {
     }
 
     /// Creates a new I/O error.
+    #[must_use]
     pub fn io(message: impl Into<String>, source: io::Error) -> Self {
         Error::Io {
             message: message.into(),
@@ -405,6 +430,7 @@ impl Error {
     }
 
     /// Creates a new HTTP client error.
+    #[must_use]
     pub fn http_client(
         message: impl Into<String>,
         source: Option<Box<dyn error::Error + Send + Sync>>,
@@ -416,6 +442,7 @@ impl Error {
     }
 
     /// Creates a new validation error.
+    #[must_use]
     pub fn validation(message: impl Into<String>, param: Option<String>) -> Self {
         Error::Validation {
             message: message.into(),
@@ -424,6 +451,7 @@ impl Error {
     }
 
     /// Creates a new URL error.
+    #[must_use]
     pub fn url(message: impl Into<String>, source: Option<url::ParseError>) -> Self {
         Error::Url {
             message: message.into(),
@@ -432,6 +460,7 @@ impl Error {
     }
 
     /// Creates a new streaming error.
+    #[must_use]
     pub fn streaming(
         message: impl Into<String>,
         source: Option<Box<dyn error::Error + Send + Sync>>,
@@ -443,6 +472,7 @@ impl Error {
     }
 
     /// Creates a new encoding error.
+    #[must_use]
     pub fn encoding(
         message: impl Into<String>,
         source: Option<Box<dyn error::Error + Send + Sync>>,
@@ -454,6 +484,7 @@ impl Error {
     }
 
     /// Creates a new sandbox error.
+    #[must_use]
     pub fn sandbox(message: impl Into<String>) -> Self {
         Error::Sandbox {
             message: message.into(),
@@ -461,6 +492,7 @@ impl Error {
     }
 
     /// Creates a new unknown error.
+    #[must_use]
     pub fn unknown(message: impl Into<String>) -> Self {
         Error::Unknown {
             message: message.into(),
@@ -468,6 +500,7 @@ impl Error {
     }
 
     /// Creates a new ToDo error for unimplemented functionality.
+    #[must_use]
     pub fn todo(message: impl Into<String>) -> Self {
         Error::ToDo {
             message: message.into(),
@@ -475,56 +508,66 @@ impl Error {
     }
 
     /// Returns true if this error is related to authentication.
+    #[must_use]
     pub fn is_authentication(&self) -> bool {
         matches!(self, Error::Authentication { .. })
     }
 
     /// Returns true if this error is related to permissions.
+    #[must_use]
     pub fn is_permission(&self) -> bool {
         matches!(self, Error::Permission { .. })
     }
 
     /// Returns true if this error is a "not found" error.
+    #[must_use]
     pub fn is_not_found(&self) -> bool {
         matches!(self, Error::NotFound { .. })
     }
 
     /// Returns true if this error is related to rate limiting.
+    #[must_use]
     pub fn is_rate_limit(&self) -> bool {
         matches!(self, Error::RateLimit { .. })
     }
 
     /// Returns true if this error is a bad request.
+    #[must_use]
     pub fn is_bad_request(&self) -> bool {
         matches!(self, Error::BadRequest { .. })
     }
 
     /// Returns true if this error is a timeout.
+    #[must_use]
     pub fn is_timeout(&self) -> bool {
         matches!(self, Error::Timeout { .. })
     }
 
     /// Returns true if this error is an abort.
+    #[must_use]
     pub fn is_abort(&self) -> bool {
         matches!(self, Error::Abort { .. })
     }
 
     /// Returns true if this error is a connection error.
+    #[must_use]
     pub fn is_connection(&self) -> bool {
         matches!(self, Error::Connection { .. })
     }
 
-    /// Returns true if this error is a server error.
+    /// Returns true if this error is a server error: any HTTP 5xx status.
+    #[must_use]
     pub fn is_server_error(&self) -> bool {
         matches!(
             self,
             Error::InternalServer { .. }
                 | Error::ServiceUnavailable { .. }
                 | Error::Overloaded { .. }
-        )
+        ) || matches!(self.status_code(), Some(500..=599))
     }
 
     /// Strict policy: only pre-header connection failures and explicit retryable HTTP statuses.
+    #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Connection { .. } => true,
@@ -534,15 +577,18 @@ impl Error {
             _ => false,
         }
     }
-    /// Is todo.
+    /// Returns true if this error is a [`Error::ToDo`].
+    #[must_use]
     pub fn is_todo(&self) -> bool {
         matches!(self, Self::ToDo { .. })
     }
-    /// Is validation.
+    /// Returns true if this error is a validation error.
+    #[must_use]
     pub fn is_validation(&self) -> bool {
         matches!(self, Self::Validation { .. })
     }
-    /// Metadata.
+    /// HTTP diagnostics, when the error came from a response.
+    #[must_use]
     pub fn metadata(&self) -> Option<&HttpMetadata> {
         match self {
             Self::Api { metadata, .. }
@@ -558,35 +604,36 @@ impl Error {
             _ => None,
         }
     }
-    /// Request id.
+    /// The response's `request-id`, when known.
+    #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         self.metadata().and_then(|m| m.request_id.as_deref())
     }
-    /// Status code.
+    /// The response's HTTP status, when the error came from a response.
+    #[must_use]
     pub fn status_code(&self) -> Option<u16> {
         self.metadata().map(|m| m.status)
     }
-    /// Retry after.
+    /// The delay the server asked for in `retry-after`, when it sent one.
+    #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
         self.metadata().and_then(|m| m.retry_after)
     }
+    #[must_use]
     pub(crate) fn with_http_metadata(self, metadata: HttpMetadata) -> Self {
         match self {
             Self::Timeout {
-                message,
-                duration,
-                source,
-                ..
+                message, source, ..
             } => Self::Timeout {
                 message,
-                duration,
                 source,
                 metadata: Some(Box::new(metadata)),
             },
-            error => Self::from_http(error.to_string(), metadata, Some(Arc::new(error))),
+            error => Self::from_http(error.to_string(), metadata, Some(Box::new(error))),
         }
     }
 
+    #[must_use]
     pub(crate) fn with_request_id(mut self, request_id: Option<String>) -> Self {
         if request_id.is_none() {
             return self;
@@ -717,7 +764,7 @@ pub(crate) enum RequestPhase {
 
 pub(crate) fn map_reqwest_error(err: reqwest::Error, phase: RequestPhase) -> Error {
     let mut message = err.to_string();
-    let mut source = std::error::Error::source(&err);
+    let mut source = error::Error::source(&err);
     while let Some(inner) = source {
         message.push_str(": ");
         message.push_str(&inner.to_string());
@@ -726,7 +773,6 @@ pub(crate) fn map_reqwest_error(err: reqwest::Error, phase: RequestPhase) -> Err
     if err.is_timeout() {
         Error::Timeout {
             message,
-            duration: None,
             source: Some(Arc::new(err)),
             metadata: None,
         }
@@ -736,5 +782,22 @@ pub(crate) fn map_reqwest_error(err: reqwest::Error, phase: RequestPhase) -> Err
         Error::connection(message, Some(Box::new(err)))
     } else {
         Error::http_client(message, Some(Box::new(err)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_5xx_status_is_a_server_error() {
+        for status in [500, 501, 503, 529, 599] {
+            let error = Error::api(status, None, "failed", None);
+            assert!(error.is_server_error(), "{status}");
+        }
+        for status in [400, 429, 600] {
+            let error = Error::api(status, None, "failed", None);
+            assert!(!error.is_server_error(), "{status}");
+        }
     }
 }

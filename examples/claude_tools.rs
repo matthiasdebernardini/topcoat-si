@@ -5,13 +5,13 @@
 
 use topcoat_si::jev::{JevClient, JevTool};
 use topcoat_si::{
-    Anthropic, ClientTool, ContentBlock, FirecrawlClient, FirecrawlFetchPage, FirecrawlWebSearch,
-    KnownModel, MessageCreateParams, MessageParam, Model,
+    Anthropic, ClientTool, FirecrawlClient, FirecrawlFetchPage, FirecrawlWebSearch, KnownModel,
+    MessageCreateParams, MessageParam, Model,
 };
 
 #[tokio::main]
 async fn main() -> topcoat_si::Result<()> {
-    let client = Anthropic::new(None)?;
+    let client = Anthropic::try_new(None)?;
     let firecrawl = FirecrawlClient::from_env()?;
     let search = FirecrawlWebSearch::new(firecrawl.clone());
     let fetch = FirecrawlFetchPage::new(firecrawl);
@@ -29,10 +29,9 @@ async fn main() -> topcoat_si::Result<()> {
     let tools: [&dyn ClientTool; 3] = [&search, &fetch, &jev];
     let run = client.run_tools(params, &tools, 12).await?;
 
-    for block in &run.message.content {
-        if let ContentBlock::Text(text) = block {
-            println!("{}", text.text);
-        }
+    match run.text() {
+        Some(answer) => println!("{answer}"),
+        None => eprintln!("Claude ended without a text answer"),
     }
     // Every turn is billed, so total the usage across all responses, not just the last one.
     let micro_cents: u64 = run

@@ -4,6 +4,7 @@ use crate::types::TextBlock;
 
 /// A wrapper around TextBlock for system prompts that includes a type field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SystemTextBlock {
     /// The type field, always "text".
     pub r#type: String,
@@ -26,11 +27,13 @@ pub enum SystemPrompt {
 
 impl SystemPrompt {
     /// Create a new SystemPrompt from a string.
-    pub fn from_string(content: String) -> Self {
-        Self::String(content)
+    #[must_use]
+    pub fn from_string(content: impl Into<String>) -> Self {
+        Self::String(content.into())
     }
 
     /// Create a new SystemPrompt from text blocks.
+    #[must_use]
     pub fn from_blocks(blocks: Vec<TextBlock>) -> Self {
         let system_blocks = blocks
             .into_iter()
@@ -82,7 +85,7 @@ mod tests {
 
     #[test]
     fn system_prompt_blocks() {
-        let blocks = vec![TextBlock::new("You are a helpful assistant.".to_string())];
+        let blocks = vec![TextBlock::new("You are a helpful assistant.")];
         let prompt = SystemPrompt::from_blocks(blocks);
         let json = to_value(&prompt).unwrap();
         assert_eq!(
@@ -96,7 +99,7 @@ mod tests {
 
     #[test]
     fn from_string() {
-        let prompt = SystemPrompt::from_string("Hello".to_string());
+        let prompt = SystemPrompt::from_string("Hello");
         assert_eq!(prompt, SystemPrompt::String("Hello".to_string()));
 
         let prompt: SystemPrompt = "Hello".into();
@@ -108,11 +111,11 @@ mod tests {
 
     #[test]
     fn from_blocks() {
-        let blocks = vec![TextBlock::new("Hello".to_string())];
+        let blocks = vec![TextBlock::new("Hello")];
         let prompt = SystemPrompt::from_blocks(blocks.clone());
         let expected_blocks = vec![SystemTextBlock {
             r#type: "text".to_string(),
-            block: TextBlock::new("Hello".to_string()),
+            block: TextBlock::new("Hello"),
         }];
         assert_eq!(prompt, SystemPrompt::Blocks(expected_blocks.clone()));
 

@@ -12,6 +12,7 @@ use crate::types::{
 /// Anthropic's API bills and rate-limits by token counts, as tokens represent the
 /// underlying cost to their systems.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct Usage {
     /// The number of input tokens used to create the cache entry.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,6 +65,7 @@ pub struct Usage {
 
 impl Usage {
     /// Create a new `Usage` with the given input and output tokens.
+    #[must_use]
     pub fn new(input_tokens: i32, output_tokens: i32) -> Self {
         Self {
             cache_creation_input_tokens: None,
@@ -82,59 +84,69 @@ impl Usage {
     }
 
     /// Set the cache creation input tokens.
+    #[must_use]
     pub fn with_cache_creation_input_tokens(mut self, tokens: i32) -> Self {
         self.cache_creation_input_tokens = Some(tokens);
         self
     }
 
     /// Set the cache-creation breakdown by cache lifetime.
+    #[must_use]
     pub fn with_cache_creation(mut self, cache_creation: CacheCreation) -> Self {
         self.cache_creation = Some(cache_creation);
         self
     }
 
     /// Set the cache read input tokens.
+    #[must_use]
     pub fn with_cache_read_input_tokens(mut self, tokens: i32) -> Self {
         self.cache_read_input_tokens = Some(tokens);
         self
     }
 
     /// Set the output-token breakdown.
+    #[must_use]
     pub fn with_output_tokens_details(mut self, details: OutputTokensDetails) -> Self {
         self.output_tokens_details = Some(details);
         self
     }
 
     /// Set the thinking-token count in the output-token breakdown.
+    #[must_use]
     pub fn with_thinking_tokens(self, thinking_tokens: i32) -> Self {
         self.with_output_tokens_details(OutputTokensDetails::new(thinking_tokens))
     }
 
     /// Set the server tool usage.
+    #[must_use]
     pub fn with_server_tool_use(mut self, server_tool_use: ServerToolUsage) -> Self {
         self.server_tool_use = Some(server_tool_use);
         self
     }
 
     /// Set the service tier.
+    #[must_use]
     pub fn with_service_tier(mut self, service_tier: ServiceTier) -> Self {
         self.service_tier = Some(service_tier);
         self
     }
 
     /// Set the inference geography.
+    #[must_use]
     pub fn with_inference_geo(mut self, inference_geo: impl Into<String>) -> Self {
         self.inference_geo = Some(inference_geo.into());
         self
     }
 
     /// Set the inference speed.
+    #[must_use]
     pub fn with_speed(mut self, speed: InferenceSpeed) -> Self {
         self.speed = Some(speed);
         self
     }
 
     /// Set the fallback-credit outcome.
+    #[must_use]
     pub fn with_fallback_credit(mut self, fallback_credit: FallbackCredit) -> Self {
         self.fallback_credit = Some(Box::new(fallback_credit));
         self
@@ -144,6 +156,7 @@ impl Usage {
     ///
     /// This is the count Anthropic uses to pick Claude Haiku 5.5's pricing tier.
     /// It describes a single request; summed usage across requests mis-tiers Claude Haiku 5.5.
+    #[must_use]
     pub fn prompt_tokens(&self) -> u64 {
         let clamp = |tokens: i32| u64::try_from(tokens).unwrap_or(0);
         clamp(self.input_tokens)
@@ -153,7 +166,7 @@ impl Usage {
 }
 
 /// Helper function to add two Option values where the contained type implements Add.
-fn add_options<T: std::ops::Add<Output = T>>(left: Option<T>, right: Option<T>) -> Option<T> {
+fn add_options<T: Add<Output = T>>(left: Option<T>, right: Option<T>) -> Option<T> {
     match (left, right) {
         (Some(a), Some(b)) => Some(a + b),
         (Some(a), None) => Some(a),

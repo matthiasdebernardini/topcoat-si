@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ToolChoice {
     /// Automatic tool choice
     Auto {
@@ -47,6 +48,7 @@ pub enum ToolChoice {
 
 impl ToolChoice {
     /// Create a new `ToolChoice` with auto mode.
+    #[must_use]
     pub fn auto() -> Self {
         Self::Auto {
             disable_parallel_tool_use: None,
@@ -54,6 +56,7 @@ impl ToolChoice {
     }
 
     /// Create a new `ToolChoice` with auto mode, specifying whether to disable parallel tool use.
+    #[must_use]
     pub fn auto_with_disable_parallel(disable: bool) -> Self {
         Self::Auto {
             disable_parallel_tool_use: Some(disable),
@@ -61,6 +64,7 @@ impl ToolChoice {
     }
 
     /// Create a new `ToolChoice` allowing any tool.
+    #[must_use]
     pub fn any() -> Self {
         Self::Any {
             disable_parallel_tool_use: None,
@@ -68,6 +72,7 @@ impl ToolChoice {
     }
 
     /// Create a new `ToolChoice` allowing any tool, specifying whether to disable parallel tool use.
+    #[must_use]
     pub fn any_with_disable_parallel(disable: bool) -> Self {
         Self::Any {
             disable_parallel_tool_use: Some(disable),
@@ -75,6 +80,7 @@ impl ToolChoice {
     }
 
     /// Create a new `ToolChoice` with a specific named tool.
+    #[must_use]
     pub fn tool(name: impl Into<String>) -> Self {
         Self::Tool {
             name: name.into(),
@@ -83,6 +89,7 @@ impl ToolChoice {
     }
 
     /// Create a new `ToolChoice` with a specific named tool, specifying whether to disable parallel tool use.
+    #[must_use]
     pub fn tool_with_disable_parallel(name: impl Into<String>, disable: bool) -> Self {
         Self::Tool {
             name: name.into(),
@@ -91,6 +98,7 @@ impl ToolChoice {
     }
 
     /// Create a new `ToolChoice` with no tools.
+    #[must_use]
     pub fn none() -> Self {
         Self::None
     }

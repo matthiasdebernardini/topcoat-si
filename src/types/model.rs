@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize, Serializer};
+use std::convert::Infallible;
 use std::fmt;
 use std::str::FromStr;
 
@@ -22,6 +23,7 @@ pub enum Model {
 /// This enum holds only the current generation.  Older or preview models are passed as
 /// [`Model::Custom`]; they round-trip unchanged but have no built-in pricing.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum KnownModel {
     /// Claude Opus 5.5 (released 2026-09-22)
     ClaudeOpus55,
@@ -61,6 +63,7 @@ impl fmt::Display for Model {
 ///
 /// Rates from <https://platform.claude.com/docs/en/about-claude/pricing> as of 2026-10-19.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TokenRates {
     /// Cost per input token in nano-cents.
     pub input: u64,
@@ -76,6 +79,7 @@ pub struct TokenRates {
 
 impl TokenRates {
     /// Rates where every token kind costs `rate` nano-cents.
+    #[must_use]
     pub const fn flat(rate: u64) -> Self {
         Self {
             input: rate,
@@ -87,6 +91,7 @@ impl TokenRates {
     }
 
     /// Message Batches rates: 50% off every field, rounded up.
+    #[must_use]
     pub const fn batch(self) -> Self {
         Self {
             input: self.input.div_ceil(2),
@@ -99,6 +104,7 @@ impl TokenRates {
 
     /// Data-residency pricing for `inference_geo: "us"`: 1.1x on every token type, rounded
     /// up and saturating at `u64::MAX`.
+    #[must_use]
     pub const fn us_inference(self) -> Self {
         const fn scale(rate: u64) -> u64 {
             let scaled = (rate as u128 * 11).div_ceil(10);
@@ -125,6 +131,7 @@ impl TokenRates {
     /// all `cache_creation_input_tokens` are priced as 5-minute writes.  Returns `u64::MAX`
     /// on overflow.  This prices the top-level counts only; see
     /// [`KnownModel::cost_micro_cents`] for the iteration-aware total.
+    #[must_use]
     pub fn cost_micro_cents(&self, usage: &Usage) -> u64 {
         let (write_5m, write_1h) = cache_writes(
             usage.cache_creation_input_tokens.unwrap_or(0),
@@ -202,6 +209,7 @@ impl KnownModel {
     /// assert_eq!(rates.input, 200_000);   // $2/MTok
     /// assert_eq!(rates.output, 1_000_000); // $10/MTok
     /// ```
+    #[must_use]
     pub fn token_rates(&self) -> TokenRates {
         let rates = |input, output, cache_write_5m, cache_write_1h, cache_read| TokenRates {
             input,
@@ -227,6 +235,7 @@ impl KnownModel {
     /// Claude Haiku 5.5 bills the whole request at $0.50/$2.50 (and matching cache rates)
     /// when the prompt exceeds [`Self::HAIKU_55_TIER_THRESHOLD_TOKENS`]; every other model
     /// returns [`token_rates`](Self::token_rates).
+    #[must_use]
     pub fn token_rates_for_prompt(&self, prompt_tokens: u64) -> TokenRates {
         match self {
             KnownModel::ClaudeHaiku55 if prompt_tokens > Self::HAIKU_55_TIER_THRESHOLD_TOKENS => {
@@ -245,6 +254,7 @@ impl KnownModel {
     /// Fast-mode rates (`speed: "fast"`), or `None` when the model has no fast mode.
     ///
     /// Prompt-caching multipliers (1.25x, 2x, 0.05x or 0.1x) stack on the fast base price.
+    #[must_use]
     pub fn fast_token_rates(&self) -> Option<TokenRates> {
         let rates = |input, output, cache_write_5m, cache_write_1h, cache_read| {
             Some(TokenRates {
@@ -265,6 +275,7 @@ impl KnownModel {
     ///
     /// Equivalent to [`rates_for_prompt_and_modifiers`](Self::rates_for_prompt_and_modifiers)
     /// with `usage.prompt_tokens()`.
+    #[must_use]
     pub fn rates_for_usage(&self, usage: &Usage) -> TokenRates {
         self.rates_for_prompt_and_modifiers(usage.prompt_tokens(), usage)
     }
@@ -277,6 +288,7 @@ impl KnownModel {
     /// [`token_rates_for_prompt`](Self::token_rates_for_prompt).  Then applies
     /// [`TokenRates::us_inference`] when `usage.inference_geo` is `"us"` and
     /// [`TokenRates::batch`] when `usage.service_tier` is batch.
+    #[must_use]
     pub fn rates_for_prompt_and_modifiers(&self, prompt_tokens: u64, usage: &Usage) -> TokenRates {
         let fast = match usage.speed {
             Some(InferenceSpeed::Fast) => self.fast_token_rates(),
@@ -400,8 +412,24 @@ impl From<KnownModel> for Model {
     }
 }
 
+/// Error returned when parsing a string that is not a known model id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ParseKnownModelError {
+    /// The string that is not a known model id.
+    pub invalid_value: String,
+}
+
+impl fmt::Display for ParseKnownModelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Unknown model: {}", self.invalid_value)
+    }
+}
+
+impl std::error::Error for ParseKnownModelError {}
+
 impl FromStr for KnownModel {
-    type Err = ();
+    type Err = ParseKnownModelError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -409,13 +437,15 @@ impl FromStr for KnownModel {
             "claude-sonnet-5-5" => Ok(KnownModel::ClaudeSonnet55),
             "claude-haiku-5-5" => Ok(KnownModel::ClaudeHaiku55),
             "claude-fable-5-1" => Ok(KnownModel::ClaudeFable51),
-            _ => Err(()),
+            _ => Err(ParseKnownModelError {
+                invalid_value: s.to_string(),
+            }),
         }
     }
 }
 
 impl FromStr for Model {
-    type Err = ();
+    type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match KnownModel::from_str(s) {
@@ -504,7 +534,12 @@ mod tests {
         for id in ["claude-haiku-4-5", "claude-opus-5"] {
             let model: Model = serde_json::from_str(&format!("\"{id}\"")).unwrap();
             assert_eq!(model, Model::Custom(id.to_string()));
-            assert_eq!(id.parse::<KnownModel>(), Err(()));
+            assert_eq!(
+                id.parse::<KnownModel>(),
+                Err(ParseKnownModelError {
+                    invalid_value: id.to_string()
+                })
+            );
             assert_eq!(serde_json::to_string(&model).unwrap(), format!("\"{id}\""));
         }
     }

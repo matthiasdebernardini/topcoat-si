@@ -1,17 +1,18 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
-use crate::types::open_union::with_type_seq;
+use crate::types::open_union;
 use crate::types::{CacheControlEphemeral, CitationsConfig, TextBlock};
 
 fn serialize_content<S>(content: &[TextBlock], serializer: S) -> Result<S::Ok, S::Error>
 where
-    S: serde::Serializer,
+    S: Serializer,
 {
-    with_type_seq("text", content, serializer)
+    open_union::with_type_seq("text", content, serializer)
 }
 
 /// A search result supplied as input, enabling RAG-style citations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct SearchResultBlock {
     /// Where the result came from, such as a URL or document identifier.
     pub source: String,
@@ -34,6 +35,7 @@ pub struct SearchResultBlock {
 
 impl SearchResultBlock {
     /// Creates a search result block.
+    #[must_use]
     pub fn new(
         source: impl Into<String>,
         title: impl Into<String>,
@@ -49,12 +51,14 @@ impl SearchResultBlock {
     }
 
     /// Sets the citation configuration.
+    #[must_use]
     pub fn with_citations(mut self, citations: CitationsConfig) -> Self {
         self.citations = Some(citations);
         self
     }
 
     /// Sets the cache control.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self

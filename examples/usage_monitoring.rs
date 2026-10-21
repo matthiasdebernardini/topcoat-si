@@ -1,16 +1,16 @@
 use time::{Duration, OffsetDateTime};
 use topcoat_si::{
-    Anthropic, CostGroupBy, CostReportParams, KnownModel, MessageCreateParams, UsageGroupBy,
-    UsageReportParams,
+    Anthropic, BucketWidth, CostGroupBy, CostReportParams, KnownModel, MessageCreateParams,
+    UsageGroupBy, UsageReportParams,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Anthropic::new(None)?;
+    let client = Anthropic::try_new(None)?;
     let model = KnownModel::ClaudeHaiku55;
 
     let message = client
-        .send(MessageCreateParams::simple(
+        .send(&MessageCreateParams::simple(
             "Say hello in five words.",
             model,
         ))
@@ -27,13 +27,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Set ANTHROPIC_ADMIN_KEY to also print the organization usage and cost reports.");
         return Ok(());
     };
-    let admin = Anthropic::new(Some(admin_key))?;
+    let admin = Anthropic::try_new(Some(admin_key))?;
     let starting_at = OffsetDateTime::now_utc() - Duration::days(7);
 
     let usage_report = admin
         .usage_report(
             UsageReportParams::new(starting_at)
-                .with_bucket_width(topcoat_si::BucketWidth::OneDay)
+                .with_bucket_width(BucketWidth::OneDay)
                 .group_by(UsageGroupBy::Model),
         )
         .await?;

@@ -18,7 +18,7 @@ built-in ones for Firecrawl, Jev, research, triage and reports, and any the app 
 - Write actions with human confirmation. Packs in this version are read-only by contract.
 - Filesystem mounts, network access or third-party Python packages in the sandbox.
 - Snapshots (`Checkout::dump` / `restore`).
-- A README section or example program.
+- An example program.
 
 ## Dependencies and feature
 
@@ -69,7 +69,7 @@ pub mod code_mode {
 `max_processes = max_workers`, `checkout_timeout = 10s`, and `request_timeout` = the 120 s
 `python` call timeout, so a hung worker is always killed. The pool's own backstops already kill a
 worker shortly past `max_feed_duration` or `max_turn_duration`; `request_timeout` guards the
-requests those limits do not cover. `CodeMode::new` rejects limits where the shorter of
+requests those limits do not cover. `CodeMode::try_new` rejects limits where the shorter of
 `max_feed_duration` and `max_turn_duration`, plus 5 s, passes 120 s.
 
 `PyError` has no `TimeoutError`: that exception is reserved for the sandbox's own time limit, which
@@ -129,7 +129,7 @@ impl Pack {
     /// Shown by help() and run by testing::check_pack.
     pub fn with_example(self, function: &str, example: Example) -> Self;
     /// Other packs that must be in the same CodeMode, by name.
-    pub fn requires(self, packs: &[&'static str]) -> Self;
+    pub fn requires(self, packs: impl IntoIterator<Item = &'static str>) -> Self;
 }
 ```
 
@@ -143,7 +143,7 @@ impl Pack {
 ```rust
 impl CodeMode {
     /// Validates the packs; nothing is sent and no worker is checked out yet.
-    pub fn new(pool: Arc<Pool>, packs: Vec<Pack>, limits: Limits) -> Result<Self>;
+    pub fn try_new(pool: Arc<Pool>, packs: Vec<Pack>, limits: Limits) -> Result<Self>;
     /// Ends the session and returns its worker to the pool. Dropping a CodeMode without
     /// calling this kills the worker instead: safe, but the pool must spawn a replacement.
     pub async fn finish(self) -> Result<()>;
@@ -151,7 +151,7 @@ impl CodeMode {
 impl ClientTool for CodeMode { /* name "python" */ }
 ```
 
-`new` fails with `Error::validation` when two packs share a name, two functions share a name
+`try_new` fails with `Error::validation` when two packs share a name, two functions share a name
 across packs, a `requires` names a pack not given, an example names a function its pack does not
 define, a function is named `help` (reserved), or the limits pass the `python` call timeout (see
 `pool`). The tool definition is built
@@ -440,7 +440,7 @@ let shop = Pack::new("shop", "this store's orders and customers, read-only")
 // once per app
 let pool = code_mode::pool(monty_path, 4).await?;
 // once per conversation
-let code = CodeMode::new(pool.clone(), vec![packs::reports(), shop], Limits::default())?;
+let code = CodeMode::try_new(pool.clone(), vec![packs::reports(), shop], Limits::default())?;
 ```
 
 ## Testing
@@ -481,7 +481,7 @@ when it is unset. CI installs `monty-runtime` 1.2.0 with `--locked` and sets it.
    while a host function runs leaves the next call working on a fresh session.
 5. Validation: duplicate pack names, duplicate function names, a missing required pack, an example
    naming a function its pack does not define, and a function named `help` each fail in
-   `CodeMode::new`. Input that is not `{"code": string}` gets an `is_error` result, and a pack
+   `CodeMode::try_new`. Input that is not `{"code": string}` gets an `is_error` result, and a pack
    whose source raises makes the call return `Err`.
 6. Values: the host-call table both directions, including the `ValueError` and `TypeError` cases;
    a final value of `{1, 2}` renders as `=> {1, 2}`.
@@ -495,7 +495,7 @@ when it is unset. CI installs `monty-runtime` 1.2.0 with `--locked` and sets it.
    timeout, and the pool's suspension limit (1 100 `help()` calls) each discard the session; a
    `BadArgs` inside a `gather` is refunded while the other calls run; the first `Fatal` in a
    `gather` returns without waiting for the rest; the cancelled-call notice survives a full pool;
-   limits past the `python` call timeout fail in `CodeMode::new`.
+   limits past the `python` call timeout fail in `CodeMode::try_new`.
 10. Value sizes: a list doubled 30 times through shared references raises `ValueError` as an
     argument and renders truncated as the final value, both quickly; 100 000 items pass and
     100 001 do not; nesting past 64 levels raises `ValueError`.
@@ -549,5 +549,5 @@ From real Sonnet 5.5 runs of the PoC (`/tmp/codemode-demo`), a five-host price c
   once with asyncio.gather, then extract in Python. Print only what you need for the answer, not
   raw pages. When you have enough, stop calling the tool and answer."
 - **Check the final answer is not empty.** When `run_tools` forces `tool_choice: none` on its last
-  turn, Sonnet replied with a thinking block and no text. That is a `run_tools` gap, not a
-  code-mode one.
+  turn, Sonnet replied with a thinking block and no text, and `ToolRun::text` returns `None`.
+  That is a `run_tools` gap, not a code-mode one.

@@ -1,6 +1,7 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 
+use crate::types::open_union;
 use crate::types::{
     CodeExecutionToolResultBlock, CompactionBlock, DocumentBlock, FallbackBlock, ImageBlock,
     McpToolResultBlock, McpToolUseBlock, RedactedThinkingBlock, SearchResultBlock,
@@ -16,6 +17,7 @@ use crate::types::{
 /// echoed back in the conversation history.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum ContentBlock {
     /// A block of text content
     #[serde(rename = "text")]
@@ -124,25 +126,29 @@ impl<'de> Deserialize<'de> for ContentBlock {
         let block_type = value
             .get("type")
             .and_then(Value::as_str)
-            .ok_or_else(|| serde::de::Error::missing_field("type"))?
+            .ok_or_else(|| de::Error::missing_field("type"))?
             .to_string();
 
         match block_type.as_str() {
-            "text" => from_value(value).map(ContentBlock::Text),
-            "image" => from_value(value).map(ContentBlock::Image),
-            "tool_use" => from_value(value).map(ContentBlock::ToolUse),
-            "server_tool_use" => from_value(value).map(ContentBlock::ServerToolUse),
-            "tool_result" => from_value(value).map(ContentBlock::ToolResult),
-            "document" => from_value(value).map(ContentBlock::Document),
+            "text" => open_union::from_value(value).map(ContentBlock::Text),
+            "image" => open_union::from_value(value).map(ContentBlock::Image),
+            "tool_use" => open_union::from_value(value).map(ContentBlock::ToolUse),
+            "server_tool_use" => open_union::from_value(value).map(ContentBlock::ServerToolUse),
+            "tool_result" => open_union::from_value(value).map(ContentBlock::ToolResult),
+            "document" => open_union::from_value(value).map(ContentBlock::Document),
             "thinking" | "thinking_summary" | "summary" => {
-                from_value(value).map(ContentBlock::Thinking)
+                open_union::from_value(value).map(ContentBlock::Thinking)
             }
-            "redacted_thinking" => from_value(value).map(ContentBlock::RedactedThinking),
-            "fallback" => from_value(value).map(ContentBlock::Fallback),
-            "search_result" => from_value(value).map(ContentBlock::SearchResult),
-            "web_fetch_tool_result" => from_value(value).map(ContentBlock::WebFetchToolResult),
+            "redacted_thinking" => {
+                open_union::from_value(value).map(ContentBlock::RedactedThinking)
+            }
+            "fallback" => open_union::from_value(value).map(ContentBlock::Fallback),
+            "search_result" => open_union::from_value(value).map(ContentBlock::SearchResult),
+            "web_fetch_tool_result" => {
+                open_union::from_value(value).map(ContentBlock::WebFetchToolResult)
+            }
             "code_execution_tool_result" => {
-                from_value(value).map(ContentBlock::CodeExecutionToolResult)
+                open_union::from_value(value).map(ContentBlock::CodeExecutionToolResult)
             }
             "bash_code_execution_tool_result" => {
                 let (tool_use_id, content) = opaque_result::<D::Error>(value)?;
@@ -158,150 +164,171 @@ impl<'de> Deserialize<'de> for ContentBlock {
                     content,
                 })
             }
-            "tool_search_tool_result" => from_value(value).map(ContentBlock::ToolSearchToolResult),
+            "tool_search_tool_result" => {
+                open_union::from_value(value).map(ContentBlock::ToolSearchToolResult)
+            }
             "container_upload" => {
                 #[derive(Deserialize)]
                 struct Upload {
                     file_id: String,
                 }
-                from_value::<Upload, D::Error>(value).map(|upload| ContentBlock::ContainerUpload {
-                    file_id: upload.file_id,
+                open_union::from_value::<Upload, D::Error>(value).map(|upload| {
+                    ContentBlock::ContainerUpload {
+                        file_id: upload.file_id,
+                    }
                 })
             }
-            "compaction" => from_value(value).map(ContentBlock::Compaction),
-            "mcp_tool_use" => from_value(value).map(ContentBlock::McpToolUse),
-            "mcp_tool_result" => from_value(value).map(ContentBlock::McpToolResult),
-            "tool_reference" => from_value(value).map(ContentBlock::ToolReference),
-            _ => Ok(ContentBlock::Unknown(value)),
+            "compaction" => open_union::from_value(value).map(ContentBlock::Compaction),
+            "mcp_tool_use" => open_union::from_value(value).map(ContentBlock::McpToolUse),
+            "mcp_tool_result" => open_union::from_value(value).map(ContentBlock::McpToolResult),
+            "tool_reference" => open_union::from_value(value).map(ContentBlock::ToolReference),
+            tag => {
+                open_union::warn_unknown("ContentBlock", tag);
+                Ok(ContentBlock::Unknown(value))
+            }
         }
     }
 }
 
 /// Reads the fields of a block whose `content` is kept opaque.
-fn opaque_result<E: serde::de::Error>(value: Value) -> Result<(String, Value), E> {
+fn opaque_result<E: de::Error>(value: Value) -> Result<(String, Value), E> {
     #[derive(Deserialize)]
     struct Opaque {
         tool_use_id: String,
         content: Value,
     }
-    from_value::<Opaque, E>(value).map(|opaque| (opaque.tool_use_id, opaque.content))
-}
-
-fn from_value<T, E>(value: Value) -> Result<T, E>
-where
-    T: serde::de::DeserializeOwned,
-    E: serde::de::Error,
-{
-    serde_json::from_value(value).map_err(E::custom)
+    open_union::from_value::<Opaque, E>(value).map(|opaque| (opaque.tool_use_id, opaque.content))
 }
 
 impl ContentBlock {
     /// Returns true if this block is a text block
+    #[must_use]
     pub fn is_text(&self) -> bool {
         matches!(self, ContentBlock::Text(_))
     }
 
     /// Returns true if this block is an image block
+    #[must_use]
     pub fn is_image(&self) -> bool {
         matches!(self, ContentBlock::Image(_))
     }
 
     /// Returns true if this block is a tool use block
+    #[must_use]
     pub fn is_tool_use(&self) -> bool {
         matches!(self, ContentBlock::ToolUse(_))
     }
 
     /// Returns true if this block is a server tool use block
+    #[must_use]
     pub fn is_server_tool_use(&self) -> bool {
         matches!(self, ContentBlock::ServerToolUse(_))
     }
 
     /// Returns true if this block is a tool result block
+    #[must_use]
     pub fn is_tool_result(&self) -> bool {
         matches!(self, ContentBlock::ToolResult(_))
     }
 
     /// Returns true if this block is a document block
+    #[must_use]
     pub fn is_document(&self) -> bool {
         matches!(self, ContentBlock::Document(_))
     }
 
     /// Returns true if this block is a thinking block
+    #[must_use]
     pub fn is_thinking(&self) -> bool {
         matches!(self, ContentBlock::Thinking(_))
     }
 
     /// Returns true if this block is a redacted thinking block
+    #[must_use]
     pub fn is_redacted_thinking(&self) -> bool {
         matches!(self, ContentBlock::RedactedThinking(_))
     }
 
     /// Returns true if this block marks a model fallback boundary.
+    #[must_use]
     pub fn is_fallback(&self) -> bool {
         matches!(self, ContentBlock::Fallback(_))
     }
 
     /// Returns true if this block is a search result block
+    #[must_use]
     pub fn is_search_result(&self) -> bool {
         matches!(self, ContentBlock::SearchResult(_))
     }
 
     /// Returns true if this block is a web fetch tool result block
+    #[must_use]
     pub fn is_web_fetch_tool_result(&self) -> bool {
         matches!(self, ContentBlock::WebFetchToolResult(_))
     }
 
     /// Returns true if this block is a code execution tool result block
+    #[must_use]
     pub fn is_code_execution_tool_result(&self) -> bool {
         matches!(self, ContentBlock::CodeExecutionToolResult(_))
     }
 
     /// Returns true if this block is a bash code execution tool result block
+    #[must_use]
     pub fn is_bash_code_execution_tool_result(&self) -> bool {
         matches!(self, ContentBlock::BashCodeExecutionToolResult { .. })
     }
 
     /// Returns true if this block is a text editor code execution tool result block
+    #[must_use]
     pub fn is_text_editor_code_execution_tool_result(&self) -> bool {
         matches!(self, ContentBlock::TextEditorCodeExecutionToolResult { .. })
     }
 
     /// Returns true if this block is a tool search tool result block
+    #[must_use]
     pub fn is_tool_search_tool_result(&self) -> bool {
         matches!(self, ContentBlock::ToolSearchToolResult(_))
     }
 
     /// Returns true if this block is a container upload block
+    #[must_use]
     pub fn is_container_upload(&self) -> bool {
         matches!(self, ContentBlock::ContainerUpload { .. })
     }
 
     /// Returns true if this block is a compaction block
+    #[must_use]
     pub fn is_compaction(&self) -> bool {
         matches!(self, ContentBlock::Compaction(_))
     }
 
     /// Returns true if this block is an MCP tool use block
+    #[must_use]
     pub fn is_mcp_tool_use(&self) -> bool {
         matches!(self, ContentBlock::McpToolUse(_))
     }
 
     /// Returns true if this block is an MCP tool result block
+    #[must_use]
     pub fn is_mcp_tool_result(&self) -> bool {
         matches!(self, ContentBlock::McpToolResult(_))
     }
 
     /// Returns true if this block is a tool reference block
+    #[must_use]
     pub fn is_tool_reference(&self) -> bool {
         matches!(self, ContentBlock::ToolReference(_))
     }
 
     /// Returns true if this block has a type this crate does not know
+    #[must_use]
     pub fn is_unknown(&self) -> bool {
         matches!(self, ContentBlock::Unknown(_))
     }
 
     /// Returns the raw JSON if this is an unrecognized block, or None otherwise.
+    #[must_use]
     pub fn as_unknown(&self) -> Option<&Value> {
         match self {
             ContentBlock::Unknown(value) => Some(value),
@@ -347,6 +374,7 @@ impl ContentBlock {
     /// Returns a short bracketed label for display, such as `[web_fetch_tool_result]`.
     ///
     /// Unrecognized blocks are labelled `[unknown block: <type>]`.
+    #[must_use]
     pub fn label(&self) -> String {
         match self {
             ContentBlock::Unknown(_) => format!("[unknown block: {}]", self.type_name()),
@@ -356,6 +384,7 @@ impl ContentBlock {
 
     /// Returns a reference to the inner TextBlock if this is a Text variant,
     /// or None otherwise.
+    #[must_use]
     pub fn as_text(&self) -> Option<&TextBlock> {
         match self {
             ContentBlock::Text(block) => Some(block),
@@ -365,6 +394,7 @@ impl ContentBlock {
 
     /// Returns a reference to the inner ImageBlock if this is an Image variant,
     /// or None otherwise.
+    #[must_use]
     pub fn as_image(&self) -> Option<&ImageBlock> {
         match self {
             ContentBlock::Image(block) => Some(block),
@@ -374,6 +404,7 @@ impl ContentBlock {
 
     /// Returns a reference to the inner ToolUseBlock if this is a ToolUse variant,
     /// or None otherwise.
+    #[must_use]
     pub fn as_tool_use(&self) -> Option<&ToolUseBlock> {
         match self {
             ContentBlock::ToolUse(block) => Some(block),
@@ -383,6 +414,7 @@ impl ContentBlock {
 
     /// Returns a reference to the inner ServerToolUseBlock if this is a ServerToolUse variant,
     /// or None otherwise.
+    #[must_use]
     pub fn as_server_tool_use(&self) -> Option<&ServerToolUseBlock> {
         match self {
             ContentBlock::ServerToolUse(block) => Some(block),
@@ -392,6 +424,7 @@ impl ContentBlock {
 
     /// Returns a reference to the inner ToolResultBlock if this is a ToolResult variant,
     /// or None otherwise.
+    #[must_use]
     pub fn as_tool_result(&self) -> Option<&ToolResultBlock> {
         match self {
             ContentBlock::ToolResult(block) => Some(block),
@@ -401,6 +434,7 @@ impl ContentBlock {
 
     /// Returns a reference to the inner DocumentBlock if this is a Document variant,
     /// or None otherwise.
+    #[must_use]
     pub fn as_document(&self) -> Option<&DocumentBlock> {
         match self {
             ContentBlock::Document(block) => Some(block),
@@ -410,6 +444,7 @@ impl ContentBlock {
 
     /// Returns a reference to the inner ThinkingBlock if this is a Thinking variant,
     /// or None otherwise.
+    #[must_use]
     pub fn as_thinking(&self) -> Option<&ThinkingBlock> {
         match self {
             ContentBlock::Thinking(block) => Some(block),
@@ -419,6 +454,7 @@ impl ContentBlock {
 
     /// Returns a reference to the inner RedactedThinkingBlock if this is a RedactedThinking variant,
     /// or None otherwise.
+    #[must_use]
     pub fn as_redacted_thinking(&self) -> Option<&RedactedThinkingBlock> {
         match self {
             ContentBlock::RedactedThinking(block) => Some(block),
@@ -427,7 +463,6 @@ impl ContentBlock {
     }
 }
 
-/// Helper methods to create ContentBlock variants
 impl From<TextBlock> for ContentBlock {
     fn from(block: TextBlock) -> Self {
         ContentBlock::Text(block)
@@ -497,6 +532,7 @@ impl From<CompactionBlock> for ContentBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{KnownModel, Model};
 
     #[test]
     fn text_block_serialization() {
@@ -571,14 +607,8 @@ mod tests {
         let ContentBlock::Fallback(block) = block else {
             panic!("expected fallback block");
         };
-        assert_eq!(
-            block.from.model,
-            crate::types::Model::Known(crate::types::KnownModel::ClaudeFable51)
-        );
-        assert_eq!(
-            block.to.model,
-            crate::types::Model::Known(crate::types::KnownModel::ClaudeOpus55)
-        );
+        assert_eq!(block.from.model, Model::Known(KnownModel::ClaudeFable51));
+        assert_eq!(block.to.model, Model::Known(KnownModel::ClaudeOpus55));
     }
 
     #[test]
@@ -652,8 +682,7 @@ mod tests {
 
     #[test]
     fn image_block_serialization() {
-        let image_source =
-            crate::types::UrlImageSource::new("https://example.com/image.jpg".to_string());
+        let image_source = crate::types::UrlImageSource::new("https://example.com/image.jpg");
         let image_block = ImageBlock::new_with_url(image_source);
         let content_block = ContentBlock::from(image_block);
 

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Breakdown of cache-creation input tokens by cache lifetime.
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CacheCreation {
     /// The number of input tokens used to create the 5-minute cache entry.
     pub ephemeral_5m_input_tokens: i32,
@@ -14,6 +15,7 @@ pub struct CacheCreation {
 
 impl CacheCreation {
     /// Create a new `CacheCreation` with the given 5-minute and 1-hour token counts.
+    #[must_use]
     pub fn new(ephemeral_5m_input_tokens: i32, ephemeral_1h_input_tokens: i32) -> Self {
         Self {
             ephemeral_5m_input_tokens,

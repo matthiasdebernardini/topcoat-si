@@ -19,6 +19,7 @@ use crate::types::{
 /// The API accepts any of these tool types when tools are provided to Claude.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum ToolUnionParam {
     /// A custom tool with a defined schema
     #[serde(rename = "custom")]
@@ -91,51 +92,61 @@ pub enum ToolUnionParam {
 
 impl ToolUnionParam {
     /// Creates a new custom tool
-    pub fn new_custom_tool(name: String, input_schema: serde_json::Value) -> Self {
+    #[must_use]
+    pub fn new_custom_tool(name: impl Into<String>, input_schema: serde_json::Value) -> Self {
         Self::CustomTool(ToolParam::new(name, input_schema))
     }
 
     /// Creates a new bash tool (version 20241022)
+    #[must_use]
     pub fn new_bash_20241022_tool() -> Self {
         Self::Bash20241022(ToolBash20241022::new())
     }
 
     /// Creates a new bash tool (version 20250124)
+    #[must_use]
     pub fn new_bash_tool() -> Self {
         Self::Bash20250124(ToolBash20250124::new())
     }
 
     /// Creates a new text editor tool
+    #[must_use]
     pub fn new_text_editor_tool() -> Self {
         Self::TextEditor20250124(ToolTextEditor20250124::new())
     }
 
     /// Creates a new text editor tool (version 20250429)
+    #[must_use]
     pub fn new_text_editor_20250429_tool() -> Self {
         Self::TextEditor20250429(ToolTextEditor20250429::new())
     }
 
     /// Creates a new text editor tool (version 20250728)
+    #[must_use]
     pub fn new_text_editor_20250728_tool() -> Self {
         Self::TextEditor20250728(ToolTextEditor20250728::new())
     }
 
     /// Creates a new web fetch tool (version 20260318)
+    #[must_use]
     pub fn new_web_fetch_tool() -> Self {
         Self::WebFetch20260318(WebFetchTool::new())
     }
 
     /// Creates a new code execution tool (version 20260521)
+    #[must_use]
     pub fn new_code_execution_tool() -> Self {
         Self::CodeExecution20260521(CodeExecutionTool::new())
     }
 
     /// Creates a new regex tool search tool
+    #[must_use]
     pub fn new_tool_search_regex_tool() -> Self {
         Self::ToolSearchToolRegex20251119(ToolSearchTool::regex())
     }
 
     /// Creates a new BM25 tool search tool
+    #[must_use]
     pub fn new_tool_search_bm25_tool() -> Self {
         Self::ToolSearchToolBm2520251119(ToolSearchTool::bm25())
     }
@@ -143,11 +154,13 @@ impl ToolUnionParam {
     /// Creates a new memory tool.
     ///
     /// This is a client-side tool: the application implements the memory commands.
+    #[must_use]
     pub fn new_memory_tool() -> Self {
         Self::Memory20250818(MemoryTool::new())
     }
 
     /// Creates a toolset exposing the tools of the named MCP server
+    #[must_use]
     pub fn new_mcp_toolset(server_name: impl Into<String>) -> Self {
         Self::McpToolset(McpToolset::new(server_name))
     }
@@ -180,6 +193,7 @@ impl ToolUnionParam {
     ///
     /// Only custom tools can have strict mode enabled. All other tool types
     /// return `false`.
+    #[must_use]
     pub fn is_strict(&self) -> bool {
         match self {
             Self::CustomTool(tool) => tool.strict == Some(true),
@@ -222,8 +236,8 @@ mod tests {
             }
         });
 
-        let custom_tool = ToolParam::new("search".to_string(), input_schema)
-            .with_description("Search for information".to_string())
+        let custom_tool = ToolParam::new("search", input_schema)
+            .with_description("Search for information")
             .with_cache_control(CacheControlEphemeral::new());
 
         let tool = ToolUnionParam::CustomTool(custom_tool);

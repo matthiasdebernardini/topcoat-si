@@ -3,8 +3,9 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Controls how extended thinking content is returned in API responses.
-#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ThinkingDisplay {
     /// Return summarized thinking text in `thinking` blocks.
     Summarized,
@@ -19,9 +20,11 @@ pub enum ThinkingDisplay {
 ///
 /// This can be disabled, adaptive, or enabled with a token budget. Display-aware
 /// variants add the API's `display` field without changing the JSON `type`.
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub enum ThinkingConfig {
     /// Disabled thinking configuration.
+    #[default]
     Disabled,
 
     /// Adaptive thinking configuration.
@@ -69,6 +72,7 @@ impl ThinkingConfig {
     /// Returns the number of budget tokens configured for thinking.
     ///
     /// Returns 0 if thinking is disabled or adaptive.
+    #[must_use]
     pub fn num_tokens(&self) -> u32 {
         match self {
             ThinkingConfig::Disabled
@@ -83,6 +87,7 @@ impl ThinkingConfig {
     /// Create a new enabled thinking configuration with the given budget tokens.
     ///
     /// Budget tokens must be ≥1024.
+    #[must_use]
     pub fn enabled(budget_tokens: u32) -> Self {
         Self::Enabled { budget_tokens }
     }
@@ -90,6 +95,7 @@ impl ThinkingConfig {
     /// Create a new enabled thinking configuration that requests summarized thinking.
     ///
     /// Budget tokens must be ≥1024.
+    #[must_use]
     pub fn enabled_summarized(budget_tokens: u32) -> Self {
         Self::enabled(budget_tokens).with_display(ThinkingDisplay::Summarized)
     }
@@ -97,11 +103,13 @@ impl ThinkingConfig {
     /// Create a new enabled thinking configuration that omits thinking text.
     ///
     /// Budget tokens must be ≥1024.
+    #[must_use]
     pub fn enabled_omitted(budget_tokens: u32) -> Self {
         Self::enabled(budget_tokens).with_display(ThinkingDisplay::Omitted)
     }
 
     /// Create a new disabled thinking configuration.
+    #[must_use]
     pub fn disabled() -> Self {
         Self::Disabled
     }
@@ -109,21 +117,25 @@ impl ThinkingConfig {
     /// Create a thinking configuration that thinks between tool calls only.
     ///
     /// Sonnet 5.5 only, with effort `high` or below.
+    #[must_use]
     pub fn between_tools() -> Self {
         Self::BetweenTools
     }
 
     /// Create a new adaptive thinking configuration.
+    #[must_use]
     pub fn adaptive() -> Self {
         Self::Adaptive
     }
 
     /// Create a new adaptive thinking configuration that requests summarized thinking.
+    #[must_use]
     pub fn adaptive_summarized() -> Self {
         Self::adaptive().with_display(ThinkingDisplay::Summarized)
     }
 
     /// Create a new adaptive thinking configuration that omits thinking text.
+    #[must_use]
     pub fn adaptive_omitted() -> Self {
         Self::adaptive().with_display(ThinkingDisplay::Omitted)
     }
@@ -131,6 +143,7 @@ impl ThinkingConfig {
     /// Create adaptive thinking that emits readable progress updates.
     ///
     /// Requires the `thinking-display-updates-2026-08-18` beta header.
+    #[must_use]
     pub fn adaptive_updates() -> Self {
         Self::adaptive().with_display(ThinkingDisplay::Updates)
     }
@@ -139,6 +152,7 @@ impl ThinkingConfig {
     ///
     /// `display` is only valid for enabled or adaptive thinking. Calling this on
     /// disabled or between-tools thinking leaves it unchanged.
+    #[must_use]
     pub fn with_display(self, display: ThinkingDisplay) -> Self {
         match self {
             ThinkingConfig::Disabled => ThinkingConfig::Disabled,
@@ -157,6 +171,7 @@ impl ThinkingConfig {
     }
 
     /// Returns the configured thinking display mode, if any.
+    #[must_use]
     pub fn display(&self) -> Option<ThinkingDisplay> {
         match self {
             ThinkingConfig::AdaptiveWithDisplay { display }
@@ -254,12 +269,6 @@ impl<'de> Deserialize<'de> for ThinkingConfig {
                 &["disabled", "adaptive", "between_tools", "enabled"],
             )),
         }
-    }
-}
-
-impl Default for ThinkingConfig {
-    fn default() -> Self {
-        Self::disabled()
     }
 }
 

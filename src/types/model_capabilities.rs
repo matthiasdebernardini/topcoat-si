@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Indicates whether a model capability is supported.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CapabilitySupport {
     /// Whether the capability is supported.
     pub supported: bool,
@@ -9,6 +10,7 @@ pub struct CapabilitySupport {
 
 /// Context-management features exposed by the Models API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ContextManagementCapability {
     /// Support for clearing thinking blocks.
     pub clear_thinking_20251015: Option<CapabilitySupport>,
@@ -22,6 +24,7 @@ pub struct ContextManagementCapability {
 
 /// Server-side tools exposed by the Models API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ServerToolsCapability {
     /// Whether server tools are supported.
     pub supported: bool,
@@ -32,6 +35,7 @@ pub struct ServerToolsCapability {
 
 /// Effort levels exposed by the Models API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EffortCapability {
     /// High effort support.
     pub high: CapabilitySupport,
@@ -49,6 +53,7 @@ pub struct EffortCapability {
 
 /// Thinking modes exposed by the Models API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ThinkingTypes {
     /// Adaptive thinking support.
     pub adaptive: CapabilitySupport,
@@ -64,6 +69,7 @@ pub struct ThinkingTypes {
 
 /// Thinking support exposed by the Models API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ThinkingCapability {
     /// Whether any thinking mode is supported.
     pub supported: bool,
@@ -73,6 +79,7 @@ pub struct ThinkingCapability {
 
 /// Capability metadata returned for a model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ModelCapabilities {
     /// Message Batches API support.
     pub batch: CapabilitySupport,

@@ -2,11 +2,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{
     CacheControlEphemeral, ContextManagement, InferenceSpeed, McpServer, MessageParam, Model,
-    OutputConfig, SystemPrompt, TextBlock, ThinkingConfig, ToolChoice, ToolUnionParam,
+    OutputConfig, SystemPrompt, ThinkingConfig, ToolChoice, ToolUnionParam,
 };
+use crate::types::{message_param, open_union};
 
 /// Parameters for counting tokens in messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MessageCountTokensParams {
     /// Input messages.
     ///
@@ -100,6 +102,7 @@ pub struct MessageCountTokensParams {
 
 impl MessageCountTokensParams {
     /// Create a new `MessageCountTokensParams` with the required fields.
+    #[must_use]
     pub fn new(messages: Vec<MessageParam>, model: Model) -> Self {
         Self {
             messages,
@@ -117,67 +120,73 @@ impl MessageCountTokensParams {
         }
     }
 
-    /// Add a system prompt as a string.
-    pub fn with_system_string(mut self, system: String) -> Self {
-        self.system = Some(SystemPrompt::from_string(system));
-        self
+    /// Rejects an `Unknown` role or speed read from a reply, which has no API value to send.
+    pub(crate) fn check_known_values(&self) -> crate::Result<()> {
+        message_param::check_roles(&self.messages)?;
+        if self.speed == Some(InferenceSpeed::Unknown) {
+            return Err(open_union::unknown_in_request("speed".to_string()));
+        }
+        Ok(())
     }
 
-    /// Add a system prompt as text blocks.
-    pub fn with_system_blocks(mut self, blocks: Vec<TextBlock>) -> Self {
-        self.system = Some(SystemPrompt::from_blocks(blocks));
-        self
-    }
-
-    /// Add a system prompt.
-    pub fn with_system(mut self, system: SystemPrompt) -> Self {
-        self.system = Some(system);
+    /// Add a system prompt: a `String`, a `&str` or a `Vec<TextBlock>`.
+    #[must_use]
+    pub fn with_system(mut self, system: impl Into<SystemPrompt>) -> Self {
+        self.system = Some(system.into());
         self
     }
 
     /// Add thinking configuration.
+    #[must_use]
     pub fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
     }
 
     /// Add tool choice.
+    #[must_use]
     pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = Some(tool_choice);
         self
     }
 
     /// Add tools.
+    #[must_use]
     pub fn with_tools(mut self, tools: Vec<ToolUnionParam>) -> Self {
         self.tools = Some(tools);
         self
     }
 
     /// Set the output configuration.
+    #[must_use]
     pub fn with_output_config(mut self, output_config: OutputConfig) -> Self {
         self.output_config = Some(output_config);
         self
     }
 
     /// Set the inference speed.
+    #[must_use]
     pub fn with_speed(mut self, speed: InferenceSpeed) -> Self {
         self.speed = Some(speed);
         self
     }
 
     /// Enable automatic prompt caching.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self
     }
 
     /// Set server-side context management.
+    #[must_use]
     pub fn with_context_management(mut self, context_management: ContextManagement) -> Self {
         self.context_management = Some(context_management);
         self
     }
 
     /// Set the remote MCP servers.
+    #[must_use]
     pub fn with_mcp_servers(mut self, mcp_servers: Vec<McpServer>) -> Self {
         self.mcp_servers = Some(mcp_servers);
         self
@@ -188,6 +197,7 @@ impl MessageCountTokensParams {
     /// These are merged with any client-level default betas and the betas
     /// auto-detected from the features this request uses. Duplicates are
     /// removed before sending.
+    #[must_use]
     pub fn with_betas(mut self, betas: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.betas = Some(betas.into_iter().map(Into::into).collect());
         self
@@ -196,6 +206,7 @@ impl MessageCountTokensParams {
     /// Add a single beta feature header for this request.
     ///
     /// Appends to any previously set betas.
+    #[must_use]
     pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
         self.betas.get_or_insert_with(Vec::new).push(beta.into());
         self
@@ -205,12 +216,12 @@ impl MessageCountTokensParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{KnownModel, MessageRole};
+    use crate::types::KnownModel;
     use serde_json::{json, to_value};
 
     #[test]
     fn message_count_tokens_params_serialization() {
-        let message = MessageParam::new_with_string("Hello, Claude".to_string(), MessageRole::User);
+        let message = MessageParam::user("Hello, Claude");
 
         let params =
             MessageCountTokensParams::new(vec![message], Model::Known(KnownModel::ClaudeSonnet55));
@@ -232,11 +243,11 @@ mod tests {
 
     #[test]
     fn message_count_tokens_params_with_system() {
-        let message = MessageParam::new_with_string("Hello, Claude".to_string(), MessageRole::User);
+        let message = MessageParam::user("Hello, Claude");
 
         let params =
             MessageCountTokensParams::new(vec![message], Model::Known(KnownModel::ClaudeSonnet55))
-                .with_system_string("You are a helpful assistant.".to_string());
+                .with_system("You are a helpful assistant.");
 
         let json = to_value(&params).unwrap();
         assert_eq!(
@@ -256,10 +267,10 @@ mod tests {
 
     #[test]
     fn message_count_tokens_params_with_tools() {
-        let message = MessageParam::new_with_string("Hello, Claude".to_string(), MessageRole::User);
+        let message = MessageParam::user("Hello, Claude");
 
         let tool = ToolUnionParam::new_custom_tool(
-            "search".to_string(),
+            "search",
             json!({
                 "type": "object",
                 "properties": {
@@ -308,10 +319,7 @@ mod tests {
     #[test]
     fn message_count_tokens_params_new_fields_serialize() {
         let params = MessageCountTokensParams::new(
-            vec![MessageParam::new_with_string(
-                "Hi".to_string(),
-                MessageRole::User,
-            )],
+            vec![MessageParam::user("Hi")],
             Model::Known(KnownModel::ClaudeSonnet55),
         )
         .with_speed(InferenceSpeed::Fast)

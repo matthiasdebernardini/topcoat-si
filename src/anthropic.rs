@@ -1,6 +1,10 @@
-use std::collections::VecDeque;
+//! The [`Anthropic`] client: request building, retries, telemetry and every API endpoint.
+use std::borrow::Cow;
+use std::collections::{HashSet, VecDeque};
 use std::env;
+use std::fmt;
 use std::fs;
+use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -8,12 +12,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest::{Client as ReqwestClient, Response, header};
-use tokio::time::sleep;
-use tracing::{Instrument, Span, field};
+use reqwest::{Client as ReqwestClient, Response, header, redirect};
+use serde::de::DeserializeOwned;
+use tracing::{Span, field};
 
 use crate::AccumulatingStream;
-use crate::backoff::ExponentialBackoff;
+use crate::backoff;
+use crate::base_url;
 use crate::error::{Error, HttpMetadata, RequestPhase, Result, map_reqwest_error};
 use crate::observability;
 use crate::sse::process_message_stream_sse;
@@ -36,6 +41,7 @@ fn final_failure(error: &Error) {
         span.record("http.status_code", status);
     }
     tracing::error!(
+        target: "topcoat_si::client",
         error = error as &dyn std::error::Error,
         "API request failed"
     );
@@ -90,6 +96,8 @@ where
     S: Stream<Item = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
+    use tracing::Instrument;
+
     stream::unfold(Some((Box::pin(inner), span)), |state| async move {
         let (mut inner, span) = state?;
         let item = async {
@@ -127,7 +135,7 @@ const FALLBACK_CREDIT_BETA: &str = "fallback-credit-2026-07-01";
 const THINKING_DISPLAY_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18";
 
 /// Allowed lifetime of an uploaded file: one hour to ninety days.
-const FILE_EXPIRY_SECONDS: std::ops::RangeInclusive<u64> = 3_600..=7_776_000;
+const FILE_EXPIRY_SECONDS: RangeInclusive<u64> = 3_600..=7_776_000;
 
 /// A multipart boundary built from a process-wide counter and the current time.
 fn multipart_boundary() -> String {
@@ -239,6 +247,22 @@ fn count_params_betas(params: &MessageCountTokensParams) -> Vec<&'static str> {
 /// Baseten's Anthropic-compatible inference gateway is one such provider: it
 /// expects a bearer token instead of `x-api-key`.
 const BASE_URLS_REQUIRING_AUTH_HEADER: &[&str] = &["https://inference.baseten.co"];
+
+/// Checks a base URL with the shared https rule (see [`base_url::checked_url`]) and normalizes
+/// it: removes trailing slashes and one final `v1` path segment, which [`Anthropic::build_url`]
+/// adds back. `setting` names where the URL came from in the validation error.
+fn normalized_base_url(setting: &str, base_url: &str) -> Result<String> {
+    let mut url = base_url::checked_url("Anthropic", setting, base_url)?;
+    // The path starts with `/`, so a trailing `/v1` is always a whole final segment.
+    let path = url.path().trim_end_matches('/');
+    let path = path
+        .strip_suffix("/v1")
+        .unwrap_or(path)
+        .trim_end_matches('/')
+        .to_string();
+    url.set_path(&path);
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
 
 /// Returns `true` when `base_url` (after trimming any trailing slash) matches
 /// one of the entries in [`BASE_URLS_REQUIRING_AUTH_HEADER`].
@@ -375,17 +399,28 @@ fn response_metadata(response: &Response) -> HttpMetadata {
     }
 }
 
-fn configured_value(names: &[&str]) -> Result<Option<String>> {
+/// Reads one environment variable: `Ok(None)` when it is unset, an error when it is not Unicode.
+fn env_value(name: &str) -> Result<Option<String>> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(Error::validation(
+            format!("Configuration variable {name} must contain Unicode text"),
+            Some(name.into()),
+        )),
+    }
+}
+
+/// Returns the first of `names` that `get` reads as nonblank text, trimmed, with its name.
+fn configured_value<'a>(
+    get: &impl Fn(&str) -> Result<Option<String>>,
+    names: &[&'a str],
+) -> Result<Option<(&'a str, String)>> {
     for name in names {
-        match env::var(name) {
-            Ok(value) if !value.trim().is_empty() => return Ok(Some(value.trim().to_string())),
-            Ok(_) | Err(env::VarError::NotPresent) => {}
-            Err(env::VarError::NotUnicode(_)) => {
-                return Err(Error::validation(
-                    format!("Configuration variable {name} must contain Unicode text"),
-                    Some((*name).into()),
-                ));
-            }
+        if let Some(value) = get(name)?
+            && !value.trim().is_empty()
+        {
+            return Ok(Some((name, value.trim().to_string())));
         }
     }
     Ok(None)
@@ -406,16 +441,16 @@ pub struct Anthropic {
     base_url: String,
     timeout: Duration,
     max_retries: usize,
-    /// Cached headers for performance - Arc for cheap cloning
-    cached_headers: Arc<HeaderMap>,
+    /// Headers sent on every request, built once from the API key and base URL.
+    cached_headers: HeaderMap,
     /// Beta feature headers included on every request.
     default_betas: Vec<String>,
     /// Rate-limit headers from the most recent response, shared by clones.
     last_rate_limits: Arc<Mutex<Option<RateLimits>>>,
 }
 
-impl std::fmt::Debug for Anthropic {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Anthropic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Anthropic")
             .field("api_key", &"[REDACTED]")
             .field("cached_headers", &"[REDACTED]")
@@ -426,9 +461,15 @@ impl std::fmt::Debug for Anthropic {
 }
 
 impl Anthropic {
-    fn build_http_client(timeout: Duration, mode: ResponseMode) -> Result<ReqwestClient> {
+    /// Builds an HTTP client for `base_url`, which decides whether proxies are used (see
+    /// [`base_url::with_proxy_rule`]).
+    fn build_http_client(
+        timeout: Duration,
+        mode: ResponseMode,
+        base_url: &str,
+    ) -> Result<ReqwestClient> {
         let builder = ReqwestClient::builder()
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(redirect::Policy::none())
             .connect_timeout(timeout.min(Duration::from_secs(60)))
             .pool_max_idle_per_host(10) // Connection pooling optimization
             .pool_idle_timeout(Duration::from_secs(90))
@@ -438,12 +479,14 @@ impl Anthropic {
         } else {
             builder.timeout(timeout)
         };
-        builder.build().map_err(|e| {
-            Error::http_client(
-                format!("Failed to build HTTP client: {e}"),
-                Some(Box::new(e)),
-            )
-        })
+        base_url::with_proxy_rule(builder, base_url)
+            .build()
+            .map_err(|e| {
+                Error::http_client(
+                    format!("Failed to build HTTP client: {e}"),
+                    Some(Box::new(e)),
+                )
+            })
     }
 
     /// Resolve an API key value, handling file:// URLs
@@ -464,37 +507,49 @@ impl Anthropic {
     /// treated as a file path and the API key will be read from that file.
     ///
     /// The base URL is resolved from the TOPCOAT_SI_BASE_URL or ANTHROPIC_BASE_URL environment
-    /// variables, in that order. If neither is set, the default Anthropic API URL is used.
-    pub fn new(api_key: Option<String>) -> Result<Self> {
+    /// variables, in that order. If neither is set, the default Anthropic API URL is used. A
+    /// configured base URL follows the rule of [`Anthropic::with_base_url`]; a URL that breaks it
+    /// is a validation error naming the variable.
+    pub fn try_new(api_key: Option<String>) -> Result<Self> {
+        Self::try_new_with(api_key, env_value)
+    }
+
+    /// [`Anthropic::try_new`] with the configuration read through `get` instead of the process
+    /// environment.
+    fn try_new_with(
+        api_key: Option<String>,
+        get: impl Fn(&str) -> Result<Option<String>>,
+    ) -> Result<Self> {
         let key = match api_key {
             Some(key) => key,
-            None => configured_value(&["TOPCOAT_SI_API_KEY", "ANTHROPIC_API_KEY"])?.ok_or_else(
-                || {
+            None => configured_value(&get, &["TOPCOAT_SI_API_KEY", "ANTHROPIC_API_KEY"])?
+                .map(|(_, key)| key)
+                .ok_or_else(|| {
                     Error::authentication(
                         "No nonempty API key configured in TOPCOAT_SI_API_KEY or ANTHROPIC_API_KEY",
                     )
-                },
-            )?,
+                })?,
         };
         let api_key = Self::resolve_api_key(&key)?;
-
-        let timeout = DEFAULT_TIMEOUT;
-        let client = Self::build_http_client(timeout, ResponseMode::Buffered)?;
 
         // Resolve base URL from environment variables, defaulting to the API URL.
         // This is resolved before building headers because some providers
         // (see `BASE_URLS_REQUIRING_AUTH_HEADER`) require an `Authorization`
         // header derived from the base URL.
-        let base_url = configured_value(&["TOPCOAT_SI_BASE_URL", "ANTHROPIC_BASE_URL"])?
-            .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+        let configured = configured_value(&get, &["TOPCOAT_SI_BASE_URL", "ANTHROPIC_BASE_URL"])?;
+        let base_url = match configured {
+            Some((name, url)) => normalized_base_url(name, &url)?,
+            None => DEFAULT_API_URL.to_string(),
+        };
 
         // Pre-build headers for performance
-        let cached_headers = Arc::new(Self::build_default_headers(&api_key, &base_url)?);
+        let cached_headers = Self::build_default_headers(&api_key, &base_url)?;
+        let timeout = DEFAULT_TIMEOUT;
 
         Ok(Self {
             api_key,
-            client,
-            stream_client: Self::build_http_client(timeout, ResponseMode::Streaming)?,
+            client: Self::build_http_client(timeout, ResponseMode::Buffered, &base_url)?,
+            stream_client: Self::build_http_client(timeout, ResponseMode::Streaming, &base_url)?,
             base_url,
             timeout,
             max_retries: 3,
@@ -507,23 +562,28 @@ impl Anthropic {
     /// Set a custom base URL for this client.
     ///
     /// This method allows you to specify a different API endpoint for the client.
-    /// The base URL should be the root URL without the `/v1/` suffix - this will
-    /// be added automatically when constructing request URLs.
+    /// The `/v1` suffix is optional: one final `v1` path segment and any trailing slashes are
+    /// removed, and `/v1/` is added back when constructing request URLs.
+    ///
+    /// The URL must use https; plain http is accepted only for a loopback host (`localhost`,
+    /// `127.x`, `[::1]`), so the API key never travels in clear. Credentials, a query or a
+    /// fragment in the URL are rejected. A URL that breaks these rules is a validation error
+    /// naming `base_url`.
     ///
     /// # Examples
     ///
     /// ```
     /// # use topcoat_si::Anthropic;
     /// // For Anthropic's API (default)
-    /// let client = Anthropic::new(Some("api-key".to_string()))?
+    /// let client = Anthropic::try_new(Some("api-key".to_string()))?
     ///     .with_base_url("https://api.anthropic.com".to_string())?;
     ///
     /// // For Minimax (international)
-    /// let client = Anthropic::new(Some("api-key".to_string()))?
+    /// let client = Anthropic::try_new(Some("api-key".to_string()))?
     ///     .with_base_url("https://api.minimax.io/anthropic".to_string())?;
     ///
     /// // For Minimax (China)
-    /// let client = Anthropic::new(Some("api-key".to_string()))?
+    /// let client = Anthropic::try_new(Some("api-key".to_string()))?
     ///     .with_base_url("https://api.minimaxi.com/anthropic".to_string())?;
     /// # Ok::<(), topcoat_si::Error>(())
     /// ```
@@ -532,7 +592,12 @@ impl Anthropic {
         // listed in `BASE_URLS_REQUIRING_AUTH_HEADER` get an `Authorization`
         // header. Rebuild the cached headers when switching to or from such a
         // provider so every subsequent request carries the right auth.
-        self.cached_headers = Arc::new(Self::build_default_headers(&self.api_key, &base_url)?);
+        let base_url = normalized_base_url("base_url", &base_url)?;
+        self.cached_headers = Self::build_default_headers(&self.api_key, &base_url)?;
+        // A loopback base URL bypasses proxies, so the HTTP clients depend on it too.
+        self.client = Self::build_http_client(self.timeout, ResponseMode::Buffered, &base_url)?;
+        self.stream_client =
+            Self::build_http_client(self.timeout, ResponseMode::Streaming, &base_url)?;
         self.base_url = base_url;
         Ok(self)
     }
@@ -543,13 +608,15 @@ impl Anthropic {
     /// an inactivity timeout of the smaller of this value and 60 seconds.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
         self.timeout = timeout;
-        self.stream_client = Self::build_http_client(timeout, ResponseMode::Streaming)?;
+        self.stream_client =
+            Self::build_http_client(timeout, ResponseMode::Streaming, &self.base_url)?;
 
-        self.client =
-            Self::build_http_client(timeout, ResponseMode::Buffered).map_err(|e| match e {
+        self.client = Self::build_http_client(timeout, ResponseMode::Buffered, &self.base_url)
+            .map_err(|e| match e {
                 Error::HttpClient { source, .. } => Error::http_client(
                     "Failed to build HTTP client with new timeout",
-                    source.map(|src| Box::new(src) as Box<dyn std::error::Error + Send + Sync>),
+                    source
+                        .map(|source| Box::new(source) as Box<dyn std::error::Error + Send + Sync>),
                 ),
                 other => other,
             })?;
@@ -559,12 +626,14 @@ impl Anthropic {
     /// Set the maximum number of retries for this client.
     ///
     /// This method allows you to specify how many times to retry failed requests.
+    #[must_use]
     pub fn with_max_retries(mut self, max_retries: usize) -> Self {
         self.max_retries = max_retries;
         self
     }
 
     /// Get the API key being used by this client.
+    #[must_use]
     pub fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -573,6 +642,7 @@ impl Anthropic {
     ///
     /// These are merged with any per-request betas and auto-detected betas
     /// (like `context-management-2025-06-27`). Duplicates are removed.
+    #[must_use]
     pub fn with_default_betas(
         mut self,
         betas: impl IntoIterator<Item = impl Into<String>>,
@@ -633,17 +703,17 @@ impl Anthropic {
         Ok(headers)
     }
 
-    /// Get cached headers for performance (no allocation needed).
+    /// A copy of the headers sent on every request.
+    #[must_use]
     pub fn default_headers(&self) -> HeaderMap {
-        (*self.cached_headers).clone()
+        self.cached_headers.clone()
     }
 
     /// Build a full endpoint URL from the base URL and endpoint path.
     ///
-    /// This method handles trailing slashes gracefully and always inserts `/v1/`
-    /// between the base URL and endpoint path. This allows the base URL to be
-    /// specified without requiring a specific format (with or without trailing slash,
-    /// with or without `/v1/` suffix).
+    /// The stored base URL has no trailing slash and no `/v1` suffix (see
+    /// [`normalized_base_url`]), so `/v1/` is always inserted between it and the
+    /// endpoint path.
     ///
     /// # Examples
     ///
@@ -651,15 +721,14 @@ impl Anthropic {
     /// - Base: `https://api.minimax.io/anthropic`, endpoint: `messages` → `https://api.minimax.io/anthropic/v1/messages`
     /// - Base: `https://example.com/`, endpoint: `models` → `https://example.com/v1/models`
     fn build_url(&self, endpoint: &str) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        format!("{}/v1/{}", base, endpoint)
+        format!("{}/v1/{}", self.base_url, endpoint)
     }
 
     /// Collect all beta strings from client defaults, per-request, and auto-detected sources.
     ///
     /// Returns a deduplicated, ordered list.
     fn collect_betas(&self, request_betas: Option<&[String]>, auto_betas: &[&str]) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         self.default_betas
             .iter()
             .map(String::as_str)
@@ -680,8 +749,8 @@ impl Anthropic {
         let mut headers = self.default_headers();
         let value = betas.join(", ");
         // Beta header values are ASCII, so from_str should not fail.
-        if let Ok(hv) = HeaderValue::from_str(&value) {
-            headers.insert("anthropic-beta", hv);
+        if let Ok(header_value) = HeaderValue::from_str(&value) {
+            headers.insert("anthropic-beta", header_value);
         }
         Some(headers)
     }
@@ -690,7 +759,7 @@ impl Anthropic {
     async fn retry_with_backoff<F, Fut, T>(&self, operation: F) -> Result<T>
     where
         F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
+        Fut: Future<Output = Result<T>>,
     {
         let mut last_error = None;
 
@@ -719,17 +788,18 @@ impl Anthropic {
                         break;
                     }
 
-                    let sleep_duration = ExponentialBackoff::next(attempt)
-                        .max(error.retry_after().unwrap_or_default());
+                    let sleep_duration =
+                        backoff::next(attempt).max(error.retry_after().unwrap_or_default());
 
                     tracing::warn!(
+                        target: "topcoat_si::client",
                         error = &error as &dyn std::error::Error,
                         attempt = attempt + 1,
                         sleep_seconds = sleep_duration.as_secs_f64(),
                         "Retrying API request"
                     );
                     observability::retry(sleep_duration);
-                    sleep(sleep_duration).await;
+                    tokio::time::sleep(sleep_duration).await;
                     last_error = Some(error);
                 }
             }
@@ -750,11 +820,11 @@ impl Anthropic {
                 return Error::from_http(
                     "Failed to read error response",
                     metadata,
-                    Some(Arc::new(error)),
+                    Some(Box::new(error)),
                 );
             }
         };
-        let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+        let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
         if let Some(value) = parsed.as_ref() {
             metadata.error_type = value["error"]["type"].as_str().map(String::from);
             metadata.request_id = metadata
@@ -798,6 +868,7 @@ impl Anthropic {
     /// `anthropic-fast-*` or `retry-after` header; responses without them leave the previous
     /// value in place.  Clones of this client share the same slot.  Returns `None` before the
     /// first such response.
+    #[must_use]
     pub fn last_rate_limits(&self) -> Option<RateLimits> {
         self.last_rate_limits.lock().ok()?.clone()
     }
@@ -806,7 +877,7 @@ impl Anthropic {
         map_reqwest_error(error, RequestPhase::Headers)
     }
 
-    async fn decode_response<T: serde::de::DeserializeOwned>(response: Response) -> Result<T> {
+    async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T> {
         let metadata = response_metadata(&response);
         let body = response.bytes().await.map_err(|error| {
             map_reqwest_error(error, RequestPhase::Body).with_http_metadata(metadata.clone())
@@ -816,13 +887,13 @@ impl Anthropic {
             Error::from_http(
                 format!("Failed to parse response ({} bytes): {error}", body.len()),
                 metadata,
-                Some(Arc::new(error)),
+                Some(Box::new(error)),
             )
         })
     }
 
     /// Execute a POST request with error handling
-    async fn execute_post_request<T: serde::de::DeserializeOwned>(
+    async fn execute_post_request<T: DeserializeOwned>(
         &self,
         url: &str,
         body: &impl serde::Serialize,
@@ -849,7 +920,7 @@ impl Anthropic {
     }
 
     /// Execute a POST request with a raw body and an explicit content type.
-    async fn execute_post_body_request<T: serde::de::DeserializeOwned>(
+    async fn execute_post_body_request<T: DeserializeOwned>(
         &self,
         url: &str,
         body: Bytes,
@@ -883,7 +954,7 @@ impl Anthropic {
     }
 
     /// Execute a GET request with error handling
-    async fn execute_get_request<T: serde::de::DeserializeOwned>(
+    async fn execute_get_request<T: DeserializeOwned>(
         &self,
         url: &str,
         query_params: Option<&[(String, String)]>,
@@ -912,7 +983,7 @@ impl Anthropic {
     }
 
     /// Execute an empty-body POST request with error handling.
-    async fn execute_post_empty_request<T: serde::de::DeserializeOwned>(
+    async fn execute_post_empty_request<T: DeserializeOwned>(
         &self,
         url: &str,
         headers: Option<HeaderMap>,
@@ -936,7 +1007,7 @@ impl Anthropic {
     }
 
     /// Execute a DELETE request with error handling.
-    async fn execute_delete_request<T: serde::de::DeserializeOwned>(
+    async fn execute_delete_request<T: DeserializeOwned>(
         &self,
         url: &str,
         headers: Option<HeaderMap>,
@@ -984,7 +1055,7 @@ impl Anthropic {
     }
 
     /// Send a message to the API and get a non-streaming response.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "send",
         otel.kind = "client", gen_ai.request.model = %params.model, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -992,7 +1063,7 @@ impl Anthropic {
         cache_read_input_tokens = field::Empty, cache_creation_input_tokens = field::Empty,
         cost_micro_cents = field::Empty
     ))]
-    pub async fn send(&self, mut params: MessageCreateParams) -> Result<Message> {
+    pub async fn send(&self, params: &MessageCreateParams) -> Result<Message> {
         let start = Instant::now();
 
         // Validate parameters first
@@ -1002,8 +1073,14 @@ impl Anthropic {
             return Err(err);
         }
 
-        // Ensure stream is disabled
-        params.stream = false;
+        // Send with stream disabled; copy the params only when the caller enabled it.
+        let params = if params.stream {
+            let mut buffered = params.clone();
+            buffered.stream = false;
+            Cow::Owned(buffered)
+        } else {
+            Cow::Borrowed(params)
+        };
 
         // Collect all betas: client defaults + per-request + auto-detected
         let mut auto_betas = create_params_betas(&params);
@@ -1038,7 +1115,7 @@ impl Anthropic {
     /// Send a message to the API and get a streaming response.
     ///
     /// Returns a stream of MessageStreamEvent objects that can be processed incrementally.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "stream",
         otel.kind = "client", gen_ai.request.model = %params.model, stream = true,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1128,9 +1205,10 @@ impl Anthropic {
         let (events, _receiver) = AccumulatingStream::new(process_message_stream_sse(stream));
         let model = params.model.clone();
         let mut usage: Option<Usage> = None;
-        let events = events.map(move |item| {
-            let item = item.map_err(|error| error.with_request_id(request_id.clone()));
-            if let Ok(event) = &item {
+        let events = events
+            .map(move |item| item.map_err(|error| error.with_request_id(request_id.clone())))
+            .inspect(move |item| {
+                let Ok(event) = item else { return };
                 match event {
                     MessageStreamEvent::MessageStart(start) => {
                         record_usage(&model, &start.message.usage);
@@ -1151,9 +1229,7 @@ impl Anthropic {
                     }
                     _ => {}
                 }
-            }
-            item
-        });
+            });
         Ok(trace_stream(events, Span::current()))
     }
 
@@ -1161,7 +1237,7 @@ impl Anthropic {
     ///
     /// This method counts the number of tokens that would be used by a message with the given parameters.
     /// It's useful for estimating costs or making sure your messages fit within the model's context window.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "count_tokens",
         otel.kind = "client", gen_ai.request.model = %params.model, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1172,6 +1248,12 @@ impl Anthropic {
         params: MessageCountTokensParams,
     ) -> Result<MessageTokensCount> {
         let start = Instant::now();
+
+        if let Err(err) = params.check_known_values() {
+            final_failure(&err);
+            observability::request_failed(start.elapsed());
+            return Err(err);
+        }
 
         // Collect betas: client defaults + per-request + auto-detected
         let auto_betas = count_params_betas(&params);
@@ -1191,7 +1273,7 @@ impl Anthropic {
     }
 
     /// Create a Message Batch for asynchronous processing.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "create_message_batch",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1244,7 +1326,7 @@ impl Anthropic {
     }
 
     /// Retrieve a Message Batch by ID.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "get_message_batch",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1267,13 +1349,8 @@ impl Anthropic {
         result
     }
 
-    /// Retrieve a Message Batch by ID.
-    pub async fn retrieve_message_batch(&self, message_batch_id: &str) -> Result<MessageBatch> {
-        self.get_message_batch(message_batch_id).await
-    }
-
     /// List Message Batches in the current Workspace.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "list_message_batches",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1316,7 +1393,7 @@ impl Anthropic {
     }
 
     /// Cancel a Message Batch that is currently processing.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "cancel_message_batch",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1340,7 +1417,7 @@ impl Anthropic {
     }
 
     /// Delete a Message Batch after processing has ended.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "delete_message_batch",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1367,7 +1444,7 @@ impl Anthropic {
     }
 
     /// Stream results for an ended Message Batch as JSONL records.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "stream_message_batch_results",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = true,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1407,7 +1484,7 @@ impl Anthropic {
     ///
     /// Returns a paginated list of all available models. Use the parameters to control
     /// pagination and filter results.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "list_models",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1415,6 +1492,12 @@ impl Anthropic {
     ))]
     pub async fn list_models(&self, params: Option<ModelListParams>) -> Result<ModelListResponse> {
         let start = Instant::now();
+
+        if let Some(Err(err)) = params.as_ref().map(ModelListParams::check_known_values) {
+            final_failure(&err);
+            observability::request_failed(start.elapsed());
+            return Err(err);
+        }
 
         // Collect betas: client defaults + per-request from ModelListParams
         let request_betas = params.as_ref().and_then(|p| p.betas.as_deref());
@@ -1440,7 +1523,7 @@ impl Anthropic {
     ///
     /// This is an Admin API endpoint: the client must be built with an Admin API key
     /// (`sk-ant-admin01-...`), which is sent in the same `x-api-key` header.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "usage_report",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1471,7 +1554,7 @@ impl Anthropic {
     ///
     /// This is an Admin API endpoint: the client must be built with an Admin API key
     /// (`sk-ant-admin01-...`), which is sent in the same `x-api-key` header.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "cost_report",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1499,7 +1582,7 @@ impl Anthropic {
     ///
     /// Returns detailed information about the specified model, including its
     /// ID, creation date, display name, and type.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "get_model",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1522,7 +1605,7 @@ impl Anthropic {
     ///
     /// The file is sent as `multipart/form-data`. `expires_in_seconds`, when given, must be
     /// between 3,600 (one hour) and 7,776,000 (90 days).
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "upload_file",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1532,7 +1615,7 @@ impl Anthropic {
         &self,
         filename: &str,
         mime_type: &str,
-        bytes: Vec<u8>,
+        bytes: &[u8],
         expires_in_seconds: Option<u64>,
     ) -> Result<FileInfo> {
         if let Some(seconds) = expires_in_seconds
@@ -1565,7 +1648,7 @@ impl Anthropic {
             &boundary,
             filename,
             mime_type,
-            &bytes,
+            bytes,
             expires_in_seconds,
         ));
         let result = self
@@ -1581,7 +1664,7 @@ impl Anthropic {
     }
 
     /// List files stored through the Files API.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "list_files",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1604,7 +1687,7 @@ impl Anthropic {
     }
 
     /// Fetch the metadata of a file.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "get_file",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1626,7 +1709,7 @@ impl Anthropic {
     /// Download the raw content of a file.
     ///
     /// Only files created by code execution or skills are downloadable.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "download_file",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1650,7 +1733,7 @@ impl Anthropic {
     }
 
     /// Delete a file.
-    #[tracing::instrument(name = "topcoat_si.request", skip_all, fields(
+    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
         operation = "delete_file",
         otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
         request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
@@ -1673,6 +1756,7 @@ impl Anthropic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Canned, record_targets, serve, uses_proxies};
     use crate::{
         KnownModel, MessageBatchCreateParams, MessageBatchCreateRequest, MessageBatchListParams,
         MessageBatchResultVariant, MessageParam, Model,
@@ -1682,13 +1766,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     fn request_headers_end(buffer: &[u8]) -> Option<usize> {
         buffer.windows(4).position(|window| window == b"\r\n\r\n")
     }
 
-    async fn read_http_request_bytes(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+    async fn read_http_request_bytes(socket: &mut TcpStream) -> Vec<u8> {
         let mut buffer = Vec::new();
         let mut chunk = [0_u8; 1024];
         loop {
@@ -1728,7 +1812,7 @@ mod tests {
         buffer
     }
 
-    async fn read_http_request(socket: &mut tokio::net::TcpStream) {
+    async fn read_http_request(socket: &mut TcpStream) {
         read_http_request_bytes(socket).await;
     }
 
@@ -1764,7 +1848,7 @@ mod tests {
         })
     }
 
-    async fn write_json_response(socket: &mut tokio::net::TcpStream, body: &str) {
+    async fn write_json_response(socket: &mut TcpStream, body: &str) {
         let response = format!(
             "HTTP/1.1 200 OK\r\n\
 Content-Type: application/json\r\n\
@@ -1779,8 +1863,8 @@ Connection: close\r\n\r\n{}",
 
     async fn start_test_server<F, Fut>(handler: F) -> String
     where
-        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1801,7 +1885,7 @@ Connection: close\r\n\r\n{}",
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 2,
-            cached_headers: Arc::new(HeaderMap::new()),
+            cached_headers: HeaderMap::new(),
             default_betas: Vec::new(),
             last_rate_limits: Arc::new(Mutex::new(None)),
         };
@@ -1815,7 +1899,10 @@ Connection: close\r\n\r\n{}",
                 async move {
                     let attempt = counter.fetch_add(1, Ordering::SeqCst);
                     match attempt {
-                        0 | 1 => Err(Error::rate_limit("Rate limited", Some(1))),
+                        0 | 1 => Err(Error::rate_limit(
+                            "Rate limited",
+                            Some(Duration::from_secs(1)),
+                        )),
                         _ => Ok("success".to_string()),
                     }
                 }
@@ -1836,7 +1923,7 @@ Connection: close\r\n\r\n{}",
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 2,
-            cached_headers: Arc::new(HeaderMap::new()),
+            cached_headers: HeaderMap::new(),
             default_betas: Vec::new(),
             last_rate_limits: Arc::new(Mutex::new(None)),
         };
@@ -1869,7 +1956,7 @@ Connection: close\r\n\r\n{}",
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 2,
-            cached_headers: Arc::new(HeaderMap::new()),
+            cached_headers: HeaderMap::new(),
             default_betas: Vec::new(),
             last_rate_limits: Arc::new(Mutex::new(None)),
         };
@@ -1882,7 +1969,10 @@ Connection: close\r\n\r\n{}",
                 let counter = counter_clone.clone();
                 async move {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::rate_limit("Always rate limited", Some(1)))
+                    Err(Error::rate_limit(
+                        "Always rate limited",
+                        Some(Duration::from_secs(1)),
+                    ))
                 }
             })
             .await;
@@ -1903,7 +1993,7 @@ Connection: close\r\n\r\n{}",
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 2,
-            cached_headers: Arc::new(HeaderMap::new()),
+            cached_headers: HeaderMap::new(),
             default_betas: Vec::new(),
             last_rate_limits: Arc::new(Mutex::new(None)),
         };
@@ -1922,7 +2012,7 @@ Connection: close\r\n\r\n{}",
                             Err(Error::api(
                                 529,
                                 Some("overloaded_error".to_string()),
-                                "Overloaded".to_string(),
+                                "Overloaded",
                                 None,
                             ))
                         }
@@ -1944,13 +2034,13 @@ Connection: close\r\n\r\n{}",
         let error = Error::api(
             529,
             Some("overloaded_error".to_string()),
-            "Overloaded".to_string(),
+            "Overloaded",
             None,
         );
         assert!(error.is_retryable());
 
         // Test that rate_limit error (which 529 now maps to) is also retryable
-        let rate_limit_error = Error::rate_limit("Overloaded", Some(5));
+        let rate_limit_error = Error::rate_limit("Overloaded", Some(Duration::from_secs(5)));
         assert!(rate_limit_error.is_retryable());
     }
 
@@ -2018,7 +2108,7 @@ Connection: close\r\n\r\n{}",
 
     #[test]
     fn client_builder_methods() {
-        let client = Anthropic::new(Some("test_key".to_string())).unwrap();
+        let client = Anthropic::try_new(Some("test_key".to_string())).unwrap();
 
         // Test builder pattern methods
         let configured_client = client
@@ -2032,7 +2122,7 @@ Connection: close\r\n\r\n{}",
 
     #[test]
     fn build_url_default_base() {
-        let client = Anthropic::new(Some("test_key".to_string())).unwrap();
+        let client = Anthropic::try_new(Some("test_key".to_string())).unwrap();
         // Default base URL: https://api.anthropic.com
         assert_eq!(
             client.build_url("messages"),
@@ -2050,7 +2140,7 @@ Connection: close\r\n\r\n{}",
 
     #[test]
     fn build_url_custom_base_without_trailing_slash() {
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url("https://api.minimax.io/anthropic".to_string())
             .unwrap();
@@ -2062,7 +2152,7 @@ Connection: close\r\n\r\n{}",
 
     #[test]
     fn build_url_custom_base_with_trailing_slash() {
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url("https://api.minimax.io/anthropic/".to_string())
             .unwrap();
@@ -2074,7 +2164,7 @@ Connection: close\r\n\r\n{}",
 
     #[test]
     fn default_headers_omit_authorization_for_default_base_url() {
-        let client = Anthropic::new(Some("test_key".to_string())).unwrap();
+        let client = Anthropic::try_new(Some("test_key".to_string())).unwrap();
         let headers = client.default_headers();
         assert!(headers.contains_key("x-api-key"));
         assert!(!headers.contains_key("authorization"));
@@ -2103,7 +2193,7 @@ Connection: close\r\n\r\n{}",
 
     #[test]
     fn with_base_url_to_baseten_rebuilds_headers_with_authorization() {
-        let client = Anthropic::new(Some("test_key".to_string())).unwrap();
+        let client = Anthropic::try_new(Some("test_key".to_string())).unwrap();
         assert!(!client.default_headers().contains_key("authorization"));
 
         let client = client
@@ -2119,7 +2209,7 @@ Connection: close\r\n\r\n{}",
 
     #[test]
     fn with_base_url_away_from_baseten_drops_authorization() {
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url("https://inference.baseten.co".to_string())
             .unwrap();
@@ -2132,8 +2222,27 @@ Connection: close\r\n\r\n{}",
     }
 
     #[test]
+    fn build_url_accepts_base_with_v1_suffix() {
+        for base_url in [
+            "https://gateway.example.com/anthropic/v1",
+            "https://gateway.example.com/anthropic/v1/",
+            "https://gateway.example.com/anthropic",
+        ] {
+            let client = Anthropic::try_new(Some("test_key".to_string()))
+                .unwrap()
+                .with_base_url(base_url.to_string())
+                .unwrap();
+            assert_eq!(
+                client.build_url("messages"),
+                "https://gateway.example.com/anthropic/v1/messages",
+                "{base_url}"
+            );
+        }
+    }
+
+    #[test]
     fn build_url_minimax_china() {
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url("https://api.minimaxi.com/anthropic".to_string())
             .unwrap();
@@ -2149,7 +2258,7 @@ Connection: close\r\n\r\n{}",
 
     #[test]
     fn client_timeout_configuration() {
-        let client = Anthropic::new(Some("test_key".to_string())).unwrap();
+        let client = Anthropic::try_new(Some("test_key".to_string())).unwrap();
         let timeout = Duration::from_secs(30);
 
         let configured_client = client.with_timeout(timeout).unwrap();
@@ -2157,10 +2266,9 @@ Connection: close\r\n\r\n{}",
     }
 
     #[test]
-    fn client_cached_headers_performance() {
-        let client = Anthropic::new(Some("test_key".to_string())).unwrap();
+    fn default_headers_carry_key_version_and_content_type() {
+        let client = Anthropic::try_new(Some("test_key".to_string())).unwrap();
 
-        // Test that headers are cached and cloning is cheap
         let headers1 = client.default_headers();
         let headers2 = client.default_headers();
 
@@ -2171,13 +2279,9 @@ Connection: close\r\n\r\n{}",
     }
 
     #[test]
-    fn request_error_mapping() {
-        let client = Anthropic::new(Some("test_key".to_string())).unwrap();
-
-        // Test different types of reqwest errors are mapped correctly
-        // Note: These are unit tests for the mapping logic, not integration tests
-        let _timeout = Duration::from_secs(30);
-        assert_eq!(client.timeout, DEFAULT_TIMEOUT); // Should use default initially
+    fn new_client_uses_default_timeout() {
+        let client = Anthropic::try_new(Some("test_key".to_string())).unwrap();
+        assert_eq!(client.timeout, DEFAULT_TIMEOUT);
     }
 
     #[tokio::test]
@@ -2192,7 +2296,7 @@ Connection: close\r\n\r\n{}",
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 1,
-            cached_headers: Arc::new(HeaderMap::new()),
+            cached_headers: HeaderMap::new(),
             default_betas: Vec::new(),
             last_rate_limits: Arc::new(Mutex::new(None)),
         };
@@ -2237,7 +2341,7 @@ Connection: close\r\n\r\n{}",
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             max_retries: 0,
-            cached_headers: Arc::new(HeaderMap::new()),
+            cached_headers: HeaderMap::new(),
             default_betas: Vec::new(),
             last_rate_limits: Arc::new(Mutex::new(None)),
         }
@@ -2296,7 +2400,7 @@ Connection: close\r\n\r\n{}",
     fn structured_outputs_never_adds_a_beta() {
         use crate::types::{OutputFormat, ToolParam, ToolUnionParam};
         let tool = ToolParam::new(
-            "get_weather".to_string(),
+            "get_weather",
             serde_json::json!({"type": "object", "properties": {}}),
         )
         .with_strict(true);
@@ -2312,10 +2416,7 @@ Connection: close\r\n\r\n{}",
     fn count_params_betas_mirror_create_params() {
         use crate::types::{ContextEdit, MessageParam};
         let params = MessageCountTokensParams::new(
-            vec![MessageParam::new_with_string(
-                "Hi".to_string(),
-                crate::types::MessageRole::User,
-            )],
+            vec![MessageParam::user("Hi")],
             Model::Known(KnownModel::ClaudeSonnet55),
         )
         .with_context_management(ContextManagement::new(vec![ContextEdit::compact()]))
@@ -2448,7 +2549,7 @@ Connection: close\r\n\r\n{}",
         })
         .await;
 
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap()
@@ -2502,7 +2603,7 @@ Connection: close\r\n\r\n{}",
         })
         .await;
 
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap();
@@ -2534,7 +2635,7 @@ Connection: close\r\n\r\n{}",
         })
         .await;
 
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap();
@@ -2569,13 +2670,13 @@ Connection: close\r\n\r\n{}",
         })
         .await;
 
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap();
         assert_eq!(client.last_rate_limits(), None);
         let params = MessageCreateParams::simple("hi", KnownModel::ClaudeHaiku55);
-        client.send(params).await.unwrap();
+        client.send(&params).await.unwrap();
 
         let limits = client.last_rate_limits().unwrap();
         let requests = limits.requests.unwrap();
@@ -2626,16 +2727,16 @@ Connection: close\r\n\r\n{}",
         })
         .await;
 
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(with_headers)
             .unwrap();
         let params = MessageCreateParams::simple("hi", KnownModel::ClaudeHaiku55);
-        client.send(params.clone()).await.unwrap();
+        client.send(&params).await.unwrap();
         let recorded = client.last_rate_limits().unwrap();
 
         let other = client.clone().with_base_url(without_headers).unwrap();
-        other.send(params.clone()).await.unwrap();
+        other.send(&params).await.unwrap();
         assert_eq!(client.last_rate_limits(), Some(recorded.clone()));
         assert_eq!(
             client.last_rate_limits().unwrap().request_id.as_deref(),
@@ -2643,7 +2744,7 @@ Connection: close\r\n\r\n{}",
         );
 
         let fast = client.clone().with_base_url(fast_only).unwrap();
-        fast.send(params).await.unwrap();
+        fast.send(&params).await.unwrap();
         let updated = client.last_rate_limits().unwrap();
         assert_ne!(updated, recorded);
         assert_eq!(updated.requests, None);
@@ -2683,7 +2784,7 @@ Connection: close\r\n\r\n{}",
         })
         .await;
 
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap();
@@ -2711,7 +2812,7 @@ Connection: close\r\n\r\n{}",
         })
         .await;
 
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap();
@@ -2758,7 +2859,7 @@ Connection: close\r\n\r\n",
         })
         .await;
 
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap();
@@ -2808,7 +2909,7 @@ Connection: close\r\n\r\n",
         })
         .await;
 
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap()
@@ -2846,7 +2947,7 @@ event: ping\n",
         })
         .await;
 
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap()
@@ -2890,7 +2991,7 @@ Connection: close\r\n\r\n",
         })
         .await;
 
-        let client = Anthropic::new(Some("test_key".to_string()))
+        let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap()
@@ -2903,7 +3004,7 @@ Connection: close\r\n\r\n",
             Model::Known(KnownModel::ClaudeHaiku55),
         );
 
-        let err = client.send(params).await.unwrap_err();
+        let err = client.send(&params).await.unwrap_err();
         assert!(matches!(err, Error::Timeout { .. }), "{err:?}");
     }
 
@@ -2912,7 +3013,7 @@ Connection: close\r\n\r\n",
     }
 
     fn files_client(base_url: String) -> Anthropic {
-        Anthropic::new(Some("test_key".to_string()))
+        Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap()
@@ -2967,7 +3068,7 @@ Connection: close\r\n\r\n",
         .await;
 
         let info = files_client(base_url)
-            .upload_file("notes.txt", "text/plain", b"hello".to_vec(), Some(7_200))
+            .upload_file("notes.txt", "text/plain", b"hello", Some(7_200))
             .await
             .unwrap();
         assert_eq!(info.id, "file_01");
@@ -2979,17 +3080,17 @@ Connection: close\r\n\r\n",
     async fn upload_file_rejects_bad_expiry_and_line_breaks() {
         let client = test_client();
         let too_short = client
-            .upload_file("a.txt", "text/plain", Vec::new(), Some(60))
+            .upload_file("a.txt", "text/plain", &[], Some(60))
             .await
             .unwrap_err();
         assert!(too_short.is_validation());
         let too_long = client
-            .upload_file("a.txt", "text/plain", Vec::new(), Some(7_776_001))
+            .upload_file("a.txt", "text/plain", &[], Some(7_776_001))
             .await
             .unwrap_err();
         assert!(too_long.is_validation());
         let bad_name = client
-            .upload_file("a\r\nb.txt", "text/plain", Vec::new(), None)
+            .upload_file("a\r\nb.txt", "text/plain", &[], None)
             .await
             .unwrap_err();
         assert!(bad_name.is_validation());
@@ -3073,5 +3174,232 @@ Connection: close\r\n\r\n",
             .await
             .unwrap();
         assert_eq!(bytes.as_ref(), &[0, 159, 146, 150, 255]);
+    }
+
+    fn send_params() -> MessageCreateParams {
+        MessageCreateParams::new(
+            16,
+            vec![MessageParam::user("hi")],
+            Model::Known(KnownModel::ClaudeHaiku55),
+        )
+    }
+
+    fn reply_json() -> String {
+        serde_json::json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-haiku-5-5",
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "end_turn", "stop_sequence": null,
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn send_with_stream_enabled_sends_a_buffered_request() {
+        let (base_url, recorded) = serve(vec![Canned::json(200, reply_json())]).await;
+        let client = Anthropic::try_new(Some("test_key".to_string()))
+            .unwrap()
+            .with_base_url(base_url)
+            .unwrap();
+
+        let message = client.send(&send_params().with_stream(true)).await.unwrap();
+
+        assert_eq!(message.id, "msg_1");
+        let requests = recorded.lock().unwrap();
+        let body: Value = serde_json::from_str(&requests[0].body).unwrap();
+        assert_eq!(body["stream"], Value::Bool(false));
+    }
+
+    #[test]
+    fn base_url_drops_only_a_final_v1_segment() {
+        for (input, expected) in [
+            ("https://example.com/v1", "https://example.com"),
+            ("https://example.com/v1/", "https://example.com"),
+            ("https://example.com//v1", "https://example.com"),
+            ("https://example.com/proxy/v1", "https://example.com/proxy"),
+            (
+                "https://example.com/proxy/v1//",
+                "https://example.com/proxy",
+            ),
+            ("https://example.com/v1beta", "https://example.com/v1beta"),
+            ("https://example.com/api/v10", "https://example.com/api/v10"),
+            ("https://example.com/v1/v1", "https://example.com/v1"),
+            ("https://v1", "https://v1"),
+            ("https://v1/", "https://v1"),
+            ("https://v1/v1", "https://v1"),
+            ("http://localhost:8080/v1", "http://localhost:8080"),
+            ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
+            ("http://[::1]:8080/proxy/", "http://[::1]:8080/proxy"),
+        ] {
+            let client = Anthropic::try_new(Some("test_key".to_string()))
+                .unwrap()
+                .with_base_url(input.to_string())
+                .unwrap();
+            assert_eq!(client.base_url, expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn base_url_needs_https_or_loopback_http() {
+        let client = || Anthropic::try_new(Some("test_key".to_string())).unwrap();
+        for url in [
+            "http://api.anthropic.com",
+            "http://10.0.0.1",
+            "http://v1",
+            "ftp://127.0.0.1",
+            "not a url",
+            "https://user:pass@api.anthropic.com",
+            "https://api.anthropic.com?x=1",
+            "https://api.anthropic.com/#v1",
+        ] {
+            let error = client().with_base_url(url.to_string()).unwrap_err();
+            assert!(
+                matches!(&error, Error::Validation { param, .. } if param.as_deref() == Some("base_url")),
+                "{url}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn try_new_checks_the_base_url_from_the_environment() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                Ok(pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string()))
+            }
+        };
+        let key = || Some("test_key".to_string());
+
+        let client = Anthropic::try_new_with(key(), env(&[])).unwrap();
+        assert_eq!(client.base_url, DEFAULT_API_URL);
+        let client = Anthropic::try_new_with(
+            key(),
+            env(&[("ANTHROPIC_BASE_URL", " https://gw.example/v1/ ")]),
+        )
+        .unwrap();
+        assert_eq!(client.base_url, "https://gw.example");
+        let client = Anthropic::try_new_with(
+            key(),
+            env(&[
+                ("TOPCOAT_SI_BASE_URL", "http://localhost:9000"),
+                ("ANTHROPIC_BASE_URL", "http://api.anthropic.com"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(client.base_url, "http://localhost:9000");
+
+        let error = Anthropic::try_new_with(
+            key(),
+            env(&[("ANTHROPIC_BASE_URL", "http://api.anthropic.com")]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, Error::Validation { param, .. } if param.as_deref() == Some("ANTHROPIC_BASE_URL")),
+            "{error}"
+        );
+        let error = Anthropic::try_new_with(key(), env(&[("TOPCOAT_SI_BASE_URL", "http://v1")]))
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Validation { param, .. } if param.as_deref() == Some("TOPCOAT_SI_BASE_URL")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn loopback_base_url_makes_both_clients_skip_proxies() {
+        let both_use_proxies = |client: &Anthropic| {
+            let (buffered, streaming) = (
+                uses_proxies(&client.client),
+                uses_proxies(&client.stream_client),
+            );
+            assert_eq!(buffered, streaming, "the two clients disagree on proxies");
+            buffered
+        };
+        let no_env = |_: &str| Ok(None);
+        let key = || Some("test_key".to_string());
+
+        let client = Anthropic::try_new_with(key(), no_env).unwrap();
+        assert!(both_use_proxies(&client));
+        let client = client
+            .with_base_url("http://127.0.0.1:1".to_string())
+            .unwrap();
+        assert!(!both_use_proxies(&client));
+        let client = client.with_timeout(Duration::from_secs(30)).unwrap();
+        assert!(!both_use_proxies(&client));
+        let client = client
+            .with_base_url("https://api.anthropic.com".to_string())
+            .unwrap();
+        assert!(both_use_proxies(&client));
+
+        for name in ["TOPCOAT_SI_BASE_URL", "ANTHROPIC_BASE_URL"] {
+            let get = |var: &str| Ok((var == name).then(|| "http://127.0.0.1:1".to_string()));
+            let client = Anthropic::try_new_with(key(), get).unwrap();
+            assert!(!both_use_proxies(&client), "{name}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn requests_trace_on_the_client_target() {
+        let (base_url, _recorded) = serve(vec![Canned::json(
+            400,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#,
+        )])
+        .await;
+        let client = Anthropic::try_new(Some("test_key".to_string()))
+            .unwrap()
+            .with_base_url(base_url)
+            .unwrap();
+        let (guard, targets) = record_targets();
+
+        let error = client.send(&send_params()).await.unwrap_err();
+        drop(guard);
+
+        assert_eq!(error.status_code(), Some(400));
+        let targets = targets.lock().unwrap();
+        assert!(
+            targets.contains(&"span topcoat_si.request topcoat_si::client".to_string()),
+            "{targets:?}"
+        );
+        assert!(
+            targets.contains(&"event topcoat_si::client".to_string()),
+            "{targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_tokens_and_list_models_reject_unknown_values_without_a_request() {
+        let (base_url, recorded) = serve(Vec::new()).await;
+        let client = Anthropic::try_new(Some("test_key".to_string()))
+            .unwrap()
+            .with_base_url(base_url)
+            .unwrap();
+        let validation_param = |error: Error| match error {
+            Error::Validation { param, .. } => param,
+            other => panic!("expected a validation error, got {other}"),
+        };
+
+        let mut count = MessageCountTokensParams::new(
+            vec![MessageParam::user("hi")],
+            Model::Known(KnownModel::ClaudeHaiku55),
+        );
+        count.messages[0].role = crate::MessageRole::Unknown;
+        let error = client.count_tokens(count.clone()).await.unwrap_err();
+        assert_eq!(validation_param(error).as_deref(), Some("messages[0].role"));
+        count.messages[0].role = crate::MessageRole::User;
+        let error = client
+            .count_tokens(count.with_speed(crate::InferenceSpeed::Unknown))
+            .await
+            .unwrap_err();
+        assert_eq!(validation_param(error).as_deref(), Some("speed"));
+
+        let list = ModelListParams::new()
+            .with_lifecycle(crate::ModelLifecycle::Active)
+            .with_lifecycle(crate::ModelLifecycle::Unknown);
+        let error = client.list_models(Some(list)).await.unwrap_err();
+        assert_eq!(validation_param(error).as_deref(), Some("lifecycle[1]"));
+
+        assert!(recorded.lock().unwrap().is_empty());
     }
 }

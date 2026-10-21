@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use schemars::JsonSchema;
 use schemars::generate::SchemaSettings;
 use serde::de::DeserializeOwned;
+use serde_json::error::Category;
 use serde_json::{Map, Value};
 
 use crate::{
@@ -32,7 +33,8 @@ const SUPPORTED_TYPES: &[&str] = &[
 ];
 
 /// A reply parsed into `T`, with the message it came from (for usage, stop reason and request id).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Parsed<T> {
     /// The reply's JSON, deserialized.
     pub value: T,
@@ -381,10 +383,10 @@ impl Message {
         // serde's message and the error itself can quote the reply, so neither is kept.
         serde_json::from_str(&text).map_err(|error| {
             let category = match error.classify() {
-                serde_json::error::Category::Io => "I/O error",
-                serde_json::error::Category::Syntax => "syntax error",
-                serde_json::error::Category::Data => "type or value mismatch",
-                serde_json::error::Category::Eof => "unexpected end of input",
+                Category::Io => "I/O error",
+                Category::Syntax => "syntax error",
+                Category::Data => "type or value mismatch",
+                Category::Eof => "unexpected end of input",
             };
             Error::serialization(
                 format!(
@@ -417,7 +419,7 @@ impl Anthropic {
     /// [`Anthropic::send`]; and any error from [`Message::parse_json`].
     pub async fn send_parsed<T: DeserializeOwned + JsonSchema>(
         &self,
-        mut params: MessageCreateParams,
+        params: &MessageCreateParams,
     ) -> Result<Parsed<T>> {
         if params
             .output_config
@@ -430,9 +432,10 @@ impl Anthropic {
             ));
         }
         let format = OutputFormat::json_schema_for::<T>()?;
+        let mut params = params.clone();
         let config = params.output_config.take().unwrap_or_default();
         params.output_config = Some(config.with_format(format));
-        let message = self.send(params).await?;
+        let message = self.send(&params).await?;
         let value = message.parse_json()?;
         Ok(Parsed { value, message })
     }
@@ -647,7 +650,7 @@ mod tests {
     }
 
     fn client(base_url: String) -> Anthropic {
-        Anthropic::new(Some("test_key".to_string()))
+        Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap()
@@ -672,7 +675,7 @@ mod tests {
         let (base_url, recorded) = serve(vec![Canned::json(200, reply.to_string())]).await;
         let params = params().with_output_config(OutputConfig::new().with_effort(Effort::Low));
 
-        let parsed = client(base_url).send_parsed::<Plan>(params).await.unwrap();
+        let parsed = client(base_url).send_parsed::<Plan>(&params).await.unwrap();
 
         assert_eq!(parsed.value.mood, Mood::Angry);
         assert_eq!(parsed.value.note.as_deref(), Some("late"));
@@ -694,7 +697,7 @@ mod tests {
         );
 
         let error = client(base_url)
-            .send_parsed::<Plan>(params)
+            .send_parsed::<Plan>(&params)
             .await
             .unwrap_err();
 

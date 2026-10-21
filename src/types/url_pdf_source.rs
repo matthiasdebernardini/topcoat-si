@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// This type is used to provide a PDF to the model from a URL.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct UrlPdfSource {
     /// The URL of the PDF.
     pub url: String,
@@ -11,11 +12,13 @@ pub struct UrlPdfSource {
 
 impl UrlPdfSource {
     /// Creates a new UrlPdfSource with the specified URL.
-    pub fn new<S: Into<String>>(url: S) -> Self {
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
         Self { url: url.into() }
     }
 
     /// Checks if the URL has a PDF file extension.
+    #[must_use]
     pub fn has_pdf_extension(&self) -> bool {
         self.url.to_lowercase().ends_with(".pdf")
     }

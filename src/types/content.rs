@@ -1,13 +1,14 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::types::open_union::{from_value, type_tag};
+use crate::types::open_union;
 use crate::types::{DocumentBlock, ImageBlock, SearchResultBlock, TextBlock, ToolReference};
 
 /// A content item inside a tool result: text, image, document, search result, tool
 /// reference, or an unrecognized item kept verbatim.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum Content {
     /// A text block content.
     #[serde(rename = "text")]
@@ -40,13 +41,16 @@ impl<'de> Deserialize<'de> for Content {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        match type_tag::<D::Error>(&value)?.as_str() {
-            "text" => from_value(value).map(Content::Text),
-            "image" => from_value(value).map(Content::Image),
-            "document" => from_value(value).map(Content::Document),
-            "search_result" => from_value(value).map(Content::SearchResult),
-            "tool_reference" => from_value(value).map(Content::ToolReference),
-            _ => Ok(Content::Unknown(value)),
+        match open_union::type_tag::<D::Error>(&value)?.as_str() {
+            "text" => open_union::from_value(value).map(Content::Text),
+            "image" => open_union::from_value(value).map(Content::Image),
+            "document" => open_union::from_value(value).map(Content::Document),
+            "search_result" => open_union::from_value(value).map(Content::SearchResult),
+            "tool_reference" => open_union::from_value(value).map(Content::ToolReference),
+            tag => {
+                open_union::warn_unknown("Content", tag);
+                Ok(Content::Unknown(value))
+            }
         }
     }
 }
@@ -70,7 +74,7 @@ mod tests {
 
     #[test]
     fn content_text_serialization() {
-        let text_block = TextBlock::new("Sample text content".to_string());
+        let text_block = TextBlock::new("Sample text content");
         let content = Content::Text(text_block);
 
         let json = to_value(&content).unwrap();
@@ -86,7 +90,7 @@ mod tests {
     #[test]
     fn content_image_serialization() {
         let base64_source = crate::types::Base64ImageSource::new(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==".to_string(),
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==",
             crate::types::ImageMediaType::Png,
         );
         let image_block = ImageBlock::new_with_base64(base64_source);
@@ -143,7 +147,7 @@ mod tests {
 
     #[test]
     fn from_text_block() {
-        let text_block = TextBlock::new("Test content".to_string());
+        let text_block = TextBlock::new("Test content");
         let content = Content::from(text_block.clone());
 
         match content {
@@ -156,10 +160,8 @@ mod tests {
 
     #[test]
     fn from_image_block() {
-        let base64_source = crate::types::Base64ImageSource::new(
-            "data".to_string(),
-            crate::types::ImageMediaType::Png,
-        );
+        let base64_source =
+            crate::types::Base64ImageSource::new("data", crate::types::ImageMediaType::Png);
         let image_block = ImageBlock::new_with_base64(base64_source);
         let content = Content::from(image_block);
 

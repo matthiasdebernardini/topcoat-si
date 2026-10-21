@@ -3,6 +3,7 @@ use time::OffsetDateTime;
 
 /// Metadata for a file stored through the Files API.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct FileInfo {
     /// Unique file identifier.
     pub id: String,
@@ -38,6 +39,7 @@ pub struct FileInfo {
 
 /// One page of files.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct FileList {
     /// The files on this page.
     pub data: Vec<FileInfo>,
@@ -53,6 +55,7 @@ pub struct FileList {
 
 /// Query parameters for listing files.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FileListParams {
     /// Number of files to return per page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,17 +68,20 @@ pub struct FileListParams {
 
 impl FileListParams {
     /// Creates empty parameters.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Sets the page size.
+    #[must_use]
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
         self
     }
 
     /// Sets the pagination cursor.
+    #[must_use]
     pub fn with_page(mut self, page: impl Into<String>) -> Self {
         self.page = Some(page.into());
         self
@@ -96,6 +102,7 @@ impl FileListParams {
 
 /// Confirmation returned when a file is deleted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeletedFile {
     /// ID of the deleted file.
     pub id: String,

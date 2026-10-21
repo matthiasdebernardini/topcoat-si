@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::str::FromStr;
 
 /// A plain text source parameter for content blocks.
 ///
 /// This represents plain text data that can be used as a source in content blocks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct PlainTextSource {
     /// The plain text data.
     pub data: String,
@@ -15,24 +18,20 @@ pub struct PlainTextSource {
 
 impl PlainTextSource {
     /// Create a new `PlainTextSource` with the given text data.
-    pub fn new(data: String) -> Self {
+    #[must_use]
+    pub fn new(data: impl Into<String>) -> Self {
         Self {
-            data,
+            data: data.into(),
             media_type: "text/plain".to_string(),
         }
     }
-
-    /// Create a new `PlainTextSource` from a string reference.
-    pub fn from_string_ref(data: &str) -> Self {
-        Self::new(data.to_string())
-    }
 }
 
-impl std::str::FromStr for PlainTextSource {
-    type Err = std::convert::Infallible;
+impl FromStr for PlainTextSource {
+    type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::from_string_ref(s))
+        Ok(Self::new(s))
     }
 }
 
@@ -43,7 +42,7 @@ mod tests {
 
     #[test]
     fn plain_text_source_serialization() {
-        let source = PlainTextSource::new("Sample text content".to_string());
+        let source = PlainTextSource::new("Sample text content");
         let json = to_value(&source).unwrap();
 
         assert_eq!(
@@ -56,8 +55,8 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_source_from_string_ref() {
-        let source = PlainTextSource::from_string_ref("Sample text content");
+    fn plain_text_source_from_literal() {
+        let source = PlainTextSource::new("Sample text content");
         assert_eq!(source.data, "Sample text content");
         assert_eq!(source.media_type, "text/plain");
     }

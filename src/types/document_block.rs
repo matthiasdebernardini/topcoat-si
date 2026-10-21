@@ -1,13 +1,16 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
+use crate::types::open_union;
 use crate::types::{
     Base64PdfSource, CacheControlEphemeral, CitationsConfig, ContentBlockSourceParam, FileSource,
     PlainTextSource, UrlPdfSource,
 };
 
 /// The source type for a document block, which can be one of several types.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum DocumentSource {
     /// A Base64 encoded PDF source.
     #[serde(rename = "base64")]
@@ -28,6 +31,27 @@ pub enum DocumentSource {
     /// A file uploaded through the Files API.
     #[serde(rename = "file")]
     File(FileSource),
+
+    /// A source of a type this crate does not know, kept verbatim.
+    #[serde(untagged)]
+    Unknown(Value),
+}
+
+impl<'de> Deserialize<'de> for DocumentSource {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        match open_union::type_tag::<D::Error>(&value)?.as_str() {
+            "base64" => open_union::from_value(value).map(Self::Base64Pdf),
+            "text" => open_union::from_value(value).map(Self::PlainText),
+            "content" => open_union::from_value(value).map(Self::ContentBlock),
+            "url" => open_union::from_value(value).map(Self::UrlPdf),
+            "file" => open_union::from_value(value).map(Self::File),
+            tag => {
+                open_union::warn_unknown("DocumentSource", tag);
+                Ok(Self::Unknown(value))
+            }
+        }
+    }
 }
 
 impl From<Base64PdfSource> for DocumentSource {
@@ -62,6 +86,7 @@ impl From<UrlPdfSource> for DocumentSource {
 
 /// Parameters for a document block.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct DocumentBlock {
     /// The source of the document.
     pub source: DocumentSource,
@@ -85,6 +110,7 @@ pub struct DocumentBlock {
 
 impl DocumentBlock {
     /// Create a new `DocumentBlock` with the given source.
+    #[must_use]
     pub fn new(source: DocumentSource) -> Self {
         Self {
             source,
@@ -96,51 +122,60 @@ impl DocumentBlock {
     }
 
     /// Create a new `DocumentBlock` with a Base64 PDF source.
+    #[must_use]
     pub fn new_with_base64_pdf(source: Base64PdfSource) -> Self {
         Self::new(DocumentSource::Base64Pdf(source))
     }
 
     /// Create a new `DocumentBlock` with a plain text source.
+    #[must_use]
     pub fn new_with_plain_text(source: PlainTextSource) -> Self {
         Self::new(DocumentSource::PlainText(source))
     }
 
     /// Create a new `DocumentBlock` with a content block source.
+    #[must_use]
     pub fn new_with_content_block(source: ContentBlockSourceParam) -> Self {
         Self::new(DocumentSource::ContentBlock(source))
     }
 
     /// Create a new `DocumentBlock` with a URL PDF source.
+    #[must_use]
     pub fn new_with_url_pdf(source: UrlPdfSource) -> Self {
         Self::new(DocumentSource::UrlPdf(source))
     }
 
     /// Create a new `DocumentBlock` referencing a file uploaded through the Files API.
+    #[must_use]
     pub fn from_file_id(file_id: impl Into<String>) -> Self {
         Self::new(DocumentSource::File(FileSource::new(file_id)))
     }
 
     /// Add a cache control to this document block.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self
     }
 
     /// Add citations configuration to this document block.
+    #[must_use]
     pub fn with_citations(mut self, citations: CitationsConfig) -> Self {
         self.citations = Some(citations);
         self
     }
 
     /// Add context to this document block.
-    pub fn with_context(mut self, context: String) -> Self {
-        self.context = Some(context);
+    #[must_use]
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        self.context = Some(context.into());
         self
     }
 
     /// Add a title to this document block.
-    pub fn with_title(mut self, title: String) -> Self {
-        self.title = Some(title);
+    #[must_use]
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
         self
     }
 }
@@ -153,7 +188,7 @@ mod tests {
     #[test]
     fn document_block_with_base64_pdf() {
         let base64_source =
-            Base64PdfSource::new("data:application/pdf;base64,JVBERi0xLjcKJeLjz9MKN".to_string());
+            Base64PdfSource::new("data:application/pdf;base64,JVBERi0xLjcKJeLjz9MKN");
 
         let document_block = DocumentBlock::new_with_base64_pdf(base64_source);
         let json = to_value(&document_block).unwrap();
@@ -172,7 +207,7 @@ mod tests {
 
     #[test]
     fn document_block_with_plain_text() {
-        let text_source = PlainTextSource::new("Sample text content".to_string());
+        let text_source = PlainTextSource::new("Sample text content");
 
         let document_block = DocumentBlock::new_with_plain_text(text_source);
         let json = to_value(&document_block).unwrap();
@@ -191,7 +226,7 @@ mod tests {
 
     #[test]
     fn document_block_with_content_block() {
-        let content_source = ContentBlockSourceParam::from_string_ref("Sample content");
+        let content_source = ContentBlockSourceParam::new_with_string("Sample content");
 
         let document_block = DocumentBlock::new_with_content_block(content_source);
         let json = to_value(&document_block).unwrap();
@@ -209,7 +244,7 @@ mod tests {
 
     #[test]
     fn document_block_with_url_pdf() {
-        let url_source = UrlPdfSource::new("https://example.com/document.pdf".to_string());
+        let url_source = UrlPdfSource::new("https://example.com/document.pdf");
 
         let document_block = DocumentBlock::new_with_url_pdf(url_source);
         let json = to_value(&document_block).unwrap();
@@ -227,15 +262,15 @@ mod tests {
 
     #[test]
     fn document_block_with_all_fields() {
-        let url_source = UrlPdfSource::new("https://example.com/document.pdf".to_string());
+        let url_source = UrlPdfSource::new("https://example.com/document.pdf");
         let cache_control = CacheControlEphemeral::new();
         let citations = CitationsConfig::enabled();
 
         let document_block = DocumentBlock::new_with_url_pdf(url_source)
             .with_cache_control(cache_control)
             .with_citations(citations)
-            .with_context("Document context".to_string())
-            .with_title("Document Title".to_string());
+            .with_context("Document context")
+            .with_title("Document Title");
 
         let json = to_value(&document_block).unwrap();
 

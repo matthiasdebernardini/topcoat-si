@@ -5,7 +5,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 /// Time-bucket width for a usage report.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum BucketWidth {
     /// One-minute buckets.
     #[serde(rename = "1m")]
@@ -29,8 +30,9 @@ impl fmt::Display for BucketWidth {
 }
 
 /// A dimension to group usage-report results by.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum UsageGroupBy {
     /// Group by account.
     AccountId,
@@ -53,7 +55,7 @@ pub enum UsageGroupBy {
 }
 
 impl UsageGroupBy {
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             UsageGroupBy::AccountId => "account_id",
             UsageGroupBy::ApiKeyId => "api_key_id",
@@ -70,6 +72,7 @@ impl UsageGroupBy {
 
 /// Parameters for the Admin API usage report (`GET /v1/organizations/usage_report/messages`).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct UsageReportParams {
     /// Start of the reporting window (inclusive).
     pub starting_at: OffsetDateTime,
@@ -105,6 +108,7 @@ pub struct UsageReportParams {
 
 impl UsageReportParams {
     /// Create parameters reporting from `starting_at`.
+    #[must_use]
     pub fn new(starting_at: OffsetDateTime) -> Self {
         Self {
             starting_at,
@@ -126,66 +130,77 @@ impl UsageReportParams {
     }
 
     /// Set the end of the reporting window.
+    #[must_use]
     pub fn with_ending_at(mut self, ending_at: OffsetDateTime) -> Self {
         self.ending_at = Some(ending_at);
         self
     }
 
     /// Set the bucket width.
+    #[must_use]
     pub fn with_bucket_width(mut self, bucket_width: BucketWidth) -> Self {
         self.bucket_width = Some(bucket_width);
         self
     }
 
     /// Add a grouping dimension.
+    #[must_use]
     pub fn group_by(mut self, group_by: UsageGroupBy) -> Self {
         self.group_by.push(group_by);
         self
     }
 
     /// Filter by one model.
+    #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.models.push(model.into());
         self
     }
 
     /// Filter by several models.
+    #[must_use]
     pub fn with_models(mut self, models: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.models.extend(models.into_iter().map(Into::into));
         self
     }
 
     /// Filter by one API key.
+    #[must_use]
     pub fn with_api_key_id(mut self, id: impl Into<String>) -> Self {
         self.api_key_ids.push(id.into());
         self
     }
 
     /// Filter by several API keys.
+    #[must_use]
     pub fn with_api_key_ids(mut self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.api_key_ids.extend(ids.into_iter().map(Into::into));
         self
     }
 
     /// Filter by one workspace.
+    #[must_use]
     pub fn with_workspace_id(mut self, id: impl Into<String>) -> Self {
         self.workspace_ids.push(id.into());
         self
     }
 
     /// Filter by several workspaces.
+    #[must_use]
     pub fn with_workspace_ids(mut self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.workspace_ids.extend(ids.into_iter().map(Into::into));
         self
     }
 
     /// Filter by one service account.
+    #[must_use]
     pub fn with_service_account_id(mut self, id: impl Into<String>) -> Self {
         self.service_account_ids.push(id.into());
         self
     }
 
     /// Filter by several service accounts.
+    #[must_use]
     pub fn with_service_account_ids(
         mut self,
         ids: impl IntoIterator<Item = impl Into<String>>,
@@ -196,54 +211,63 @@ impl UsageReportParams {
     }
 
     /// Filter by one account.
+    #[must_use]
     pub fn with_account_id(mut self, id: impl Into<String>) -> Self {
         self.account_ids.push(id.into());
         self
     }
 
     /// Filter by several accounts.
+    #[must_use]
     pub fn with_account_ids(mut self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.account_ids.extend(ids.into_iter().map(Into::into));
         self
     }
 
     /// Filter by one service tier.
+    #[must_use]
     pub fn with_service_tier(mut self, tier: impl Into<String>) -> Self {
         self.service_tiers.push(tier.into());
         self
     }
 
     /// Filter by one context window.
+    #[must_use]
     pub fn with_context_window(mut self, window: impl Into<String>) -> Self {
         self.context_window.push(window.into());
         self
     }
 
     /// Filter by one inference geography.
+    #[must_use]
     pub fn with_inference_geo(mut self, geo: impl Into<String>) -> Self {
         self.inference_geos.push(geo.into());
         self
     }
 
     /// Filter by one speed.
+    #[must_use]
     pub fn with_speed(mut self, speed: impl Into<String>) -> Self {
         self.speeds.push(speed.into());
         self
     }
 
     /// Set the maximum number of buckets to return.
+    #[must_use]
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
         self
     }
 
     /// Set the pagination cursor.
+    #[must_use]
     pub fn with_page(mut self, page: impl Into<String>) -> Self {
         self.page = Some(page.into());
         self
     }
 
     /// Build the URL-encoded query string, repeating array keys with a `[]` suffix.
+    #[must_use]
     pub fn to_query(&self) -> String {
         let mut query = url::form_urlencoded::Serializer::new(String::new());
         query.append_pair("starting_at", &rfc3339(self.starting_at));
@@ -291,6 +315,7 @@ pub(crate) fn rfc3339(time: OffsetDateTime) -> String {
 
 /// Cache-creation tokens by cache lifetime in a usage report.
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct UsageReportCacheCreation {
     /// Tokens written to the 1-hour cache.
     #[serde(default)]
@@ -302,6 +327,7 @@ pub struct UsageReportCacheCreation {
 
 /// One result row inside a usage bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct UsageBucketResult {
     /// Input tokens that were not served from or written to the cache.
     pub uncached_input_tokens: i64,
@@ -343,6 +369,7 @@ pub struct UsageBucketResult {
 
 impl UsageBucketResult {
     /// Total input tokens: uncached plus cache reads plus 5-minute and 1-hour cache writes.
+    #[must_use]
     pub fn total_input_tokens(&self) -> i64 {
         self.uncached_input_tokens
             + self.cache_read_input_tokens
@@ -353,6 +380,7 @@ impl UsageBucketResult {
 
 /// One time bucket of a usage report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct UsageBucket {
     /// Start of the bucket (inclusive).
     #[serde(with = "time::serde::rfc3339")]
@@ -366,6 +394,7 @@ pub struct UsageBucket {
 
 /// A page of the Admin API usage report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct UsageReport {
     /// The buckets on this page.
     pub data: Vec<UsageBucket>,

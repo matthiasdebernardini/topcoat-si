@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// pass the previous response `id` on later turns so the API can compare the two
 /// requests and report where they diverged. Generally available; no beta header.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DiagnosticsRequest {
     /// The `id` of the previous response, or `None` on the first turn.
     ///
@@ -16,6 +17,7 @@ pub struct DiagnosticsRequest {
 
 impl DiagnosticsRequest {
     /// Opt in on the first turn of a conversation.
+    #[must_use]
     pub fn first_turn() -> Self {
         Self {
             previous_message_id: None,
@@ -23,6 +25,7 @@ impl DiagnosticsRequest {
     }
 
     /// Opt in on a later turn, comparing against the previous response.
+    #[must_use]
     pub fn after(previous_message_id: impl Into<String>) -> Self {
         Self {
             previous_message_id: Some(previous_message_id.into()),
@@ -39,6 +42,7 @@ impl DiagnosticsRequest {
 ///   from the previous one (`unavailable` also covers differences in
 ///   `tool_choice`, `thinking`, `output_config` or beta headers).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CacheDiagnostics {
     /// Why the cache missed, or `None` while the comparison is still running.
     #[serde(default)]
@@ -47,6 +51,7 @@ pub struct CacheDiagnostics {
 
 /// The earliest divergence between this request and the previous one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CacheMissReason {
     /// One of the `*_CHANGED`, `PREVIOUS_MESSAGE_NOT_FOUND` or `UNAVAILABLE` types.
     pub r#type: String,
@@ -71,6 +76,7 @@ impl CacheMissReason {
     pub const UNAVAILABLE: &'static str = "unavailable";
 
     /// Whether the miss is attributable to one of the four `*_changed` divergences.
+    #[must_use]
     pub fn is_changed(&self) -> bool {
         matches!(
             self.r#type.as_str(),

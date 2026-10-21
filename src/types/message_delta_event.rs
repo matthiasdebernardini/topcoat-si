@@ -5,7 +5,8 @@ use crate::types::{
 };
 
 /// The delta information for a message delta event.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageDelta {
     /// The reason the model stopped generating text, if it has stopped.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -27,6 +28,7 @@ pub struct MessageDelta {
 
 impl MessageDelta {
     /// Create a new empty `MessageDelta`.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             stop_reason: None,
@@ -37,26 +39,23 @@ impl MessageDelta {
     }
 
     /// Set the stop reason.
+    #[must_use]
     pub fn with_stop_reason(mut self, stop_reason: StopReason) -> Self {
         self.stop_reason = Some(stop_reason);
         self
     }
 
     /// Set the stop sequence.
-    pub fn with_stop_sequence(mut self, stop_sequence: String) -> Self {
-        self.stop_sequence = Some(stop_sequence);
+    #[must_use]
+    pub fn with_stop_sequence(mut self, stop_sequence: impl Into<String>) -> Self {
+        self.stop_sequence = Some(stop_sequence.into());
         self
-    }
-}
-
-impl Default for MessageDelta {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
 /// An event that represents a delta update to a message in a streaming response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageDeltaEvent {
     /// The delta information for the message.
     pub delta: MessageDelta,
@@ -71,6 +70,7 @@ pub struct MessageDeltaEvent {
 
 impl MessageDeltaEvent {
     /// Create a new `MessageDeltaEvent` with the given delta and usage.
+    #[must_use]
     pub fn new(delta: MessageDelta, usage: MessageDeltaUsage) -> Self {
         Self {
             delta,
@@ -97,7 +97,7 @@ mod tests {
     fn message_delta_with_values() {
         let delta = MessageDelta::new()
             .with_stop_reason(StopReason::EndTurn)
-            .with_stop_sequence("###".to_string());
+            .with_stop_sequence("###");
 
         let json = to_value(&delta).unwrap();
 

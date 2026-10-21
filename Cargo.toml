@@ -5,7 +5,7 @@ authors = ["Matthias Debernardini <matthias@nashvilleautomation.io>"]
 edition = "2024"
 description = "Superintelligence for Topcoat apps: Claude, Jev and Firecrawl"
 license = "Apache-2.0"
-repository = "https://github.com/matthiasdebernardini/claudius"
+repository = "https://github.com/matthiasdebernardini/topcoat-si"
 
 [features]
 default = ["native-tls"]
@@ -32,19 +32,3 @@ monty-types = { version = "1.2", optional = true }
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["test-util", "macros", "rt-multi-thread", "net", "io-util"] }
 tokio-test = "0.4.5"
-
-[[example]]
-name = "retry_example"
-path = "examples/retry_example.rs"
-
-[[example]]
-name = "usage_monitoring"
-path = "examples/usage_monitoring.rs"
-
-[[example]]
-name = "server_tools"
-path = "examples/server_tools.rs"
-
-[[example]]
-name = "files"
-path = "examples/files.rs"

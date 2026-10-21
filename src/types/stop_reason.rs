@@ -1,10 +1,13 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+use crate::types::open_union;
+
 /// Reasons why the model stopped generating a response.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum StopReason {
     /// The model reached the end of a generated turn
     EndTurn,
@@ -34,8 +37,28 @@ pub enum StopReason {
     Compaction,
 
     /// A value introduced by a newer API version.
-    #[serde(other)]
     Unknown,
+}
+
+impl<'de> Deserialize<'de> for StopReason {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "StopReason",
+            |value| match value {
+                "end_turn" => Some(Self::EndTurn),
+                "max_tokens" => Some(Self::MaxTokens),
+                "stop_sequence" => Some(Self::StopSequence),
+                "tool_use" => Some(Self::ToolUse),
+                "pause_turn" => Some(Self::PauseTurn),
+                "refusal" => Some(Self::Refusal),
+                "model_context_window_exceeded" => Some(Self::ModelContextWindowExceeded),
+                "compaction" => Some(Self::Compaction),
+                _ => None,
+            },
+            Self::Unknown,
+        )
+    }
 }
 
 impl fmt::Display for StopReason {
@@ -58,7 +81,8 @@ impl fmt::Display for StopReason {
 ///
 /// This error contains the invalid string value that could not be parsed
 /// into a valid `StopReason` variant.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StopReasonParseError {
     /// The invalid string value that could not be parsed.
     pub invalid_value: String,

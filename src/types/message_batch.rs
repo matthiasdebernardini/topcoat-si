@@ -2,9 +2,11 @@ use std::collections::HashSet;
 
 use serde::de::Error as DeError;
 use serde::ser::{SerializeStruct, Serializer};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use time::OffsetDateTime;
 
+use crate::types::open_union;
 use crate::types::{Message, MessageCreateParams};
 
 const MAX_MESSAGE_BATCH_REQUESTS: usize = 100_000;
@@ -12,6 +14,7 @@ const MAX_MESSAGE_BATCH_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Parameters for creating a Message Batch.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageBatchCreateParams {
     /// Individual Messages API requests to process asynchronously.
     pub requests: Vec<MessageBatchCreateRequest>,
@@ -26,6 +29,7 @@ pub struct MessageBatchCreateParams {
 
 impl MessageBatchCreateParams {
     /// Create batch creation parameters from individual batch requests.
+    #[must_use]
     pub fn new(requests: Vec<MessageBatchCreateRequest>) -> Self {
         Self {
             requests,
@@ -34,12 +38,14 @@ impl MessageBatchCreateParams {
     }
 
     /// Set beta feature headers for this batch creation request.
+    #[must_use]
     pub fn with_betas(mut self, betas: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.betas = Some(betas.into_iter().map(Into::into).collect());
         self
     }
 
     /// Add a single beta feature header for this batch creation request.
+    #[must_use]
     pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
         self.betas.get_or_insert_with(Vec::new).push(beta.into());
         self
@@ -138,6 +144,7 @@ impl Serialize for MessageBatchCreateParams {
 
 /// A single Messages API request within a Message Batch.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageBatchCreateRequest {
     /// Caller-provided identifier used to match results back to requests.
     pub custom_id: String,
@@ -148,6 +155,7 @@ pub struct MessageBatchCreateRequest {
 
 impl MessageBatchCreateRequest {
     /// Create a batch request from a custom ID and message creation parameters.
+    #[must_use]
     pub fn new(custom_id: impl Into<String>, params: MessageCreateParams) -> Self {
         Self {
             custom_id: custom_id.into(),
@@ -168,7 +176,7 @@ impl Serialize for MessageBatchCreateRequest {
     }
 }
 
-struct MessageBatchRequestParams<'a>(&'a MessageCreateParams);
+struct MessageBatchRequestParams<'params>(&'params MessageCreateParams);
 
 impl Serialize for MessageBatchRequestParams<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -260,6 +268,7 @@ impl Serialize for MessageBatchRequestParams<'_> {
 
 /// A Message Batch returned by the API.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageBatch {
     /// Unique object identifier.
     pub id: String,
@@ -312,8 +321,9 @@ pub struct MessageBatch {
 }
 
 /// Processing status for a Message Batch.
-#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageBatchProcessingStatus {
     /// The batch is actively processing.
     InProgress,
@@ -323,10 +333,32 @@ pub enum MessageBatchProcessingStatus {
 
     /// The batch has ended and no more requests will be processed.
     Ended,
+
+    /// A status this crate does not know.
+    ///
+    /// Never send it; it only models values this crate does not know.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for MessageBatchProcessingStatus {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "MessageBatchProcessingStatus",
+            |value| match value {
+                "in_progress" => Some(Self::InProgress),
+                "canceling" => Some(Self::Canceling),
+                "ended" => Some(Self::Ended),
+                _ => None,
+            },
+            Self::Unknown,
+        )
+    }
 }
 
 /// Counts of individual batch requests by processing state.
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageBatchRequestCounts {
     /// Requests still being processed.
     pub processing: u32,
@@ -346,6 +378,7 @@ pub struct MessageBatchRequestCounts {
 
 /// Parameters for listing Message Batches.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageBatchListParams {
     /// ID of the object to use as a cursor for results after this object.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -366,35 +399,41 @@ pub struct MessageBatchListParams {
 
 impl MessageBatchListParams {
     /// Create empty list parameters.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the `after_id` cursor.
+    #[must_use]
     pub fn with_after_id(mut self, after_id: impl Into<String>) -> Self {
         self.after_id = Some(after_id.into());
         self
     }
 
     /// Set the `before_id` cursor.
+    #[must_use]
     pub fn with_before_id(mut self, before_id: impl Into<String>) -> Self {
         self.before_id = Some(before_id.into());
         self
     }
 
     /// Set the number of items to return.
+    #[must_use]
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
         self
     }
 
     /// Set beta feature headers for this list request.
+    #[must_use]
     pub fn with_betas(mut self, betas: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.betas = Some(betas.into_iter().map(Into::into).collect());
         self
     }
 
     /// Add a single beta feature header for this list request.
+    #[must_use]
     pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
         self.betas.get_or_insert_with(Vec::new).push(beta.into());
         self
@@ -403,6 +442,7 @@ impl MessageBatchListParams {
 
 /// A page of Message Batch objects.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageBatchListResponse {
     /// Message Batch objects returned by the API.
     pub data: Vec<MessageBatch>,
@@ -421,6 +461,7 @@ pub struct MessageBatchListResponse {
 
 /// A single result line from a Message Batch results JSONL stream.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageBatchResult {
     /// Caller-provided ID from the corresponding batch request.
     pub custom_id: String,
@@ -430,10 +471,11 @@ pub struct MessageBatchResult {
 }
 
 /// Result for a single request within a Message Batch.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
 // `Message` carries the response fields the API added; results are consumed one at a time.
 #[allow(clippy::large_enum_variant)]
+#[non_exhaustive]
 pub enum MessageBatchResultVariant {
     /// The request completed successfully and produced a message.
     #[serde(rename = "succeeded")]
@@ -456,10 +498,47 @@ pub enum MessageBatchResultVariant {
     /// The request expired before being sent to the model.
     #[serde(rename = "expired")]
     Expired,
+
+    /// A result of a type this crate does not know, kept verbatim.
+    #[serde(untagged)]
+    Unknown(Value),
+}
+
+impl<'de> Deserialize<'de> for MessageBatchResultVariant {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Succeeded {
+            message: Message,
+        }
+
+        #[derive(Deserialize)]
+        struct Errored {
+            error: MessageBatchErrorResponse,
+        }
+
+        let value = Value::deserialize(deserializer)?;
+        match open_union::type_tag::<D::Error>(&value)?.as_str() {
+            "succeeded" => {
+                open_union::from_value(value).map(|succeeded: Succeeded| Self::Succeeded {
+                    message: succeeded.message,
+                })
+            }
+            "errored" => open_union::from_value(value).map(|errored: Errored| Self::Errored {
+                error: errored.error,
+            }),
+            "canceled" => Ok(Self::Canceled),
+            "expired" => Ok(Self::Expired),
+            tag => {
+                open_union::warn_unknown("MessageBatchResultVariant", tag);
+                Ok(Self::Unknown(value))
+            }
+        }
+    }
 }
 
 /// Standard Anthropic error response embedded in a batch result.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageBatchErrorResponse {
     /// Object type, normally `"error"`.
     #[serde(rename = "type")]
@@ -510,6 +589,7 @@ impl<'de> Deserialize<'de> for MessageBatchErrorResponse {
 
 /// Error details for a failed request within a Message Batch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageBatchError {
     /// Anthropic error type.
     #[serde(rename = "type")]
@@ -525,6 +605,7 @@ pub struct MessageBatchError {
 
 /// Response returned after deleting a Message Batch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeletedMessageBatch {
     /// Deleted batch ID.
     pub id: String,
@@ -645,6 +726,19 @@ mod tests {
         let err = params.validate().unwrap_err();
         assert!(err.is_validation());
         assert!(err.to_string().contains("speed"));
+    }
+
+    #[test]
+    fn batch_create_params_reject_unknown_role() {
+        let mut request = valid_batch_request("unknown-role");
+        request.params.messages[0].role = crate::types::MessageRole::Unknown;
+        let params = MessageBatchCreateParams::new(vec![request]);
+        let err = params.validate().unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Validation { param, .. }
+                if param.as_deref() == Some("requests[0].params.messages[0].role")),
+            "{err}"
+        );
     }
 
     #[test]
@@ -847,7 +941,7 @@ mod tests {
     #[test]
     fn message_batch_result_round_trip_succeeded() {
         let message = Message::new(
-            "msg_123".to_string(),
+            "msg_123",
             vec![TextBlock::new("Hello").into()],
             Model::Known(KnownModel::ClaudeOpus55),
             Usage::new(1, 1),

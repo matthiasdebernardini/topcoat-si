@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Information about server tool usage for a message.
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct ServerToolUsage {
     /// The number of web fetch tool requests (omitted when serializing if zero).
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -16,6 +17,7 @@ fn is_zero(value: &i32) -> bool {
 
 impl ServerToolUsage {
     /// Create a new `ServerToolUsage` with the given web fetch requests count.
+    #[must_use]
     pub fn new(web_fetch_requests: i32) -> Self {
         Self { web_fetch_requests }
     }

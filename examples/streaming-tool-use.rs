@@ -1,7 +1,6 @@
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io;
 
-use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use topcoat_si::{
@@ -9,6 +8,9 @@ use topcoat_si::{
     MessageCreateParams, MessageParam, MessageRole, MessageStreamEvent, Model, Result, StopReason,
     ToolChoice, ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock,
 };
+
+// Each turn is a billed model call; stop a run that keeps calling tools.
+const MAX_TURNS: usize = 8;
 
 #[derive(Debug, Deserialize)]
 struct MathAddInput {
@@ -23,33 +25,37 @@ struct ShoutInput {
 
 fn run_tool(tool_use: &ToolUseBlock) -> ToolResultBlock {
     match tool_use.name.as_str() {
-        "math_add" => match serde_json::from_value::<MathAddInput>(tool_use.input.clone()) {
+        "math_add" => match MathAddInput::deserialize(&tool_use.input) {
             Ok(input) => ToolResultBlock::new(tool_use.id.clone())
                 .with_string_content((input.a + input.b).to_string()),
-            Err(err) => ToolResultBlock::new(tool_use.id.clone())
-                .with_string_content(format!("invalid input: {err}"))
-                .with_error(true),
+            Err(err) => {
+                ToolResultBlock::error(tool_use.id.clone(), format!("invalid input: {err}"))
+            }
         },
-        "shout" => match serde_json::from_value::<ShoutInput>(tool_use.input.clone()) {
+        "shout" => match ShoutInput::deserialize(&tool_use.input) {
             Ok(input) => ToolResultBlock::new(tool_use.id.clone())
                 .with_string_content(input.text.to_uppercase()),
-            Err(err) => ToolResultBlock::new(tool_use.id.clone())
-                .with_string_content(format!("invalid input: {err}"))
-                .with_error(true),
+            Err(err) => {
+                ToolResultBlock::error(tool_use.id.clone(), format!("invalid input: {err}"))
+            }
         },
-        _ => ToolResultBlock::new(tool_use.id.clone())
-            .with_string_content(format!("unknown tool: {}", tool_use.name))
-            .with_error(true),
+        _ => ToolResultBlock::error(
+            tool_use.id.clone(),
+            format!("unknown tool: {}", tool_use.name),
+        ),
     }
 }
 
 async fn stream_message(client: &Anthropic, params: &MessageCreateParams) -> Result<Message> {
+    use futures::StreamExt;
+    use std::io::Write;
+
     let stream = client.stream(params).await?;
-    let (mut acc_stream, rx) = AccumulatingStream::new(stream);
+    let (mut events, done) = AccumulatingStream::new(stream);
     let mut active_tool_uses = HashSet::new();
     let mut stdout = io::stdout();
 
-    while let Some(event) = acc_stream.next().await {
+    while let Some(event) = events.next().await {
         match event? {
             MessageStreamEvent::ContentBlockStart(start) => match start.content_block {
                 ContentBlock::Text(text) if !text.text.is_empty() => {
@@ -84,7 +90,7 @@ async fn stream_message(client: &Anthropic, params: &MessageCreateParams) -> Res
         }
     }
 
-    match rx.await {
+    match done.await {
         Ok(result) => result,
         Err(_) => Err(Error::streaming(
             "failed to receive accumulated streaming message",
@@ -95,7 +101,7 @@ async fn stream_message(client: &Anthropic, params: &MessageCreateParams) -> Res
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = Anthropic::new(None)?;
+    let client = Anthropic::try_new(None)?;
     let prompt = "Use the math_add tool to add 24 and 18. Then respond with the sum.";
 
     let tools = vec![
@@ -129,10 +135,8 @@ async fn main() -> Result<()> {
     ];
 
     let mut messages = vec![MessageParam::user(prompt)];
-    let mut turn = 0;
 
-    loop {
-        turn += 1;
+    for turn in 1..=MAX_TURNS {
         println!("\n--- Turn {turn} ---");
         let mut params = MessageCreateParams::new_streaming(
             1024,
@@ -146,36 +150,35 @@ async fn main() -> Result<()> {
         }
 
         let response = stream_message(&client, &params).await?;
-        messages.push(MessageParam::from(response.clone()));
 
         if response.stop_reason != Some(StopReason::ToolUse) {
-            break;
+            // Push the final reply so `messages` holds the whole conversation, e.g. for a
+            // follow-up turn.
+            messages.push(MessageParam::from(response));
+            return Ok(());
         }
 
-        let tool_uses: Vec<ToolUseBlock> = response
+        let tool_results: Vec<ContentBlock> = response
             .content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::ToolUse(tool_use) => Some(tool_use.clone()),
+                ContentBlock::ToolUse(tool_use) => {
+                    Some(ContentBlock::ToolResult(run_tool(tool_use)))
+                }
                 _ => None,
             })
             .collect();
 
-        if tool_uses.is_empty() {
-            break;
+        messages.push(MessageParam::from(response));
+        if tool_results.is_empty() {
+            return Ok(());
         }
-
-        let tool_results = tool_uses
-            .iter()
-            .map(run_tool)
-            .map(ContentBlock::ToolResult)
-            .collect();
-
         messages.push(MessageParam::new_with_blocks(
             tool_results,
             MessageRole::User,
         ));
     }
 
+    println!("\nStopped after {MAX_TURNS} turns: Claude was still calling tools.");
     Ok(())
 }

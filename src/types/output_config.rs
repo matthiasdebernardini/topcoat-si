@@ -8,6 +8,7 @@ use crate::types::OutputFormat;
 /// Serializes as `{"type":"tokens","total":N,"remaining":M}`. Requires the
 /// `task-budgets-2026-03-13` beta, which is added automatically.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TaskBudget {
     /// Total tokens for the task; at least 20,000 (checked by request validation).
     pub total: u64,
@@ -18,6 +19,7 @@ pub struct TaskBudget {
 
 impl TaskBudget {
     /// Create a task budget with the given total.
+    #[must_use]
     pub fn new(total: u64) -> Self {
         Self {
             total,
@@ -26,6 +28,7 @@ impl TaskBudget {
     }
 
     /// Set the remaining tokens.
+    #[must_use]
     pub fn with_remaining(mut self, remaining: u64) -> Self {
         self.remaining = Some(remaining);
         self
@@ -64,8 +67,11 @@ impl<'de> Deserialize<'de> for TaskBudget {
 ///
 /// Used with `ThinkingConfig::Adaptive` to control how much thinking
 /// Claude applies to a task.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Variants are declared from least to most effort, so the derived `Ord` ranks them.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Effort {
     /// Low effort - minimal thinking for simple tasks
     Low,
@@ -93,7 +99,8 @@ pub enum Effort {
 /// // Control thinking effort
 /// let config = OutputConfig::new().with_effort(Effort::High);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct OutputConfig {
     /// Output format configuration for structured outputs.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,6 +120,7 @@ pub struct OutputConfig {
 
 impl OutputConfig {
     /// Create a new empty output configuration.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             format: None,
@@ -122,27 +130,24 @@ impl OutputConfig {
     }
 
     /// Set the output format.
+    #[must_use]
     pub fn with_format(mut self, format: OutputFormat) -> Self {
         self.format = Some(format);
         self
     }
 
     /// Set the effort level.
+    #[must_use]
     pub fn with_effort(mut self, effort: Effort) -> Self {
         self.effort = Some(effort);
         self
     }
 
     /// Set the task budget.
+    #[must_use]
     pub fn with_task_budget(mut self, task_budget: TaskBudget) -> Self {
         self.task_budget = Some(task_budget);
         self
-    }
-}
-
-impl Default for OutputConfig {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -150,6 +155,14 @@ impl Default for OutputConfig {
 mod tests {
     use super::*;
     use serde_json::{json, to_value};
+
+    #[test]
+    fn effort_orders_from_low_to_max() {
+        assert!(Effort::Low < Effort::Medium);
+        assert!(Effort::Medium < Effort::High);
+        assert!(Effort::High < Effort::XHigh);
+        assert!(Effort::XHigh < Effort::Max);
+    }
 
     #[test]
     fn effort_serialization() {

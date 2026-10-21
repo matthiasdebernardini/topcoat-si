@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::{CacheControlEphemeral, Content};
+use crate::types::{CacheControlEphemeral, Content, TextBlock};
 
 /// A block containing the result of a tool execution.
 ///
@@ -8,6 +8,7 @@ use crate::types::{CacheControlEphemeral, Content};
 /// requested via a ToolUseBlock. It contains the tool's response, which can be
 /// either successful output or an error indication.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct ToolResultBlock {
     /// The ID of the tool use that this result is for.
     ///
@@ -62,42 +63,55 @@ impl From<&str> for ToolResultBlockContent {
 
 impl ToolResultBlock {
     /// Create a new `ToolResultBlock` with the given tool use ID.
-    pub fn new(tool_use_id: String) -> Self {
+    #[must_use]
+    pub fn new(tool_use_id: impl Into<String>) -> Self {
         Self {
-            tool_use_id,
+            tool_use_id: tool_use_id.into(),
             cache_control: None,
             content: None,
             is_error: None,
         }
     }
 
+    /// Create an `is_error` result carrying `message`, for a problem the model can fix.
+    #[must_use]
+    pub fn error(tool_use_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(tool_use_id)
+            .with_string_content(message)
+            .with_error(true)
+    }
+
     /// Add a cache control to this tool result block.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self
     }
 
     /// Add string content to this tool result block.
-    pub fn with_string_content(mut self, content: String) -> Self {
-        self.content = Some(ToolResultBlockContent::String(content));
+    #[must_use]
+    pub fn with_string_content(mut self, content: impl Into<String>) -> Self {
+        self.content = Some(ToolResultBlockContent::String(content.into()));
         self
     }
 
     /// Add array content to this tool result block.
+    #[must_use]
     pub fn with_array_content(mut self, content: Vec<Content>) -> Self {
         self.content = Some(ToolResultBlockContent::Array(content));
         self
     }
 
     /// Add a single text content item to this tool result block.
-    pub fn with_text_content(mut self, text: crate::types::TextBlock) -> Self {
+    #[must_use]
+    pub fn with_text_content(mut self, text: TextBlock) -> Self {
         let content = match self.content {
             Some(ToolResultBlockContent::Array(mut items)) => {
                 items.push(Content::Text(text));
                 ToolResultBlockContent::Array(items)
             }
             Some(ToolResultBlockContent::String(s)) => ToolResultBlockContent::Array(vec![
-                Content::Text(crate::types::TextBlock::new(s)),
+                Content::Text(TextBlock::new(s)),
                 Content::Text(text),
             ]),
             None => ToolResultBlockContent::Array(vec![Content::Text(text)]),
@@ -107,6 +121,7 @@ impl ToolResultBlock {
     }
 
     /// Set this tool result block as an error.
+    #[must_use]
     pub fn with_error(mut self, is_error: bool) -> Self {
         self.is_error = Some(is_error);
         self
@@ -121,8 +136,7 @@ mod tests {
 
     #[test]
     fn tool_result_block_with_string_content() {
-        let block = ToolResultBlock::new("tool_1".to_string())
-            .with_string_content("Result of tool execution".to_string());
+        let block = ToolResultBlock::new("tool_1").with_string_content("Result of tool execution");
         let content_block = ContentBlock::ToolResult(block);
 
         let json = to_value(&content_block).unwrap();
@@ -138,10 +152,10 @@ mod tests {
 
     #[test]
     fn tool_result_block_with_array_content() {
-        let text_param = crate::types::TextBlock::new("Sample text content".to_string());
+        let text_param = TextBlock::new("Sample text content");
         let content = vec![Content::Text(text_param)];
 
-        let block = ToolResultBlock::new("tool_1".to_string()).with_array_content(content);
+        let block = ToolResultBlock::new("tool_1").with_array_content(content);
         let content_block = ContentBlock::ToolResult(block);
 
         let json = to_value(&content_block).unwrap();
@@ -161,9 +175,18 @@ mod tests {
     }
 
     #[test]
+    fn error_sets_message_and_is_error() {
+        let block = ToolResultBlock::error("tool_1", "No such city");
+        assert_eq!(
+            to_value(&block).unwrap(),
+            json!({"tool_use_id": "tool_1", "content": "No such city", "is_error": true})
+        );
+    }
+
+    #[test]
     fn tool_result_block_with_error() {
-        let block = ToolResultBlock::new("tool_1".to_string())
-            .with_string_content("Error executing tool".to_string())
+        let block = ToolResultBlock::new("tool_1")
+            .with_string_content("Error executing tool")
             .with_error(true);
         let content_block = ContentBlock::ToolResult(block);
 

@@ -1,6 +1,7 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::types::ContentBlock;
+use crate::types::open_union;
+use crate::types::{ContentBlock, Message};
 
 /// The content of a message, which can be either a string or an array of content blocks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -15,6 +16,7 @@ pub enum MessageParamContent {
 
 /// Parameters for a message.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageParam {
     /// The content of the message.
     pub content: MessageParamContent,
@@ -23,9 +25,22 @@ pub struct MessageParam {
     pub role: MessageRole,
 }
 
+/// Rejects a message whose role is [`MessageRole::Unknown`], which has no API value to send.
+pub(crate) fn check_roles(messages: &[MessageParam]) -> crate::Result<()> {
+    for (index, message) in messages.iter().enumerate() {
+        if message.role == MessageRole::Unknown {
+            return Err(open_union::unknown_in_request(format!(
+                "messages[{index}].role"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Role type for a message parameter.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum MessageRole {
     /// User role.
     User,
@@ -39,37 +54,73 @@ pub enum MessageRole {
     /// assistant's behavior. Unlike the top-level system prompt, a system
     /// message can be interleaved at any point in the conversation history.
     System,
+
+    /// A role this crate does not know.
+    ///
+    /// Never send it; it only models values this crate does not know.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for MessageRole {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "MessageRole",
+            |value| match value {
+                "user" => Some(Self::User),
+                "assistant" => Some(Self::Assistant),
+                "system" => Some(Self::System),
+                _ => None,
+            },
+            Self::Unknown,
+        )
+    }
 }
 
 impl MessageParam {
     /// Create a new `MessageParam` with the given content and role.
+    #[must_use]
     pub fn new(content: MessageParamContent, role: MessageRole) -> Self {
         Self { content, role }
     }
 
-    /// Create a new `MessageParam` with a string content.
-    pub fn new_with_string(content: String, role: MessageRole) -> Self {
-        Self::new(MessageParamContent::String(content), role)
-    }
-
     /// Create a new `MessageParam` with an array of content blocks.
+    #[must_use]
     pub fn new_with_blocks(blocks: Vec<ContentBlock>, role: MessageRole) -> Self {
         Self::new(MessageParamContent::Array(blocks), role)
     }
 
     /// Create a new user `MessageParam` with a string content.
+    #[must_use]
     pub fn user(content: impl Into<String>) -> Self {
-        Self::new_with_string(content.into(), MessageRole::User)
+        Self::new(
+            MessageParamContent::String(content.into()),
+            MessageRole::User,
+        )
     }
 
     /// Create a new assistant `MessageParam` with a string content.
+    #[must_use]
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self::new_with_string(content.into(), MessageRole::Assistant)
+        Self::new(
+            MessageParamContent::String(content.into()),
+            MessageRole::Assistant,
+        )
     }
 
     /// Create a new system `MessageParam` with a string content.
+    #[must_use]
     pub fn system(content: impl Into<String>) -> Self {
-        Self::new_with_string(content.into(), MessageRole::System)
+        Self::new(
+            MessageParamContent::String(content.into()),
+            MessageRole::System,
+        )
+    }
+
+    /// Echo a reply back into the conversation as an assistant message.
+    #[must_use]
+    pub fn from_message(message: Message) -> Self {
+        Self::new_with_blocks(message.content, MessageRole::Assistant)
     }
 }
 
@@ -85,9 +136,9 @@ impl From<String> for MessageParam {
     }
 }
 
-impl From<crate::types::Message> for MessageParam {
-    fn from(message: crate::types::Message) -> Self {
-        Self::new_with_blocks(message.content, MessageRole::Assistant)
+impl From<Message> for MessageParam {
+    fn from(message: Message) -> Self {
+        Self::from_message(message)
     }
 }
 
@@ -101,14 +152,14 @@ impl<T: AsRef<str>> From<T> for MessageParamContent {
 mod tests {
     use super::*;
     use crate::types::{
-        ImageBlock, KnownModel, Message, Model, TextBlock, ToolResultBlock, Usage,
+        ImageBlock, KnownModel, Message, Model, TextBlock, ToolResultBlock, UrlImageSource, Usage,
         WebFetchToolResultBlock, WebFetchToolResultContent,
     };
     use serde_json::{json, to_value};
 
     #[test]
     fn message_param_with_string() {
-        let message = MessageParam::user("Hello, Claude!".to_string());
+        let message = MessageParam::user("Hello, Claude!");
         let json = to_value(&message).unwrap();
 
         assert_eq!(
@@ -141,7 +192,7 @@ mod tests {
 
     #[test]
     fn message_param_with_blocks() {
-        let text_block = TextBlock::new("Hello, Claude!".to_string());
+        let text_block = TextBlock::new("Hello, Claude!");
         let blocks = vec![ContentBlock::Text(text_block)];
 
         let message = MessageParam::new_with_blocks(blocks, MessageRole::User);
@@ -163,10 +214,9 @@ mod tests {
 
     #[test]
     fn message_param_with_mixed_blocks() {
-        let text_block = TextBlock::new("Check out this image:".to_string());
+        let text_block = TextBlock::new("Check out this image:");
 
-        let image_source =
-            crate::types::UrlImageSource::new("https://example.com/image.jpg".to_string());
+        let image_source = UrlImageSource::new("https://example.com/image.jpg");
         let image_block = ImageBlock::new_with_url(image_source);
 
         let blocks = vec![
@@ -263,12 +313,12 @@ mod tests {
 
     #[test]
     fn message_param_from_message() {
-        let text_block = TextBlock::new("Hello, I'm Claude.".to_string());
+        let text_block = TextBlock::new("Hello, I'm Claude.");
         let content = vec![ContentBlock::Text(text_block)];
         let model = Model::Known(KnownModel::ClaudeSonnet55);
         let usage = Usage::new(50, 100);
 
-        let message = Message::new("msg_012345".to_string(), content, model, usage);
+        let message = Message::new("msg_012345", content, model, usage);
         let param: MessageParam = message.into();
 
         assert_eq!(param.role, MessageRole::Assistant);
@@ -319,8 +369,7 @@ mod tests {
 
     #[test]
     fn message_param_serializes_tool_result_transcript_blocks_without_duplicate_type() {
-        let tool_result =
-            ToolResultBlock::new("toolu_123".to_string()).with_string_content("ok".to_string());
+        let tool_result = ToolResultBlock::new("toolu_123").with_string_content("ok");
         let web_fetch_tool_result = WebFetchToolResultBlock {
             tool_use_id: "toolu_456".to_string(),
             content: WebFetchToolResultContent::Error {

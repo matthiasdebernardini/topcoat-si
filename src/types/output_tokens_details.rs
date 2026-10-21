@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Breakdown of output tokens by category.
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OutputTokensDetails {
     /// The number of output tokens generated as internal reasoning.
     pub thinking_tokens: i32,
@@ -11,6 +12,7 @@ pub struct OutputTokensDetails {
 
 impl OutputTokensDetails {
     /// Create a new output-token breakdown.
+    #[must_use]
     pub fn new(thinking_tokens: i32) -> Self {
         Self { thinking_tokens }
     }

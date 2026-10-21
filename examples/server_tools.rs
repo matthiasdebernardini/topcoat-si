@@ -5,7 +5,7 @@ use topcoat_si::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Anthropic::new(None)?;
+    let client = Anthropic::try_new(None)?;
     let model = KnownModel::ClaudeHaiku55;
 
     let params = MessageCreateParams::simple(
@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ToolUnionParam::CodeExecution20260521(CodeExecutionTool::new()),
     ]);
 
-    let message = client.send(params).await?;
+    let message = client.send(&params).await?;
 
     for block in &message.content {
         match block {

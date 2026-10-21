@@ -3,18 +3,41 @@ use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::types::open_union;
+
 /// Whether a skill is provided by Anthropic or by the user.
-#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SkillType {
     /// A skill provided by Anthropic.
     Anthropic,
     /// A skill created by the user.
     Custom,
+    /// A skill type this crate does not know.
+    ///
+    /// Never send it; it only models values this crate does not know.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for SkillType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        open_union::deserialize_str(
+            deserializer,
+            "SkillType",
+            |value| match value {
+                "anthropic" => Some(Self::Anthropic),
+                "custom" => Some(Self::Custom),
+                _ => None,
+            },
+            Self::Unknown,
+        )
+    }
 }
 
 /// A reference to a skill loaded into a container.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SkillRef {
     /// Whether the skill is Anthropic-provided or custom.
     pub r#type: SkillType,
@@ -29,6 +52,7 @@ pub struct SkillRef {
 
 impl SkillRef {
     /// Create a reference to an Anthropic-provided skill.
+    #[must_use]
     pub fn anthropic(skill_id: impl Into<String>) -> Self {
         Self {
             r#type: SkillType::Anthropic,
@@ -38,6 +62,7 @@ impl SkillRef {
     }
 
     /// Create a reference to a custom skill.
+    #[must_use]
     pub fn custom(skill_id: impl Into<String>) -> Self {
         Self {
             r#type: SkillType::Custom,
@@ -47,6 +72,7 @@ impl SkillRef {
     }
 
     /// Pin the skill to a version.
+    #[must_use]
     pub fn with_version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
         self
@@ -72,12 +98,14 @@ pub enum Container {
 
 impl Container {
     /// Reuse the container with the given identifier.
+    #[must_use]
     pub fn id(id: impl Into<String>) -> Self {
         Self::Id(id.into())
     }
 
     /// Create a new container with the given skills.
-    pub fn with_skills(skills: Vec<SkillRef>) -> Self {
+    #[must_use]
+    pub fn new_with_skills(skills: Vec<SkillRef>) -> Self {
         Self::Config { id: None, skills }
     }
 }
@@ -121,6 +149,7 @@ impl<'de> Deserialize<'de> for Container {
 
 /// Information about the container used in a response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContainerInfo {
     /// Identifier of the container; pass it back to reuse the container.
     pub id: String,
@@ -191,7 +220,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             config,
-            Container::with_skills(vec![SkillRef::anthropic("xlsx")])
+            Container::new_with_skills(vec![SkillRef::anthropic("xlsx")])
         );
     }
 

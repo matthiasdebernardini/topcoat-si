@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// This type is used to indicate a specific span of pages in a document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct CitationPageLocation {
     /// The text that was cited
     pub cited_text: String,
@@ -28,15 +29,16 @@ pub struct CitationPageLocation {
 
 impl CitationPageLocation {
     /// Creates a new CitationPageLocation
+    #[must_use]
     pub fn new(
-        cited_text: String,
+        cited_text: impl Into<String>,
         document_index: i32,
         start_page_number: i32,
         end_page_number: i32,
         document_title: Option<String>,
     ) -> Self {
         Self {
-            cited_text,
+            cited_text: cited_text.into(),
             document_index,
             document_title,
             end_page_number,
@@ -46,17 +48,20 @@ impl CitationPageLocation {
     }
 
     /// Sets the ID of the cited file
+    #[must_use]
     pub fn with_file_id(mut self, file_id: impl Into<String>) -> Self {
         self.file_id = Some(file_id.into());
         self
     }
 
     /// Returns the number of pages in the citation span (exclusive end)
+    #[must_use]
     pub fn page_count(&self) -> i32 {
         self.end_page_number - self.start_page_number
     }
 
     /// Returns true if the citation is only for a single page
+    #[must_use]
     pub fn is_single_page(&self) -> bool {
         self.page_count() == 1
     }

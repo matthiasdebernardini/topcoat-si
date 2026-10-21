@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// when a [`ContextEdit::Compact20260112`] edit is present); both are added
 /// automatically. Mutually exclusive with `compaction`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContextManagement {
     /// The edits to apply, in order.
     pub edits: Vec<ContextEdit>,
@@ -15,11 +16,13 @@ pub struct ContextManagement {
 
 impl ContextManagement {
     /// Create a context-management configuration from edits.
+    #[must_use]
     pub fn new(edits: Vec<ContextEdit>) -> Self {
         Self { edits }
     }
 
     /// Whether any edit is a [`ContextEdit::Compact20260112`] edit.
+    #[must_use]
     pub fn has_compact_edit(&self) -> bool {
         self.edits
             .iter()
@@ -30,6 +33,7 @@ impl ContextManagement {
 /// A threshold that starts or bounds a context edit.
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ContextTrigger {
     /// Trigger when the prompt reaches this many input tokens.
     InputTokens {
@@ -45,9 +49,18 @@ pub enum ContextTrigger {
 
 /// How many recent tool uses to keep when clearing tool uses.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeepToolUses {
     /// Number of most recent tool uses to keep.
     pub value: u64,
+}
+
+impl KeepToolUses {
+    /// Keep the `value` most recent tool uses.
+    #[must_use]
+    pub fn new(value: u64) -> Self {
+        Self { value }
+    }
 }
 
 impl Serialize for KeepToolUses {
@@ -77,6 +90,7 @@ impl<'de> Deserialize<'de> for KeepToolUses {
 
 /// How much thinking to keep when clearing thinking blocks.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ThinkingKeep {
     /// Keep thinking from this many recent assistant turns.
     Turns(u64),
@@ -124,6 +138,7 @@ impl<'de> Deserialize<'de> for ThinkingKeep {
 /// One context-management edit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum ContextEdit {
     /// Clear old tool results (and optionally inputs) once the prompt grows.
     #[serde(rename = "clear_tool_uses_20250919")]
@@ -168,6 +183,7 @@ pub enum ContextEdit {
 
 impl ContextEdit {
     /// A `clear_tool_uses_20250919` edit with API defaults.
+    #[must_use]
     pub fn clear_tool_uses() -> Self {
         Self::ClearToolUses20250919 {
             trigger: None,
@@ -179,11 +195,13 @@ impl ContextEdit {
     }
 
     /// A `clear_thinking_20251015` edit with API defaults.
+    #[must_use]
     pub fn clear_thinking() -> Self {
         Self::ClearThinking20251015 { keep: None }
     }
 
     /// A `compact_20260112` edit with API defaults.
+    #[must_use]
     pub fn compact() -> Self {
         Self::Compact20260112 {
             trigger: None,
@@ -195,6 +213,7 @@ impl ContextEdit {
 
 /// Context management applied to a response.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContextManagementResponse {
     /// The edits that were applied.
     #[serde(default)]
@@ -203,6 +222,7 @@ pub struct ContextManagementResponse {
 
 /// An edit the API applied.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AppliedEdit {
     /// The edit type, such as `clear_tool_uses_20250919`.
     pub r#type: String,
@@ -222,6 +242,7 @@ pub struct AppliedEdit {
 
 /// Context-management information in a count-tokens response.
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CountTokensContextManagement {
     /// Input tokens before any context-management edits were applied.
     pub original_input_tokens: u64,

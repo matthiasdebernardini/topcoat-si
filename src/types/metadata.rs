@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// This can be used to provide additional context or client information with requests.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct Metadata {
     /// An external identifier for the user who is associated with the request.
     ///
@@ -16,12 +17,14 @@ pub struct Metadata {
 
 impl Metadata {
     /// Creates a new empty Metadata instance
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Creates a new Metadata instance with the specified user_id
-    pub fn with_user_id<S: Into<String>>(user_id: S) -> Self {
+    #[must_use]
+    pub fn new_with_user_id(user_id: impl Into<String>) -> Self {
         Self {
             user_id: Some(user_id.into()),
         }
@@ -41,7 +44,7 @@ mod tests {
 
     #[test]
     fn with_user_id_serialization() {
-        let metadata = Metadata::with_user_id("user-123");
+        let metadata = Metadata::new_with_user_id("user-123");
         let json = serde_json::to_value(&metadata).unwrap();
         assert_eq!(json, serde_json::json!({"user_id":"user-123"}));
     }

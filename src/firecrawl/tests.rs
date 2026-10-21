@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -6,9 +8,11 @@ use time::macros::date;
 
 use super::*;
 use crate::ClientTool;
-use crate::test_support::{Canned, Recorded, serve};
+use crate::error::Error;
+use crate::test_support::{Canned, Recorded, serve, uses_proxies};
 use crate::types::{
-    Content, ContentBlock, ToolResultBlock, ToolResultBlockContent, ToolUnionParam, ToolUseBlock,
+    Content, ContentBlock, SearchResultBlock, ToolResultBlock, ToolResultBlockContent,
+    ToolUnionParam, ToolUseBlock,
 };
 
 fn ok(body: Value) -> Canned {
@@ -16,9 +20,10 @@ fn ok(body: Value) -> Canned {
 }
 
 fn client(base_url: &str) -> FirecrawlClient {
-    FirecrawlClient::new("fc-test-key")
+    FirecrawlClient::try_new("fc-test-key")
         .unwrap()
         .with_base_url(base_url)
+        .unwrap()
 }
 
 fn tool_use(input: Value) -> ToolUseBlock {
@@ -390,7 +395,7 @@ async fn developer_domain_lists_win_over_the_model() {
 
 #[test]
 fn tool_definition_and_dispatch() {
-    let search = FirecrawlWebSearch::new(FirecrawlClient::new("fc-test-key").unwrap());
+    let search = FirecrawlWebSearch::new(FirecrawlClient::try_new("fc-test-key").unwrap());
     let ToolUnionParam::CustomTool(tool) = search.tool() else {
         panic!("expected a custom tool");
     };
@@ -424,7 +429,43 @@ fn unknown_response_fields_are_ignored() {
 
 #[test]
 fn empty_api_key_is_rejected() {
-    assert!(FirecrawlClient::new(" ").unwrap_err().is_validation());
+    assert!(FirecrawlClient::try_new(" ").unwrap_err().is_validation());
+}
+
+#[test]
+fn base_url_needs_https_or_loopback_http() {
+    let firecrawl = || FirecrawlClient::try_new("fc-test-key").unwrap();
+    for url in [
+        "https://api.firecrawl.dev/",
+        "http://127.0.0.1:9000",
+        "http://localhost:9000/",
+        "http://[::1]:9000",
+    ] {
+        let client = firecrawl().with_base_url(url).unwrap();
+        assert!(!client.base_url.ends_with('/'), "{url}");
+    }
+    for url in [
+        "http://api.firecrawl.dev",
+        "http://10.0.0.1",
+        "ftp://127.0.0.1",
+        "not a url",
+        "https://user:pass@api.firecrawl.dev",
+        "https://api.firecrawl.dev?x=1",
+    ] {
+        let error = firecrawl().with_base_url(url).unwrap_err();
+        assert!(
+            matches!(&error, Error::Validation { param, .. } if param.as_deref() == Some("base_url")),
+            "{url}: {error}"
+        );
+    }
+}
+
+#[test]
+fn loopback_base_url_skips_proxies() {
+    let firecrawl = FirecrawlClient::try_new("fc-test-key").unwrap();
+    assert!(uses_proxies(&firecrawl.http));
+    let firecrawl = firecrawl.with_base_url("http://127.0.0.1:1").unwrap();
+    assert!(!uses_proxies(&firecrawl.http));
 }
 
 #[tokio::test]
@@ -764,9 +805,9 @@ async fn snippets_only_without_scraping() {
 #[tokio::test]
 #[ignore = "hits the live Firecrawl API; needs FIRECRAWL_API_KEY"]
 async fn live_search() {
-    let Ok(client) = FirecrawlClient::from_env() else {
-        return;
-    };
+    let client = FirecrawlClient::from_env().expect(
+        "live_search needs FIRECRAWL_API_KEY: FIRECRAWL_API_KEY=... cargo test live_search -- --ignored",
+    );
     let result = FirecrawlWebSearch::new(client)
         .with_default_limit(2)
         .execute(&tool_use(json!({"query": "Rust programming language"})))
@@ -791,7 +832,7 @@ fn scraped(markdown: &str, metadata: Value) -> Canned {
     ok(json!({"success": true, "data": {"markdown": markdown, "metadata": metadata}}))
 }
 
-fn only_search_result(result: &ToolResultBlock) -> &crate::types::SearchResultBlock {
+fn only_search_result(result: &ToolResultBlock) -> &SearchResultBlock {
     match &result.content {
         Some(ToolResultBlockContent::Array(items)) => match items.as_slice() {
             [Content::SearchResult(block)] => block,

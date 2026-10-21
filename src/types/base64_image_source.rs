@@ -1,7 +1,6 @@
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::Read;
+use std::io;
 use std::path::Path;
 
 /// Represents a base64-encoded image source.
@@ -9,6 +8,7 @@ use std::path::Path;
 /// This can be created from either a base64-encoded string or from a file path.
 /// The media_type must be one of the supported image formats: "image/jpeg", "image/png", "image/gif", or "image/webp".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct Base64ImageSource {
     /// The base64-encoded data of the image
     pub data: String,
@@ -18,8 +18,9 @@ pub struct Base64ImageSource {
 }
 
 /// Supported image media types
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ImageMediaType {
     /// JPEG image format.
     #[serde(rename = "image/jpeg")]
@@ -40,15 +41,22 @@ pub enum ImageMediaType {
 
 impl Base64ImageSource {
     /// Create a new Base64ImageSource from a base64-encoded string
-    pub fn new(data: String, media_type: ImageMediaType) -> Self {
-        Self { data, media_type }
+    #[must_use]
+    pub fn new(data: impl Into<String>, media_type: ImageMediaType) -> Self {
+        Self {
+            data: data.into(),
+            media_type,
+        }
     }
 
     /// Create a Base64ImageSource from a file path
     ///
     /// This will read the file and encode it as base64.
     /// The media_type will be determined from the file extension if possible.
-    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, std::io::Error> {
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
+        use base64::Engine;
+        use std::io::Read;
+
         let path = path.as_ref();
 
         // Try to determine media type from extension
@@ -58,8 +66,8 @@ impl Base64ImageSource {
             Some("gif") => ImageMediaType::Gif,
             Some("webp") => ImageMediaType::Webp,
             _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
                     "Unsupported file extension. Must be jpeg, png, gif, or webp",
                 ));
             }

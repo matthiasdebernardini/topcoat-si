@@ -3,8 +3,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use futures::StreamExt;
-
 use crate::{
     Anthropic, Error, MessageBatch, MessageBatchProcessingStatus, MessageBatchResultVariant, Result,
 };
@@ -60,6 +58,8 @@ impl Anthropic {
         &self,
         message_batch_id: &str,
     ) -> Result<HashMap<String, MessageBatchResultVariant>> {
+        use futures::StreamExt;
+
         let mut results =
             std::pin::pin!(self.stream_message_batch_results(message_batch_id).await?);
         let mut by_id = HashMap::new();
@@ -77,7 +77,7 @@ mod tests {
     use crate::test_support::{Canned, serve};
 
     fn client(base_url: String) -> Anthropic {
-        Anthropic::new(Some("test_key".to_string()))
+        Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap()

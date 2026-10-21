@@ -4,6 +4,7 @@ use crate::types::CacheControlEphemeral;
 
 /// Common parameters for a custom tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct ToolParam {
     /// [JSON schema](https://json-schema.org/draft/2020-12) for this tool's input.
     ///
@@ -65,9 +66,10 @@ pub struct ToolParam {
 
 impl ToolParam {
     /// Create a new `ToolParam` with the required fields.
-    pub fn new(name: String, input_schema: serde_json::Value) -> Self {
+    #[must_use]
+    pub fn new(name: impl Into<String>, input_schema: serde_json::Value) -> Self {
         Self {
-            name,
+            name: name.into(),
             input_schema,
             cache_control: None,
             description: None,
@@ -80,12 +82,14 @@ impl ToolParam {
     }
 
     /// Add a description to the tool.
-    pub fn with_description(mut self, description: String) -> Self {
-        self.description = Some(description);
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
         self
     }
 
     /// Add cache control to the tool.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self
@@ -119,12 +123,14 @@ impl ToolParam {
     /// )
     /// .with_strict(true);
     /// ```
+    #[must_use]
     pub fn with_strict(mut self, strict: bool) -> Self {
         self.strict = Some(strict);
         self
     }
 
     /// Set whether the tool definition is deferred until found by tool search.
+    #[must_use]
     pub fn with_defer_loading(mut self, defer_loading: bool) -> Self {
         self.defer_loading = Some(defer_loading);
         self
@@ -134,18 +140,21 @@ impl ToolParam {
     ///
     /// Values: `"direct"`, `"code_execution_20250825"`, `"code_execution_20260120"`,
     /// `"code_execution_20260521"`.
+    #[must_use]
     pub fn with_allowed_callers(mut self, allowed_callers: Vec<String>) -> Self {
         self.allowed_callers = Some(allowed_callers);
         self
     }
 
     /// Set example inputs for the tool.
+    #[must_use]
     pub fn with_input_examples(mut self, input_examples: Vec<serde_json::Value>) -> Self {
         self.input_examples = Some(input_examples);
         self
     }
 
     /// Set whether tool input is streamed eagerly.
+    #[must_use]
     pub fn with_eager_input_streaming(mut self, eager_input_streaming: bool) -> Self {
         self.eager_input_streaming = Some(eager_input_streaming);
         self
@@ -171,8 +180,8 @@ mod tests {
 
         let cache_control = CacheControlEphemeral::new();
 
-        let tool = ToolParam::new("search".to_string(), input_schema)
-            .with_description("Search for information".to_string())
+        let tool = ToolParam::new("search", input_schema)
+            .with_description("Search for information")
             .with_cache_control(cache_control);
 
         let json = to_value(&tool).unwrap();
@@ -215,8 +224,8 @@ mod tests {
             "additionalProperties": false
         });
 
-        let tool = ToolParam::new("get_weather".to_string(), input_schema)
-            .with_description("Get the current weather".to_string())
+        let tool = ToolParam::new("get_weather", input_schema)
+            .with_description("Get the current weather")
             .with_strict(true);
 
         let json = to_value(&tool).unwrap();
@@ -258,7 +267,7 @@ mod tests {
             }
         });
 
-        let tool = ToolParam::new("search".to_string(), input_schema).with_strict(false);
+        let tool = ToolParam::new("search", input_schema).with_strict(false);
 
         let json = to_value(&tool).unwrap();
         // strict: false should be serialized
@@ -275,7 +284,7 @@ mod tests {
             }
         });
 
-        let tool = ToolParam::new("search".to_string(), input_schema);
+        let tool = ToolParam::new("search", input_schema);
 
         let json = to_value(&tool).unwrap();
         // strict should not be present when None
@@ -287,7 +296,7 @@ mod tests {
 
     #[test]
     fn tool_param_new_fields() {
-        let tool = ToolParam::new("t".to_string(), json!({"type": "object"}))
+        let tool = ToolParam::new("t", json!({"type": "object"}))
             .with_defer_loading(true)
             .with_allowed_callers(vec!["direct".to_string()])
             .with_input_examples(vec![json!({"a": 1})])

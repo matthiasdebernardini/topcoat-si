@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::ModelLifecycle;
+use crate::types::{ModelLifecycle, open_union};
 
 /// Parameters for listing models.
 ///
 /// This struct contains the parameters that can be passed when listing models
 /// from the Anthropic API.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ModelListParams {
     /// ID of the object to use as a cursor for pagination.
     ///
@@ -45,14 +46,28 @@ pub struct ModelListParams {
 
 impl ModelListParams {
     /// Create a new, empty instance of ModelListParams.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Filter by lifecycle state; may be called repeatedly.
+    #[must_use]
     pub fn with_lifecycle(mut self, lifecycle: ModelLifecycle) -> Self {
         self.lifecycle.push(lifecycle);
         self
+    }
+
+    /// Rejects an `Unknown` lifecycle read from a reply, which has no API value to send.
+    pub(crate) fn check_known_values(&self) -> crate::Result<()> {
+        self.lifecycle
+            .iter()
+            .position(|lifecycle| *lifecycle == ModelLifecycle::Unknown)
+            .map_or(Ok(()), |index| {
+                Err(open_union::unknown_in_request(format!(
+                    "lifecycle[{index}]"
+                )))
+            })
     }
 
     /// The query-string pairs for this request, with `lifecycle[]` repeated per value.
@@ -78,6 +93,7 @@ impl ModelListParams {
     /// Set the after_id parameter for pagination.
     ///
     /// When provided, returns the page of results immediately after this object.
+    #[must_use]
     pub fn with_after_id(mut self, after_id: impl Into<String>) -> Self {
         self.after_id = Some(after_id.into());
         self
@@ -86,6 +102,7 @@ impl ModelListParams {
     /// Set the before_id parameter for pagination.
     ///
     /// When provided, returns the page of results immediately before this object.
+    #[must_use]
     pub fn with_before_id(mut self, before_id: impl Into<String>) -> Self {
         self.before_id = Some(before_id.into());
         self
@@ -94,20 +111,23 @@ impl ModelListParams {
     /// Set the limit for the number of items to return per page.
     ///
     /// Defaults to `20`. Ranges from `1` to `1000`.
+    #[must_use]
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
         self
     }
 
     /// Set the beta versions to use for this request.
-    pub fn with_betas(mut self, betas: Vec<String>) -> Self {
-        self.betas = Some(betas);
+    #[must_use]
+    pub fn with_betas(mut self, betas: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.betas = Some(betas.into_iter().map(Into::into).collect());
         self
     }
 
     /// Add a single beta version to use for this request.
-    pub fn with_beta(mut self, beta: String) -> Self {
-        self.betas.get_or_insert_with(Vec::new).push(beta);
+    #[must_use]
+    pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
+        self.betas.get_or_insert_with(Vec::new).push(beta.into());
         self
     }
 }
@@ -130,7 +150,7 @@ mod tests {
         let params = ModelListParams::new()
             .with_after_id("model_123")
             .with_limit(50)
-            .with_beta("token-counting-2024-11-01".to_string());
+            .with_beta("token-counting-2024-11-01");
 
         assert_eq!(params.after_id, Some("model_123".to_string()));
         assert_eq!(params.before_id, None);
@@ -145,7 +165,7 @@ mod tests {
     fn model_list_params_serialization() {
         let params = ModelListParams::new()
             .with_limit(50)
-            .with_beta("token-counting-2024-11-01".to_string());
+            .with_beta("token-counting-2024-11-01");
 
         let json = serde_json::to_value(&params).unwrap();
         let expected = serde_json::json!({

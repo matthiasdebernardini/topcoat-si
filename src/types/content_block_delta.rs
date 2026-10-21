@@ -1,6 +1,7 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 
+use crate::types::open_union;
 use crate::types::{CitationsDelta, InputJsonDelta, SignatureDelta, TextDelta, ThinkingDelta};
 
 /// A raw content block delta, representing a streaming update to a content block.
@@ -9,6 +10,7 @@ use crate::types::{CitationsDelta, InputJsonDelta, SignatureDelta, TextDelta, Th
 /// are updated incrementally.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum ContentBlockDelta {
     /// A text delta.
     #[serde(rename = "text_delta")]
@@ -36,7 +38,6 @@ pub enum ContentBlockDelta {
     #[serde(rename = "compaction_delta")]
     CompactionDelta(CompactionDelta),
     /// A value introduced by a newer API version.
-    #[serde(other)]
     Unknown,
 }
 
@@ -49,33 +50,47 @@ impl<'de> Deserialize<'de> for ContentBlockDelta {
         let delta_type = value
             .get("type")
             .and_then(Value::as_str)
-            .ok_or_else(|| serde::de::Error::missing_field("type"))?
+            .ok_or_else(|| de::Error::missing_field("type"))?
             .to_string();
 
         match delta_type.as_str() {
-            "text_delta" => from_value(value).map(ContentBlockDelta::TextDelta),
-            "input_json_delta" => from_value(value).map(ContentBlockDelta::InputJsonDelta),
-            "citations_delta" => from_value(value).map(ContentBlockDelta::CitationsDelta),
-            "thinking_delta" | "summary_delta" | "thinking_summary_delta" => {
-                from_value(value).map(ContentBlockDelta::ThinkingDelta)
+            "text_delta" => open_union::from_value(value).map(ContentBlockDelta::TextDelta),
+            "input_json_delta" => {
+                open_union::from_value(value).map(ContentBlockDelta::InputJsonDelta)
             }
-            "signature_delta" => from_value(value).map(ContentBlockDelta::SignatureDelta),
-            "compaction_delta" => from_value(value).map(ContentBlockDelta::CompactionDelta),
+            "citations_delta" => {
+                open_union::from_value(value).map(ContentBlockDelta::CitationsDelta)
+            }
+            "thinking_delta" | "summary_delta" | "thinking_summary_delta" => {
+                open_union::from_value(value).map(ContentBlockDelta::ThinkingDelta)
+            }
+            "signature_delta" => {
+                open_union::from_value(value).map(ContentBlockDelta::SignatureDelta)
+            }
+            "compaction_delta" => {
+                open_union::from_value(value).map(ContentBlockDelta::CompactionDelta)
+            }
             other if is_thinking_like_delta(other) => {
-                let thinking_delta: ThinkingDelta = from_value(value)?;
+                // Read as thinking so its text keeps streaming, but still report the new tag.
+                open_union::warn_unknown("ContentBlockDelta", other);
+                let thinking_delta: ThinkingDelta = open_union::from_value(value)?;
                 if thinking_delta.thinking.is_empty() {
                     Ok(ContentBlockDelta::Unknown)
                 } else {
                     Ok(ContentBlockDelta::ThinkingDelta(thinking_delta))
                 }
             }
-            _ => Ok(ContentBlockDelta::Unknown),
+            other => {
+                open_union::warn_unknown("ContentBlockDelta", other);
+                Ok(ContentBlockDelta::Unknown)
+            }
         }
     }
 }
 
 /// The fields of a `compaction_delta`; each replaces the block's field of the same name.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CompactionDelta {
     /// The summary text, or `None` when the API sends null.
     #[serde(default)]
@@ -86,48 +101,14 @@ pub struct CompactionDelta {
     pub encrypted_content: Option<String>,
 }
 
-fn from_value<T, E>(value: Value) -> Result<T, E>
-where
-    T: serde::de::DeserializeOwned,
-    E: serde::de::Error,
-{
-    serde_json::from_value(value).map_err(E::custom)
-}
-
 fn is_thinking_like_delta(delta_type: &str) -> bool {
     delta_type.contains("thinking") || delta_type.contains("summary")
-}
-
-impl ContentBlockDelta {
-    /// Create a new `ContentBlockDelta` from a text delta.
-    pub fn from_text_delta(text_delta: TextDelta) -> Self {
-        ContentBlockDelta::TextDelta(text_delta)
-    }
-
-    /// Create a new `ContentBlockDelta` from an input JSON delta.
-    pub fn from_input_json_delta(input_json_delta: InputJsonDelta) -> Self {
-        ContentBlockDelta::InputJsonDelta(input_json_delta)
-    }
-
-    /// Create a new `ContentBlockDelta` from a citations delta.
-    pub fn from_citations_delta(citations_delta: CitationsDelta) -> Self {
-        ContentBlockDelta::CitationsDelta(citations_delta)
-    }
-
-    /// Create a new `ContentBlockDelta` from a thinking delta.
-    pub fn from_thinking_delta(thinking_delta: ThinkingDelta) -> Self {
-        ContentBlockDelta::ThinkingDelta(thinking_delta)
-    }
-
-    /// Create a new `ContentBlockDelta` from a signature delta.
-    pub fn from_signature_delta(signature_delta: SignatureDelta) -> Self {
-        ContentBlockDelta::SignatureDelta(signature_delta)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::CitationCharLocation;
     use serde_json::{from_value, json, to_value};
 
     #[test]
@@ -160,7 +141,7 @@ mod tests {
 
     #[test]
     fn text_delta_serialization() {
-        let text_delta = TextDelta::new("Hello world".to_string());
+        let text_delta = TextDelta::new("Hello world");
         let delta = ContentBlockDelta::TextDelta(text_delta);
 
         let json = to_value(&delta).unwrap();
@@ -190,7 +171,7 @@ mod tests {
 
     #[test]
     fn citations_delta_serialization() {
-        let char_location = crate::types::CitationCharLocation {
+        let char_location = CitationCharLocation {
             cited_text: "example text".to_string(),
             document_index: 0,
             document_title: Some("Document Title".to_string()),
@@ -199,7 +180,7 @@ mod tests {
             file_id: None,
         };
 
-        let citations_delta = CitationsDelta::with_char_location(char_location);
+        let citations_delta = CitationsDelta::new_with_char_location(char_location);
         let delta = ContentBlockDelta::CitationsDelta(citations_delta);
 
         let json = to_value(&delta).unwrap();
@@ -221,7 +202,7 @@ mod tests {
 
     #[test]
     fn thinking_delta_serialization() {
-        let thinking_delta = ThinkingDelta::new("Let me think about this...".to_string());
+        let thinking_delta = ThinkingDelta::new("Let me think about this...");
         let delta = ContentBlockDelta::ThinkingDelta(thinking_delta);
 
         let json = to_value(&delta).unwrap();
@@ -236,7 +217,7 @@ mod tests {
 
     #[test]
     fn signature_delta_serialization() {
-        let signature_delta = SignatureDelta::new("Robert Paulson".to_string());
+        let signature_delta = SignatureDelta::new("Robert Paulson");
         let delta = ContentBlockDelta::SignatureDelta(signature_delta);
 
         let json = to_value(&delta).unwrap();
@@ -295,5 +276,25 @@ mod tests {
             }
             _ => panic!("Expected ThinkingDelta variant"),
         }
+    }
+
+    #[test]
+    fn thinking_like_unknown_tag_streams_as_thinking_and_warns() {
+        let json = json!({"type": "reasoning_thinking_delta", "thinking": "Step one."});
+
+        let (delta, warnings) = crate::test_support::unknown_warnings(|| {
+            from_value::<ContentBlockDelta>(json).unwrap()
+        });
+
+        match delta {
+            ContentBlockDelta::ThinkingDelta(thinking_delta) => {
+                assert_eq!(thinking_delta.thinking, "Step one.");
+            }
+            _ => panic!("Expected ThinkingDelta variant"),
+        }
+        assert_eq!(
+            warnings,
+            ["rust_type=ContentBlockDelta tag=reasoning_thinking_delta"]
+        );
     }
 }

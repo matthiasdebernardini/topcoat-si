@@ -11,6 +11,7 @@ fn default_name() -> String {
 /// The same parameters are shared by every `code_execution_*` version; the version is
 /// chosen by the [`ToolUnionParam`](crate::ToolUnionParam) variant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct CodeExecutionTool {
     /// Name of the tool.
     #[serde(default = "default_name")]
@@ -27,6 +28,7 @@ pub struct CodeExecutionTool {
 
 impl CodeExecutionTool {
     /// Creates a code execution tool with default values.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             name: default_name(),
@@ -36,12 +38,14 @@ impl CodeExecutionTool {
     }
 
     /// Sets the cache control.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self
     }
 
     /// Sets whether the tool definition is deferred until found by tool search.
+    #[must_use]
     pub fn with_defer_loading(mut self, defer_loading: bool) -> Self {
         self.defer_loading = Some(defer_loading);
         self

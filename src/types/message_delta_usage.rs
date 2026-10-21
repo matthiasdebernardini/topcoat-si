@@ -7,6 +7,7 @@ use crate::types::{OutputTokensDetails, ServerToolUsage, Usage, UsageIteration};
 /// Anthropic's API bills and rate-limits by token counts, as tokens represent the
 /// underlying cost to their systems.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageDeltaUsage {
     /// The cumulative number of input tokens used to create the cache entry.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -38,6 +39,7 @@ pub struct MessageDeltaUsage {
 
 impl MessageDeltaUsage {
     /// Create a new `MessageDeltaUsage` with the given output tokens.
+    #[must_use]
     pub fn new(output_tokens: i32) -> Self {
         Self {
             cache_creation_input_tokens: None,
@@ -51,35 +53,41 @@ impl MessageDeltaUsage {
     }
 
     /// Set the cache creation input tokens.
+    #[must_use]
     pub fn with_cache_creation_input_tokens(mut self, tokens: i32) -> Self {
         self.cache_creation_input_tokens = Some(tokens);
         self
     }
 
     /// Set the cache read input tokens.
+    #[must_use]
     pub fn with_cache_read_input_tokens(mut self, tokens: i32) -> Self {
         self.cache_read_input_tokens = Some(tokens);
         self
     }
 
     /// Set the input tokens.
+    #[must_use]
     pub fn with_input_tokens(mut self, tokens: i32) -> Self {
         self.input_tokens = Some(tokens);
         self
     }
 
     /// Set the output-token breakdown.
+    #[must_use]
     pub fn with_output_tokens_details(mut self, details: OutputTokensDetails) -> Self {
         self.output_tokens_details = Some(details);
         self
     }
 
     /// Set the thinking-token count in the output-token breakdown.
+    #[must_use]
     pub fn with_thinking_tokens(self, thinking_tokens: i32) -> Self {
         self.with_output_tokens_details(OutputTokensDetails::new(thinking_tokens))
     }
 
     /// Set the server tool usage.
+    #[must_use]
     pub fn with_server_tool_use(mut self, server_tool_use: ServerToolUsage) -> Self {
         self.server_tool_use = Some(server_tool_use);
         self

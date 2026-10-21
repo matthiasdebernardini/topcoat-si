@@ -3,33 +3,25 @@ use serde::{Deserialize, Serialize};
 /// Configuration for enabling or disabling citations in the response.
 ///
 /// This type allows controlling whether citations will be included in the model's response.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// By default, citations are disabled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct CitationsConfig {
     /// Whether citations are enabled
     pub enabled: bool,
 }
 
 impl CitationsConfig {
-    /// Creates a new CitationsConfig with the specified enabled state
-    pub fn new(enabled: bool) -> Self {
-        Self { enabled }
-    }
-
     /// Returns a CitationsConfig with citations enabled
+    #[must_use]
     pub fn enabled() -> Self {
-        Self::new(true)
+        Self { enabled: true }
     }
 
     /// Returns a CitationsConfig with citations disabled
+    #[must_use]
     pub fn disabled() -> Self {
-        Self::new(false)
-    }
-}
-
-impl Default for CitationsConfig {
-    /// By default, citations are disabled
-    fn default() -> Self {
-        Self::disabled()
+        Self { enabled: false }
     }
 }
 

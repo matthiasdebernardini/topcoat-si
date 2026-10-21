@@ -16,7 +16,7 @@ pub async fn check_pack(pool: Arc<Pool>, pack: Pack, fakes: Vec<Pack>) -> Result
     let examples = pack.examples.clone();
     let mut packs = fakes;
     packs.push(pack);
-    let code = CodeMode::new(pool, packs, Limits::default())?;
+    let code = CodeMode::try_new(pool, packs, Limits::default())?;
     for (function, example) in examples {
         let reply = code.execute(example.code).await?;
         code.end_session().await?;

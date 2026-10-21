@@ -7,26 +7,26 @@ use topcoat_si::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create a client using the API key from the environment variable TOPCOAT_SI_API_KEY
-    let client = Anthropic::new(None)?;
+    // Create a client using the API key from TOPCOAT_SI_API_KEY or ANTHROPIC_API_KEY
+    let client = Anthropic::try_new(None)?;
 
-    // Example 1: Non-streaming request (old verbose way)
-    println!("EXAMPLE 1: Non-streaming request (old verbose way)");
-    println!("--------------------------------------------------");
+    // Example 1: Non-streaming request built from MessageParam and MessageCreateParams::new
+    println!("EXAMPLE 1: Non-streaming request with MessageCreateParams::new");
+    println!("--------------------------------------------------------------");
 
-    let message = MessageParam::new_with_string(
-        "Hello, I'm a human. Can you tell me about yourself?".to_string(),
+    let message = MessageParam::new(
+        "Hello, I'm a human. Can you tell me about yourself?".into(),
         MessageRole::User,
     );
     let system_prompt = "You are Claude, an AI assistant made by Anthropic.".to_string();
     let params = MessageCreateParams::new(
         1000, // max tokens
-        vec![message.clone()],
+        vec![message],
         Model::Known(KnownModel::ClaudeSonnet55),
     )
-    .with_system_string(system_prompt.clone());
+    .with_system(system_prompt);
 
-    let response = client.send(params).await?;
+    let response = client.send(&params).await?;
 
     println!("Response ID: {}", response.id);
     if let Some(content) = response.content.first() {
@@ -39,9 +39,9 @@ async fn main() -> Result<()> {
     }
     println!();
 
-    // Example 2: New ergonomic API - much simpler!
-    println!("EXAMPLE 2: New ergonomic API - much simpler!");
-    println!("---------------------------------------------");
+    // Example 2: Non-streaming request from a prompt string
+    println!("EXAMPLE 2: Non-streaming request with MessageCreateParams::simple");
+    println!("-----------------------------------------------------------------");
 
     let params = MessageCreateParams::simple(
         "Hello, I'm a human. Can you tell me about yourself?",
@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
     )
     .with_system("You are Claude, an AI assistant made by Anthropic.");
 
-    let response = client.send(params).await?;
+    let response = client.send(&params).await?;
 
     println!("Response ID: {}", response.id);
     if let Some(content) = response.content.first() {
@@ -62,9 +62,9 @@ async fn main() -> Result<()> {
     }
     println!();
 
-    // Example 3: Streaming request with new API
-    println!("EXAMPLE 3: Streaming request with new API");
-    println!("-----------------------------------------");
+    // Example 3: Streaming request from a prompt string
+    println!("EXAMPLE 3: Streaming request with MessageCreateParams::simple_streaming");
+    println!("-----------------------------------------------------------------------");
 
     let params =
         MessageCreateParams::simple_streaming("Tell me a short joke.", KnownModel::ClaudeSonnet55);

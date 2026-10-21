@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::str::FromStr;
 
 use crate::types::{CacheControlEphemeral, TextCitation};
@@ -7,6 +8,7 @@ use crate::types::{CacheControlEphemeral, TextCitation};
 ///
 /// TextBlocks contain plain text content and optional citations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct TextBlock {
     /// Optional citations supporting the text block.
     ///
@@ -26,7 +28,8 @@ pub struct TextBlock {
 
 impl TextBlock {
     /// Creates a new TextBlock with the specified text.
-    pub fn new<S: Into<String>>(text: S) -> Self {
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             citations: None,
@@ -35,7 +38,8 @@ impl TextBlock {
     }
 
     /// Creates a new TextBlock with the specified text and citations.
-    pub fn with_citations<S: Into<String>>(text: S, citations: Vec<TextCitation>) -> Self {
+    #[must_use]
+    pub fn new_with_citations(text: impl Into<String>, citations: Vec<TextCitation>) -> Self {
         Self {
             text: text.into(),
             citations: Some(citations),
@@ -44,30 +48,34 @@ impl TextBlock {
     }
 
     /// Add a cache control to this text block.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self
     }
 
     /// Add a single citation to this text block.
+    #[must_use]
     pub fn with_citation(mut self, citation: TextCitation) -> Self {
         self.citations.get_or_insert_with(Vec::new).push(citation);
         self
     }
 
     /// Returns the number of citations if any, or 0 if there are none.
+    #[must_use]
     pub fn citation_count(&self) -> usize {
         self.citations.as_ref().map_or(0, |c| c.len())
     }
 
     /// Returns true if this text block has citations.
+    #[must_use]
     pub fn has_citations(&self) -> bool {
         self.citation_count() > 0
     }
 }
 
 impl FromStr for TextBlock {
-    type Err = std::convert::Infallible;
+    type Err = Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self::new(s))
@@ -103,8 +111,10 @@ mod tests {
 
         let citation = TextCitation::CharLocation(char_location);
 
-        let text_block =
-            TextBlock::with_citations("This is some text content with a citation.", vec![citation]);
+        let text_block = TextBlock::new_with_citations(
+            "This is some text content with a citation.",
+            vec![citation],
+        );
 
         // For this test, we'll directly check the structure instead of the exact string
         // since the citation order might change and cause test flakiness
@@ -179,7 +189,7 @@ mod tests {
 
         let citation = TextCitation::CharLocation(char_location);
 
-        let text_block = TextBlock::with_citations("Text with citation", vec![citation]);
+        let text_block = TextBlock::new_with_citations("Text with citation", vec![citation]);
 
         assert_eq!(text_block.citation_count(), 1);
         assert!(text_block.has_citations());

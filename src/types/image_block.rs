@@ -5,6 +5,7 @@ use crate::types::{Base64ImageSource, CacheControlEphemeral, FileSource, UrlImag
 /// The source type for an image block, which can be either Base64 encoded or a URL.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum ImageSource {
     /// A Base64 encoded image source.
     #[serde(rename = "base64")]
@@ -20,7 +21,7 @@ pub enum ImageSource {
 }
 
 /// What to do with an image larger than the supported size.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum OversizedImage {
     /// Downsize the image to fit.
@@ -31,14 +32,25 @@ pub enum OversizedImage {
 
 /// Transformations applied to an image before the model sees it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ImageTransformations {
     /// How oversized images are handled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oversized_image: Option<OversizedImage>,
 }
 
+impl ImageTransformations {
+    /// Set how an image larger than the supported size is handled.
+    #[must_use]
+    pub fn with_oversized_image(mut self, oversized_image: OversizedImage) -> Self {
+        self.oversized_image = Some(oversized_image);
+        self
+    }
+}
+
 /// Parameters for an image block.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct ImageBlock {
     /// The source of the image.
     pub source: ImageSource,
@@ -54,6 +66,7 @@ pub struct ImageBlock {
 
 impl ImageBlock {
     /// Create a new `ImageBlock` with the given source.
+    #[must_use]
     pub fn new(source: ImageSource) -> Self {
         Self {
             source,
@@ -63,27 +76,32 @@ impl ImageBlock {
     }
 
     /// Create a new `ImageBlock` with a Base64 image source.
+    #[must_use]
     pub fn new_with_base64(source: Base64ImageSource) -> Self {
         Self::new(ImageSource::Base64(source))
     }
 
     /// Create a new `ImageBlock` with a URL image source.
+    #[must_use]
     pub fn new_with_url(source: UrlImageSource) -> Self {
         Self::new(ImageSource::Url(source))
     }
 
     /// Create a new `ImageBlock` referencing a file uploaded through the Files API.
+    #[must_use]
     pub fn from_file_id(file_id: impl Into<String>) -> Self {
         Self::new(ImageSource::File(FileSource::new(file_id)))
     }
 
     /// Set the image transformations.
+    #[must_use]
     pub fn with_transformations(mut self, transformations: ImageTransformations) -> Self {
         self.transformations = Some(transformations);
         self
     }
 
     /// Add a cache control to this image block.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self
@@ -99,7 +117,7 @@ mod tests {
     #[test]
     fn image_block_with_base64() {
         let base64_source = Base64ImageSource::new(
-            "data:image/jpeg;base64,SGVsbG8gd29ybGQ=".to_string(),
+            "data:image/jpeg;base64,SGVsbG8gd29ybGQ=",
             ImageMediaType::Jpeg,
         );
 
@@ -120,7 +138,7 @@ mod tests {
 
     #[test]
     fn image_block_with_url() {
-        let url_source = UrlImageSource::new("https://example.com/image.jpg".to_string());
+        let url_source = UrlImageSource::new("https://example.com/image.jpg");
 
         let image_block = ImageBlock::new_with_url(url_source);
         let json = to_value(&image_block).unwrap();
@@ -138,7 +156,7 @@ mod tests {
 
     #[test]
     fn image_block_with_cache_control() {
-        let url_source = UrlImageSource::new("https://example.com/image.jpg".to_string());
+        let url_source = UrlImageSource::new("https://example.com/image.jpg");
         let cache_control = CacheControlEphemeral::new();
 
         let image_block = ImageBlock::new_with_url(url_source).with_cache_control(cache_control);

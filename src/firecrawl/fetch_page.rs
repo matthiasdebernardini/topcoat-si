@@ -6,12 +6,10 @@ use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::web_search::{
-    Filter, error_result, is_blocked, normalize_domains, push_text, search_result, truncate,
-};
-use super::{FirecrawlClient, ScrapeOptions, ScrapeRequest, ScrapeResponse};
+use super::filter::Filter;
+use super::{FirecrawlClient, ScrapeOptions, ScrapeRequest, ScrapeResponse, tool_result};
+use crate::client_tool::ClientTool;
 use crate::error::{Error, Result};
-use crate::tool::ClientTool;
 use crate::types::{TextBlock, ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock};
 
 const FETCH_PAGE_TOOL_NAME: &str = "fetch_page";
@@ -38,6 +36,7 @@ pub struct FirecrawlFetchPage {
 impl FirecrawlFetchPage {
     /// Wrap a client with the defaults: main content only, cached copies up to an hour old, a
     /// 30 second scrape timeout, at most 20 PDF pages, markdown cut at 30,000 characters.
+    #[must_use]
     pub fn new(client: FirecrawlClient) -> Self {
         Self {
             client,
@@ -53,6 +52,7 @@ impl FirecrawlFetchPage {
     }
 
     /// Characters of page markdown kept.
+    #[must_use]
     pub fn with_max_content_chars(mut self, max_content_chars: usize) -> Self {
         self.max_content_chars = max_content_chars;
         self
@@ -60,18 +60,21 @@ impl FirecrawlFetchPage {
 
     /// How pages are scraped. Replaces every default, including the PDF page cap that bounds
     /// credits.
+    #[must_use]
     pub fn with_scrape_options(mut self, scrape_options: ScrapeOptions) -> Self {
         self.scrape_options = scrape_options;
         self
     }
 
     /// Only ever fetch pages on these hostnames.
+    #[must_use]
     pub fn with_allowed_domains(mut self, domains: Vec<String>) -> Self {
         self.allowed_domains = domains;
         self
     }
 
     /// Never fetch pages on these hostnames.
+    #[must_use]
     pub fn with_blocked_domains(mut self, domains: Vec<String>) -> Self {
         self.blocked_domains = domains;
         self
@@ -87,28 +90,16 @@ impl FirecrawlFetchPage {
             ));
         }
         self.scrape_options.validate()?;
-        let parse = |domains: &[String], param: &str| {
-            normalize_domains(domains)
-                .map_err(|bad| invalid(format!("{param} entry {bad:?} is not a hostname"), param))
-        };
-        let allowed = parse(&self.allowed_domains, "allowed_domains")?;
-        let blocked = parse(&self.blocked_domains, "blocked_domains")?;
-        if !allowed.is_empty() && allowed.iter().all(|a| is_blocked(a, &blocked)) {
-            return Err(invalid(
-                "every allowed domain is also blocked".to_string(),
-                "allowed_domains",
-            ));
-        }
-        Ok(Filter { allowed, blocked })
+        Filter::try_new(&self.allowed_domains, &self.blocked_domains)
     }
 
     async fn execute(&self, tool_use: &ToolUseBlock) -> Result<ToolResultBlock> {
         let filter = self.checked_config()?;
         let id = tool_use.id.clone();
-        let url = match serde_json::from_value::<ModelInput>(tool_use.input.clone()) {
+        let url = match ModelInput::deserialize(&tool_use.input) {
             Ok(input) => input.url.trim().to_string(),
             Err(error) => {
-                return Ok(error_result(
+                return Ok(ToolResultBlock::error(
                     id,
                     format!(
                         "Invalid fetch_page input: {error}. Send an object with only a \"url\" \
@@ -119,7 +110,7 @@ impl FirecrawlFetchPage {
         };
         Ok(match self.fetch(&url, &filter).await? {
             Ok(page) => self.result(id, &url, page),
-            Err(message) => error_result(id, message),
+            Err(message) => ToolResultBlock::error(id, message),
         })
     }
 
@@ -200,7 +191,7 @@ impl FirecrawlFetchPage {
             markdown: data
                 .markdown
                 .filter(|m| !m.trim().is_empty())
-                .map(|m| truncate(&m, self.max_content_chars)),
+                .map(|m| tool_result::truncate(&m, self.max_content_chars)),
             pdf_note,
             warning: data
                 .warning
@@ -219,10 +210,10 @@ impl FirecrawlFetchPage {
         };
         let mut content: Vec<TextBlock> =
             chunks(&markdown).into_iter().map(TextBlock::new).collect();
-        push_text(&mut content, page.pdf_note);
-        push_text(&mut content, page.warning);
+        tool_result::push_text(&mut content, page.pdf_note);
+        tool_result::push_text(&mut content, page.warning);
         // A tool result holding a search result may hold nothing else.
-        ToolResultBlock::new(id).with_array_content(vec![search_result(
+        ToolResultBlock::new(id).with_array_content(vec![tool_result::search_result(
             page.source,
             page.title,
             content,

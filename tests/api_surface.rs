@@ -1,7 +1,5 @@
 //! Compile-time and no-network check of the API surface the topcoat app relies on.
 
-use std::str::FromStr;
-
 use topcoat_si::{
     AccumulatingStream, Anthropic, ContentBlock, FirecrawlClient, FirecrawlWebSearch, HttpMetadata,
     Message, MessageCreateParams, MessageParam, Model, StopReason,
@@ -27,7 +25,7 @@ fn text_of(message: &Message) -> String {
         .content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text(t) => Some(t.text.clone()),
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect()
@@ -35,22 +33,24 @@ fn text_of(message: &Message) -> String {
 
 #[test]
 fn topcoat_surface_compiles_and_builds_without_network() {
-    let client = Anthropic::new(Some("test-key".to_string()))
+    use std::str::FromStr;
+
+    let client = Anthropic::try_new(Some("test-key".to_string()))
         .unwrap()
         .with_base_url("http://127.0.0.1:9".into())
         .unwrap()
         .with_max_retries(0);
 
-    let known = Model::from_str("claude-sonnet-5-5").unwrap_or_else(|()| Model::Custom("x".into()));
+    let Ok(known) = Model::from_str("claude-sonnet-5-5");
     assert!(matches!(known, Model::Known(_)));
-    let custom = Model::from_str("some-custom-model")
-        .unwrap_or_else(|()| Model::Custom("some-custom-model".to_string()));
+    let Ok(custom) = Model::from_str("some-custom-model");
     assert!(matches!(custom, Model::Custom(ref name) if name == "some-custom-model"));
 
     let search = FirecrawlWebSearch::new(
-        FirecrawlClient::new("fc-test-key")
+        FirecrawlClient::try_new("fc-test-key")
             .unwrap()
-            .with_base_url("http://127.0.0.1:9"),
+            .with_base_url("http://127.0.0.1:9")
+            .unwrap(),
     );
     let params = MessageCreateParams::new_streaming(
         1024,
@@ -72,11 +72,9 @@ fn topcoat_surface_compiles_and_builds_without_network() {
 
 #[test]
 fn api_error_exposes_http_metadata() {
-    let metadata = HttpMetadata {
-        status: 500,
-        request_id: Some("req_123".to_string()),
-        ..HttpMetadata::default()
-    };
+    let mut metadata = HttpMetadata::default();
+    metadata.status = 500;
+    metadata.request_id = Some("req_123".to_string());
     let err = topcoat_si::Error::from_http("internal error", metadata, None);
     assert!(err.metadata().is_some());
     let formatted = format!("{:?}", err.metadata());

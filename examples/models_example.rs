@@ -1,14 +1,15 @@
-/// Example demonstrating how to use the Models API
-///
-/// This example shows how to:
-/// - List available models with pagination
-/// - Retrieve information about a specific model
+//! Example demonstrating how to use the Models API
+//!
+//! This example shows how to:
+//! - List available models with pagination
+//! - Retrieve information about a specific model
+
 use topcoat_si::{Anthropic, ModelListParams};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize the client
-    let client = Anthropic::new(None)?;
+    let client = Anthropic::try_new(None)?;
 
     // List all models
     println!("Listing all available models:");

@@ -1,19 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 /// An event that represents the end of a message in a streaming response.
-#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Copy, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct MessageStopEvent {}
 
 impl MessageStopEvent {
     /// Create a new `MessageStopEvent`.
+    #[must_use]
     pub fn new() -> Self {
         Self {}
-    }
-}
-
-impl Default for MessageStopEvent {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

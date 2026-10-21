@@ -1,7 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::types::open_union::{from_value, type_tag};
+use crate::types::open_union;
 use crate::types::{
     CitationCharLocation, CitationContentBlockLocation, CitationPageLocation,
     CitationSearchResultLocation,
@@ -13,6 +13,7 @@ use crate::types::{
 /// in a text block's content.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum TextCitation {
     /// A character-based location citation
     #[serde(rename = "char_location")]
@@ -41,72 +42,76 @@ impl<'de> Deserialize<'de> for TextCitation {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        match type_tag::<D::Error>(&value)?.as_str() {
-            "char_location" => from_value(value).map(TextCitation::CharLocation),
-            "page_location" => from_value(value).map(TextCitation::PageLocation),
-            "content_block_location" => from_value(value).map(TextCitation::ContentBlockLocation),
-            "search_result_location" => from_value(value).map(TextCitation::SearchResultLocation),
-            _ => Ok(TextCitation::Unknown(value)),
+        match open_union::type_tag::<D::Error>(&value)?.as_str() {
+            "char_location" => open_union::from_value(value).map(TextCitation::CharLocation),
+            "page_location" => open_union::from_value(value).map(TextCitation::PageLocation),
+            "content_block_location" => {
+                open_union::from_value(value).map(TextCitation::ContentBlockLocation)
+            }
+            "search_result_location" => {
+                open_union::from_value(value).map(TextCitation::SearchResultLocation)
+            }
+            tag => {
+                open_union::warn_unknown("TextCitation", tag);
+                Ok(TextCitation::Unknown(value))
+            }
         }
     }
 }
 
 impl TextCitation {
     /// Creates a new character-based location citation
+    #[must_use]
     pub fn char_location(
-        cited_text: String,
+        cited_text: impl Into<String>,
         document_index: i32,
         start_char_index: i32,
         end_char_index: i32,
         document_title: Option<String>,
     ) -> Self {
-        let char_location = CitationCharLocation {
+        Self::CharLocation(CitationCharLocation::new(
             cited_text,
             document_index,
-            document_title,
-            end_char_index,
             start_char_index,
-            file_id: None,
-        };
-        Self::CharLocation(char_location)
+            end_char_index,
+            document_title,
+        ))
     }
 
     /// Creates a new page-based location citation
+    #[must_use]
     pub fn page_location(
-        cited_text: String,
+        cited_text: impl Into<String>,
         document_index: i32,
         start_page_number: i32,
         end_page_number: i32,
         document_title: Option<String>,
     ) -> Self {
-        let page_location = CitationPageLocation {
+        Self::PageLocation(CitationPageLocation::new(
             cited_text,
             document_index,
-            document_title,
-            end_page_number,
             start_page_number,
-            file_id: None,
-        };
-        Self::PageLocation(page_location)
+            end_page_number,
+            document_title,
+        ))
     }
 
     /// Creates a new content block-based location citation
+    #[must_use]
     pub fn content_block_location(
-        cited_text: String,
+        cited_text: impl Into<String>,
         document_index: i32,
         start_block_index: i32,
         end_block_index: i32,
         document_title: Option<String>,
     ) -> Self {
-        let content_block_location = CitationContentBlockLocation {
+        Self::ContentBlockLocation(CitationContentBlockLocation::new(
             cited_text,
             document_index,
-            document_title,
-            end_block_index,
             start_block_index,
-            file_id: None,
-        };
-        Self::ContentBlockLocation(content_block_location)
+            end_block_index,
+            document_title,
+        ))
     }
 }
 
@@ -220,7 +225,7 @@ mod tests {
     #[test]
     fn char_location_method() {
         let citation = TextCitation::char_location(
-            "example text".to_string(),
+            "example text",
             0,
             0,
             12,
@@ -243,7 +248,7 @@ mod tests {
     #[test]
     fn page_location_method() {
         let citation = TextCitation::page_location(
-            "example text".to_string(),
+            "example text",
             0,
             3,
             5,
@@ -266,7 +271,7 @@ mod tests {
     #[test]
     fn content_block_location_method() {
         let citation = TextCitation::content_block_location(
-            "example text".to_string(),
+            "example text",
             0,
             2,
             4,
@@ -288,7 +293,7 @@ mod tests {
 
     #[test]
     fn optional_fields_are_omitted() {
-        let citation = TextCitation::char_location("example text".to_string(), 0, 0, 12, None);
+        let citation = TextCitation::char_location("example text", 0, 0, 12, None);
 
         let json_value = serde_json::to_value(&citation).unwrap();
         let expected = json!({

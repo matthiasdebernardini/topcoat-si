@@ -7,6 +7,7 @@ use crate::types::CacheControlEphemeral;
 /// The variant is chosen by the [`ToolUnionParam`](crate::ToolUnionParam) variant;
 /// the matching constructor sets the expected name.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct ToolSearchTool {
     /// Name of the tool: `tool_search_tool_regex` or `tool_search_tool_bm25`.
     pub name: String,
@@ -18,6 +19,7 @@ pub struct ToolSearchTool {
 
 impl ToolSearchTool {
     /// Creates a tool search tool with the given name.
+    #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -26,16 +28,19 @@ impl ToolSearchTool {
     }
 
     /// Creates the regex variant (`tool_search_tool_regex`).
+    #[must_use]
     pub fn regex() -> Self {
         Self::new("tool_search_tool_regex")
     }
 
     /// Creates the BM25 variant (`tool_search_tool_bm25`).
+    #[must_use]
     pub fn bm25() -> Self {
         Self::new("tool_search_tool_bm25")
     }
 
     /// Sets the cache control.
+    #[must_use]
     pub fn with_cache_control(mut self, cache_control: CacheControlEphemeral) -> Self {
         self.cache_control = Some(cache_control);
         self

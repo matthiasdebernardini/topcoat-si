@@ -1,8 +1,8 @@
 //! A tool loop: call Claude, run the client tools it asks for, send the results back, repeat.
 
-use crate::client::Anthropic;
+use crate::anthropic::Anthropic;
+use crate::client_tool::ClientTool;
 use crate::error::{Error, Result};
-use crate::tool::ClientTool;
 use crate::types::{
     ContentBlock, Message, MessageCreateParams, MessageParam, MessageRole, StopReason, ToolChoice,
     ToolResultBlock, ToolUnionParam, ToolUseBlock,
@@ -14,7 +14,8 @@ use crate::types::{
 /// gives the cost of the whole run. If the run ended on the turn budget while Claude was still
 /// calling tools, the final assistant turn holds `tool_use` blocks with no answers yet: answer
 /// them before sending `messages` again.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ToolRun {
     /// The last response Claude sent; its `stop_reason` says why the run ended.
     pub message: Message,
@@ -23,6 +24,28 @@ pub struct ToolRun {
     /// The whole conversation, starting with the caller's messages and ending with the final
     /// assistant turn, ready to extend with a new user message and send again.
     pub messages: Vec<MessageParam>,
+}
+
+impl ToolRun {
+    /// The text blocks of the final message concatenated with no separator, or `None` when they
+    /// hold no non-whitespace text.
+    ///
+    /// `None` is a real outcome: on the forced last turn Sonnet can reply with only a thinking
+    /// block.
+    pub fn text(&self) -> Option<String> {
+        let text: String = self
+            .message
+            .content
+            .iter()
+            .filter_map(ContentBlock::as_text)
+            .map(|block| block.text.as_str())
+            .collect();
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
 }
 
 impl Anthropic {
@@ -46,6 +69,9 @@ impl Anthropic {
     ///
     /// Fails with a validation error, before any request, when `max_turns` is 0 or two tools share
     /// a name, counting the named tools already in `params.tools` (an MCP toolset has no name).
+    ///
+    /// Read the answer with [`ToolRun::text`] and handle `None`: when the last turn is forced to
+    /// answer in text, Sonnet can still reply with only a thinking block.
     pub async fn run_tools(
         &self,
         mut params: MessageCreateParams,
@@ -92,7 +118,7 @@ impl Anthropic {
                 caller_tool_choice.clone()
             };
 
-            let response = self.send(params.clone()).await?;
+            let response = self.send(&params).await?;
             params.messages.push(MessageParam::new_with_blocks(
                 response.content.clone(),
                 MessageRole::Assistant,
@@ -116,12 +142,10 @@ impl Anthropic {
                     for tool_use in tool_uses {
                         let result = match tools.iter().find(|tool| tool.name() == tool_use.name) {
                             Some(tool) => tool.call(tool_use).await?,
-                            None => ToolResultBlock::new(tool_use.id.clone())
-                                .with_string_content(format!(
-                                    "No tool named {} is available.",
-                                    tool_use.name
-                                ))
-                                .with_error(true),
+                            None => ToolResultBlock::error(
+                                tool_use.id.clone(),
+                                format!("No tool named {} is available.", tool_use.name),
+                            ),
                         };
                         results.push(ContentBlock::ToolResult(result));
                     }
@@ -172,11 +196,13 @@ fn tool_name(tool: &ToolUnionParam) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use futures::future::BoxFuture;
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::test_support::{Canned, serve};
+    use crate::test_support::{Canned, Recorded, serve};
     use crate::types::{KnownModel, Model};
 
     /// Answers with its input, or fails with an authentication error when `fail` is set.
@@ -238,7 +264,7 @@ mod tests {
     }
 
     fn client(base_url: String) -> Anthropic {
-        Anthropic::new(Some("test_key".to_string()))
+        Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap()
@@ -253,7 +279,7 @@ mod tests {
         )
     }
 
-    fn bodies(recorded: &std::sync::Mutex<Vec<crate::test_support::Recorded>>) -> Vec<Value> {
+    fn bodies(recorded: &Mutex<Vec<Recorded>>) -> Vec<Value> {
         recorded
             .lock()
             .unwrap()
@@ -493,5 +519,31 @@ mod tests {
         assert_eq!(bodies[0]["tool_choice"], json!({"type": "auto"}));
         assert!(bodies[0].get("tools").is_none(), "{}", bodies[0]);
         assert_eq!(run.message.stop_reason, Some(StopReason::EndTurn));
+    }
+
+    #[tokio::test]
+    async fn text_joins_the_final_text_blocks_and_is_none_without_text() {
+        let (base_url, _recorded) = serve(vec![
+            reply(
+                "end_turn",
+                json!([
+                    {"type": "thinking", "thinking": "hm", "signature": "sig"},
+                    {"type": "text", "text": "Rust "},
+                    {"type": "text", "text": "1.95."}
+                ]),
+            ),
+            reply(
+                "end_turn",
+                json!([{"type": "thinking", "thinking": "hm", "signature": "sig"}]),
+            ),
+        ])
+        .await;
+        let client = client(base_url);
+
+        let run = client.run_tools(params(), &[], 1).await.unwrap();
+        assert_eq!(run.text().as_deref(), Some("Rust 1.95."));
+
+        let run = client.run_tools(params(), &[], 1).await.unwrap();
+        assert_eq!(run.text(), None);
     }
 }

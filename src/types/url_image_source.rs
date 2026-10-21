@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// This type is used to provide an image to the model from a URL.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct UrlImageSource {
     /// The URL of the image.
     pub url: String,
@@ -11,7 +12,8 @@ pub struct UrlImageSource {
 
 impl UrlImageSource {
     /// Creates a new UrlImageSource with the specified URL.
-    pub fn new<S: Into<String>>(url: S) -> Self {
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
         Self { url: url.into() }
     }
 }

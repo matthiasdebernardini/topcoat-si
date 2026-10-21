@@ -1,8 +1,10 @@
-use crate::types::{CacheCreation, Model};
-use serde::{Deserialize, Serialize};
+use crate::types::{CacheCreation, Model, open_union};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 /// Token counts for an individual inference or compaction iteration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct IterationUsage {
     /// Model for this iteration, when supplied by the API.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -25,8 +27,9 @@ pub struct IterationUsage {
 }
 
 /// Each known API iteration kind, accepting future kinds without losing the message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum UsageIteration {
     /// Primary inference; model may be absent or null.
     Message(IterationUsage),
@@ -37,8 +40,23 @@ pub enum UsageIteration {
     /// Advisor sub-inference.
     AdvisorMessage(IterationUsage),
     /// An iteration introduced by a newer API.
-    #[serde(other)]
     Unknown,
+}
+
+impl<'de> Deserialize<'de> for UsageIteration {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        match open_union::type_tag::<D::Error>(&value)?.as_str() {
+            "message" => open_union::from_value(value).map(Self::Message),
+            "fallback_message" => open_union::from_value(value).map(Self::FallbackMessage),
+            "compaction" => open_union::from_value(value).map(Self::Compaction),
+            "advisor_message" => open_union::from_value(value).map(Self::AdvisorMessage),
+            tag => {
+                open_union::warn_unknown("UsageIteration", tag);
+                Ok(Self::Unknown)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

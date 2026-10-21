@@ -4,10 +4,10 @@ use topcoat_si::{Anthropic, KnownModel, MessageCreateParams, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create a client using the API key from the environment variable TOPCOAT_SI_API_KEY
-    let client = Anthropic::new(None)?;
+    // Create a client using the API key from TOPCOAT_SI_API_KEY or ANTHROPIC_API_KEY
+    let client = Anthropic::try_new(None)?;
 
-    // Create a streaming request with the new ergonomic API
+    // Create a streaming request from a prompt string
     let params = MessageCreateParams::simple_streaming(
         "Hello, I'm a human. Can you tell me about yourself?",
         KnownModel::ClaudeSonnet55,
