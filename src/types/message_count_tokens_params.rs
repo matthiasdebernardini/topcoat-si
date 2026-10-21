@@ -120,9 +120,10 @@ impl MessageCountTokensParams {
         }
     }
 
-    /// Rejects an `Unknown` role or speed read from a reply, which has no API value to send.
+    /// Rejects an `Unknown` role or speed read from a reply, which has no API value to send,
+    /// and the message shapes the API refuses with a 400.
     pub(crate) fn check_known_values(&self) -> crate::Result<()> {
-        message_param::check_roles(&self.messages)?;
+        message_param::check_turns(&self.messages)?;
         if self.speed == Some(InferenceSpeed::Unknown) {
             return Err(open_union::unknown_in_request("speed".to_string()));
         }

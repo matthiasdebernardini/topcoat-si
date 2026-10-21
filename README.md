@@ -120,15 +120,12 @@ let Ok(other) = "my-proxy-model".parse::<Model>();
 assert_eq!(other, Model::Custom("my-proxy-model".to_string()));
 ```
 
-The current models restrict some sampling and thinking settings:
+The current models restrict some thinking settings:
 
 | Setting | What the API accepts |
 |---|---|
 | thinking `enabled` | no model |
 | thinking `disabled` | Haiku 5.5 only, and not at effort `xhigh` or `max` |
-| `temperature` | only 1.0 |
-| `top_p` | only 0.99 or more |
-| `top_k` | no value at all |
 
 ### Streaming
 

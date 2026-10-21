@@ -123,7 +123,7 @@ where
 }
 
 const DEFAULT_API_URL: &str = "https://api.anthropic.com";
-const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+const ANTHROPIC_API_VERSION: &str = "2026-10-21";
 /// Total deadline for non-streaming requests; streams use a separate read timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
@@ -2277,7 +2277,7 @@ Connection: close\r\n\r\n{}",
 
         assert_eq!(headers1.len(), headers2.len());
         assert!(headers1.contains_key("x-api-key"));
-        assert!(headers1.contains_key("anthropic-version"));
+        assert_eq!(headers1["anthropic-version"], "2026-10-21");
         assert!(headers1.contains_key("content-type"));
     }
 
