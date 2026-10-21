@@ -9,13 +9,12 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValu
 use reqwest::redirect;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::time::sleep;
 
 use super::questions::WireQuestions;
 use super::{Choices, JevErrorCode, JevResponse, Levels, Outcome, Questions};
-use crate::backoff;
+use crate::backoff::{self, RetryPolicy};
 use crate::base_url;
-use crate::error::{Error, ErrorCode, HttpMetadata, RequestPhase, Result, map_reqwest_error};
+use crate::error::{Error, ErrorCode, ErrorKind, RequestPhase, Result, Service, map_reqwest_error};
 use crate::types::retry_after_from_headers;
 
 pub(super) const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
@@ -95,11 +94,12 @@ impl JevClient {
             ));
         }
         let mut authorization =
-            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| {
+            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
                 Error::validation(
                     "Jev API key contains characters not allowed in an HTTP header",
                     Some("api_key".to_string()),
                 )
+                .with_source(e)
             })?;
         authorization.set_sensitive(true);
         Ok(Self {
@@ -188,84 +188,74 @@ impl JevClient {
     ///
     /// `state` must be a string, object or array nested at most 64 deep, and the request body
     /// at most 32 MiB; the questions are checked as described on [`Questions`]. A failed check
-    /// sends nothing. Responses 408, 429 and every 5xx, connection failures and timeouts are
-    /// retried, honoring `Retry-After`; a `Retry-After` over 60 seconds, or a wait that would
-    /// pass the retry budget, returns the error at once.
+    /// sends nothing. Whatever [`Error::is_retryable`] accepts (408, 409, 429, 5xx, connection
+    /// failures, timeouts) is retried, except a response cut off mid-body, which Jev may already
+    /// have billed. Each wait is the backoff delay or `Retry-After`, whichever is longer; a
+    /// `Retry-After` over 60 seconds, or a wait that would pass the retry budget, returns the
+    /// error at once.
     pub async fn ask(&self, state: impl Into<Value>, questions: &Questions) -> Result<JevResponse> {
         let state: Value = state.into();
         questions.validate()?;
         validate_state(&state)?;
-        let request_body = serde_json::to_vec(&WireRequest {
+        let request_body = serialize_body(&WireRequest {
             model: &self.model,
             state: &state,
             questions: WireQuestions(&questions.items),
-        })
-        .map_err(|_| Error::serialization("Failed to serialize the Jev request", None))?;
-        if request_body.len() > MAX_BODY_BYTES {
-            return Err(Error::validation(
-                format!(
-                    "Jev request body is {} bytes, over the 32 MiB limit",
-                    request_body.len()
-                ),
-                Some("state".to_string()),
-            ));
-        }
+        })?;
         let request_body = Bytes::from(request_body);
         let url = format!("{}{PATH}", self.base_url);
         let started = Instant::now();
-        let mut attempt = 0;
-        loop {
-            let remaining = self.retry_budget.saturating_sub(started.elapsed());
-            let timeout = self.timeout.min(remaining);
-            let error = match self.send_once(&url, &request_body, timeout, attempt).await {
-                Ok((status, request_id, response_body)) => {
-                    tracing::debug!(
-                        target: "topcoat_si::jev",
-                        status,
-                        attempt = attempt + 1,
-                        request_id = request_id.as_deref(),
-                        model = %self.model,
-                        latency_seconds = started.elapsed().as_secs_f64(),
-                        "Jev answered"
-                    );
-                    return JevResponse::parse(
-                        request_body,
-                        response_body,
-                        request_id,
-                        attempt + 1,
-                    );
-                }
-                Err(error) => error,
-            };
-            let retry_after = error.retry_after();
-            let delay = retry_after.unwrap_or_else(|| backoff::next(attempt));
-            let give_up = attempt >= self.max_retries
-                || !is_retryable(&error)
-                || retry_after.is_some_and(|d| d > MAX_RETRY_AFTER)
-                || started.elapsed() + delay >= self.retry_budget;
-            if give_up {
+        let policy = RetryPolicy {
+            max_retries: self.max_retries,
+            max_retry_after: MAX_RETRY_AFTER,
+            budget: Some(self.retry_budget),
+            resend_timeouts: true,
+            resend_interrupted: false,
+        };
+        let retried = backoff::retry(
+            &policy,
+            |attempt, remaining| {
+                let timeout = self.timeout.min(remaining.unwrap_or(self.retry_budget));
+                self.send_once(&url, &request_body, timeout, attempt)
+            },
+            |error, attempt, delay| {
                 tracing::debug!(
                     target: "topcoat_si::jev",
-                    status = error.status_code(),
+                    status = error.status(),
                     attempt = attempt + 1,
+                    request_id = error.request_id(),
+                    model = %self.model,
+                    sleep_seconds = delay.as_secs_f64(),
+                    "Retrying Jev request"
+                );
+            },
+        )
+        .await;
+        match retried.result {
+            Ok((status, request_id, response_body)) => {
+                tracing::debug!(
+                    target: "topcoat_si::jev",
+                    status,
+                    attempt = retried.attempts,
+                    request_id = request_id.as_deref(),
+                    model = %self.model,
+                    latency_seconds = started.elapsed().as_secs_f64(),
+                    "Jev answered"
+                );
+                JevResponse::parse(request_body, response_body, request_id, retried.attempts)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    target: "topcoat_si::jev",
+                    status = error.status(),
+                    attempt = retried.attempts,
                     request_id = error.request_id(),
                     model = %self.model,
                     latency_seconds = started.elapsed().as_secs_f64(),
                     "Jev request failed"
                 );
-                return Err(error);
+                Err(error)
             }
-            tracing::debug!(
-                target: "topcoat_si::jev",
-                status = error.status_code(),
-                attempt = attempt + 1,
-                request_id = error.request_id(),
-                model = %self.model,
-                sleep_seconds = delay.as_secs_f64(),
-                "Retrying Jev request"
-            );
-            sleep(delay).await;
-            attempt += 1;
         }
     }
 
@@ -338,16 +328,28 @@ impl JevClient {
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         let request_id = request_id(&headers);
-        // Headers arrived, so a body failure keeps the real status and the request id.
-        let bytes = response.bytes().await.map_err(|e| {
-            map_reqwest_error(e, RequestPhase::Body).with_http_metadata(HttpMetadata {
-                status,
-                error_code: None,
-                request_id: request_id.clone(),
-                retry_after: retry_after_from_headers(&headers),
-            })
-        })?;
-        if !(200..300).contains(&status) {
+        let success = (200..300).contains(&status);
+        // Headers arrived, so a body failure keeps the request id. An error status whose body
+        // failed is still that status, so it stays retryable as one.
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) if success => {
+                return Err(map_reqwest_error(e, RequestPhase::Body).with_request_id(request_id));
+            }
+            Err(e) => {
+                let error = Error::http_status(
+                    Service::Jev,
+                    status,
+                    None,
+                    None,
+                    None,
+                    request_id,
+                    retry_after_from_headers(&headers),
+                );
+                return Err(error.with_source(e));
+            }
+        };
+        if !success {
             return Err(http_error(status, &headers, &bytes, request_id));
         }
         Ok((status, request_id, bytes))
@@ -362,18 +364,7 @@ fn http_client(base_url: &str) -> Result<ReqwestClient> {
         .user_agent(USER_AGENT);
     base_url::with_proxy_rule(builder, base_url)
         .build()
-        .map_err(|e| {
-            Error::http_client(
-                format!("Failed to build HTTP client: {e}"),
-                Some(Box::new(e)),
-            )
-        })
-}
-
-/// Jev's transient statuses (408, 429, every 5xx), connection failures and timeouts.
-fn is_retryable(error: &Error) -> bool {
-    matches!(error, Error::Connection { .. } | Error::Timeout { .. })
-        || matches!(error.status_code(), Some(408 | 429 | 500..=599))
+        .map_err(|e| Error::validation("Failed to build HTTP client", None).with_source(e))
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -425,17 +416,16 @@ fn http_error(status: u16, headers: &HeaderMap, body: &[u8], request_id: Option<
     } else {
         detail
     };
-    let message = match detail {
-        Some(detail) => format!("Jev returned {status}: {detail}"),
-        None => format!("Jev returned {status}"),
-    };
-    let metadata = HttpMetadata {
+    // Display already shows the service and status, so the message is Jev's own words.
+    Error::http_status(
+        Service::Jev,
         status,
-        error_code: error_code.map(ErrorCode::Jev),
+        detail.map(|detail| truncate(&detail, MAX_ERROR_CHARS)),
+        None,
+        error_code.map(ErrorCode::Jev),
         request_id,
-        retry_after: retry_after_from_headers(headers),
-    };
-    Error::from_http(truncate(&message, MAX_ERROR_CHARS), metadata, None)
+        retry_after_from_headers(headers),
+    )
 }
 
 fn validation_detail(items: &[Value]) -> String {
@@ -469,6 +459,26 @@ fn truncate(text: &str, max_chars: usize) -> String {
         Some((end, _)) => text[..end].to_string(),
         None => text.to_string(),
     }
+}
+
+/// Serializes the request, keeping the serde error as the source, and enforces the body cap.
+pub(super) fn serialize_body(request: &impl Serialize) -> Result<Vec<u8>> {
+    let body = serde_json::to_vec(request).map_err(|e| {
+        Error::validation("Failed to serialize the Jev request", None).with_source(e)
+    })?;
+    if body.len() > MAX_BODY_BYTES {
+        return Err(Error::new(
+            ErrorKind::RequestTooLarge {
+                size: body.len(),
+                limit: MAX_BODY_BYTES,
+            },
+            format!(
+                "Jev request body is {} bytes, over the 32 MiB limit",
+                body.len()
+            ),
+        ));
+    }
+    Ok(body)
 }
 
 fn validate_state(state: &Value) -> Result<()> {

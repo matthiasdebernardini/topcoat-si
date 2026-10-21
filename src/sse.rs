@@ -8,10 +8,10 @@ use futures::stream::{self, Stream, StreamExt};
 use serde::Deserialize;
 use std::time::Instant;
 
-use crate::error::RequestPhase;
+use crate::error::{RequestPhase, Service, describe_json_error};
 use crate::observability;
 use crate::{
-    ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent, Error, ErrorCode,
+    ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent, Error, ErrorKind,
     ErrorType, MessageDeltaEvent, MessageStartEvent, MessageStopEvent, MessageStreamEvent, Result,
 };
 
@@ -95,6 +95,10 @@ where
             match extract_event(&state.buffer) {
                 Ok(Some((event, remaining))) => {
                     state.buffer = remaining;
+                    let Some(event) = event else {
+                        // Nothing to dispatch, such as a comment-only frame.
+                        continue;
+                    };
                     match &event {
                         Ok(_) => observability::stream_event(),
                         Err(_) => state.fail(),
@@ -114,9 +118,9 @@ where
             if state.buffer.len() > MAX_BUFFER_SIZE {
                 state.fail();
                 return Some((
-                    Err(Error::streaming(
+                    Err(Error::new(
+                        ErrorKind::Decode,
                         format!("SSE buffer size exceeded maximum limit: {MAX_BUFFER_SIZE} bytes"),
-                        None,
                     )),
                     (stream, state),
                 ));
@@ -152,10 +156,11 @@ where
                                     Err(error) => {
                                         state.fail();
                                         return Some((
-                                            Err(Error::encoding(
+                                            Err(Error::new(
+                                                ErrorKind::Decode,
                                                 "Invalid UTF-8 prefix in SSE stream",
-                                                Some(Box::new(error)),
-                                            )),
+                                            )
+                                            .with_source(error)),
                                             (stream, state),
                                         ));
                                     }
@@ -170,10 +175,8 @@ where
 
                             state.fail();
                             return Some((
-                                Err(Error::encoding(
-                                    format!("Invalid UTF-8 in stream: {utf8_error}"),
-                                    Some(Box::new(utf8_error)),
-                                )),
+                                Err(Error::new(ErrorKind::Decode, "Invalid UTF-8 in SSE stream")
+                                    .with_source(utf8_error)),
                                 (stream, state),
                             ));
                         }
@@ -187,9 +190,9 @@ where
                     if !state.pending_utf8.is_empty() {
                         state.fail();
                         return Some((
-                            Err(Error::encoding(
+                            Err(Error::new(
+                                ErrorKind::Decode,
                                 "Incomplete UTF-8 sequence at end of SSE stream",
-                                None,
                             )),
                             (stream, state),
                         ));
@@ -218,22 +221,22 @@ pub fn parse_message_stream_event(event: &SseEvent) -> Result<MessageStreamEvent
         "ping" => Ok(MessageStreamEvent::Ping),
         "message_start" => serde_json::from_str::<MessageStartEvent>(&event.data)
             .map(MessageStreamEvent::MessageStart)
-            .map_err(Into::into),
+            .map_err(|error| event_error(event, error)),
         "message_delta" => serde_json::from_str::<MessageDeltaEvent>(&event.data)
             .map(MessageStreamEvent::MessageDelta)
-            .map_err(Into::into),
+            .map_err(|error| event_error(event, error)),
         "message_stop" => serde_json::from_str::<MessageStopEvent>(&event.data)
             .map(MessageStreamEvent::MessageStop)
-            .map_err(Into::into),
+            .map_err(|error| event_error(event, error)),
         "content_block_start" => serde_json::from_str::<ContentBlockStartEvent>(&event.data)
             .map(MessageStreamEvent::ContentBlockStart)
-            .map_err(Into::into),
+            .map_err(|error| event_error(event, error)),
         "content_block_delta" => serde_json::from_str::<ContentBlockDeltaEvent>(&event.data)
             .map(MessageStreamEvent::ContentBlockDelta)
-            .map_err(Into::into),
+            .map_err(|error| event_error(event, error)),
         "content_block_stop" => serde_json::from_str::<ContentBlockStopEvent>(&event.data)
             .map(MessageStreamEvent::ContentBlockStop)
-            .map_err(Into::into),
+            .map_err(|error| event_error(event, error)),
         "error" => Err(parse_stream_error(&event.data)),
         name => {
             // Dropped by `process_message_stream_sse`; the event name is enough to spot it.
@@ -244,6 +247,9 @@ pub fn parse_message_stream_event(event: &SseEvent) -> Result<MessageStreamEvent
 }
 
 /// Process a stream of bytes into decoded Topcoat SI [`MessageStreamEvent`] values.
+///
+/// An error item carries [`Error::events_delivered`]: the number of events other than pings
+/// yielded before it. `Some(0)` means sending the request again is clean.
 pub fn process_message_stream_sse<S>(
     byte_stream: S,
 ) -> impl Stream<Item = Result<MessageStreamEvent>>
@@ -269,6 +275,17 @@ where
                 other => Some(other),
             })
         })
+        .scan(0_u64, |delivered, result| {
+            futures::future::ready(Some(match result {
+                Ok(event) => {
+                    if !matches!(event, MessageStreamEvent::Ping) {
+                        *delivered += 1;
+                    }
+                    Ok(event)
+                }
+                Err(error) => Err(error.with_events_delivered(*delivered)),
+            }))
+        })
         .fuse()
 }
 
@@ -286,7 +303,10 @@ fn decode(result: Result<SseEvent>) -> Result<MessageStreamEvent> {
 }
 
 /// Extract a complete SSE event from a buffer string with size validation.
-fn extract_event(buffer: &str) -> Result<Option<(Result<SseEvent>, String)>> {
+///
+/// The event is `None` when the frame has nothing to dispatch: only comments or fields other
+/// than `data`.
+fn extract_event(buffer: &str) -> Result<Option<(Option<Result<SseEvent>>, String)>> {
     let Some((event_end, delimiter_len)) = ["\n\n", "\r\n\r\n", "\r\r"]
         .iter()
         .filter_map(|delimiter| buffer.find(delimiter).map(|index| (index, delimiter.len())))
@@ -300,24 +320,24 @@ fn extract_event(buffer: &str) -> Result<Option<(Result<SseEvent>, String)>> {
 
     if event_text.len() > MAX_EVENT_SIZE {
         return Ok(Some((
-            Err(Error::streaming(
+            Some(Err(Error::new(
+                ErrorKind::Decode,
                 format!(
                     "SSE event size {} exceeds maximum limit of {} bytes",
                     event_text.len(),
                     MAX_EVENT_SIZE
                 ),
-                None,
-            )),
+            ))),
             rest,
         )));
     }
 
     if event_text.trim().is_empty() {
         return Ok(Some((
-            Ok(SseEvent {
+            Some(Ok(SseEvent {
                 event: String::new(),
                 data: String::new(),
-            }),
+            })),
             rest,
         )));
     }
@@ -327,79 +347,106 @@ fn extract_event(buffer: &str) -> Result<Option<(Result<SseEvent>, String)>> {
 
     for raw_line in event_text.split(['\r', '\n']) {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        if let Some(value) = parse_field_value(line, "event:") {
-            event_type = Some(value.trim().to_string());
-        } else if let Some(value) = parse_field_value(line, "data:") {
-            data_lines.push(value.to_string());
+        if line.is_empty() || line.starts_with(':') {
+            // A comment, such as a `: keepalive` line.
+            continue;
+        }
+        match parse_field(line) {
+            ("event", value) => {
+                event_type = Some(value.trim().to_string()).filter(|name| !name.is_empty());
+            }
+            ("data", value) => data_lines.push(value.to_string()),
+            // Any other field, such as `id` or `retry`, is ignored.
+            _ => {}
         }
     }
 
-    let Some(event) = event_type else {
-        return Ok(Some((
-            Err(Error::serialization(
-                "Malformed SSE event: missing event type line",
-                None,
-            )),
-            rest,
-        )));
-    };
-
     if data_lines.is_empty() {
-        return Ok(Some((
-            Err(Error::serialization(
-                "Malformed SSE event: missing data lines",
-                None,
-            )),
-            rest,
-        )));
+        // The SSE spec dispatches nothing for a frame without data.
+        return Ok(Some((None, rest)));
     }
 
     Ok(Some((
-        Ok(SseEvent {
-            event,
+        Some(Ok(SseEvent {
+            event: event_type.unwrap_or_else(|| "message".to_string()),
             data: data_lines.join("\n"),
-        }),
+        })),
         rest,
     )))
 }
 
-fn parse_field_value<'a>(line: &'a str, field: &str) -> Option<&'a str> {
-    line.strip_prefix(field)
-        .map(|value| value.strip_prefix(' ').unwrap_or(value))
+/// Splits an SSE line into its field name and value. A line without a colon is a field with an
+/// empty value; one space after the colon is dropped.
+fn parse_field(line: &str) -> (&str, &str) {
+    match line.split_once(':') {
+        Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+        None => (line, ""),
+    }
 }
 
-fn parse_stream_error(event_data: &str) -> Error {
-    match serde_json::from_str::<serde_json::Value>(event_data) {
-        Ok(error_json) => {
-            let error_object = error_json.get("error");
-            let error_type = error_object
-                .and_then(|error| error.get("type"))
-                .and_then(|value| ErrorType::deserialize(value).ok());
-            let message = error_object
-                .and_then(|error| error.get("message"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("Unknown stream error")
-                .to_string();
-            // A stream error event rarely carries a status, so it comes from the documented
-            // status of its type.
-            let status_code = error_object
-                .and_then(|error| error.get("status_code"))
-                .and_then(|value| value.as_u64())
-                .and_then(|value| u16::try_from(value).ok())
-                .unwrap_or_else(|| error_type.map_or(500, ErrorType::http_status));
-            let _retryable = error_object
-                .and_then(|error| error.get("retryable"))
-                .and_then(|value| value.as_bool());
+/// The error for an SSE event whose payload does not decode. It gives the byte count and where
+/// parsing failed, never the payload, and keeps no source, since serde's text quotes the payload.
+fn event_error(event: &SseEvent, error: serde_json::Error) -> Error {
+    Error::new(
+        ErrorKind::Decode,
+        format!(
+            "could not decode the {} event ({} bytes): {}",
+            event.event,
+            event.data.len(),
+            describe_json_error(&error)
+        ),
+    )
+}
 
-            Error::api(
-                status_code,
-                error_type.map(ErrorCode::Anthropic),
-                message,
-                error_json["request_id"].as_str().map(String::from),
-            )
-        }
-        Err(_) => Error::api(500, None, event_data.to_string(), None),
+/// The most payload text a stream error message copies, in bytes.
+const MAX_ERROR_TEXT_BYTES: usize = 300;
+
+/// `text` cut to [`MAX_ERROR_TEXT_BYTES`] at a character boundary.
+fn capped(text: &str) -> String {
+    if text.len() <= MAX_ERROR_TEXT_BYTES {
+        return text.to_string();
     }
+    let mut end = MAX_ERROR_TEXT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+/// Builds the error for an `error` event inside a stream.
+///
+/// The event has no HTTP status. A payload that is not JSON, or has no `error` object or message,
+/// still becomes an [`ErrorKind::Api`] error with no type, since the service did send an `error`
+/// event; the message then carries the start of the payload.
+fn parse_stream_error(event_data: &str) -> Error {
+    let payload = serde_json::from_str::<serde_json::Value>(event_data).ok();
+    let error_object = payload.as_ref().and_then(|payload| payload.get("error"));
+    let text = |key: &str| {
+        error_object
+            .and_then(|error| error.get(key))
+            .and_then(serde_json::Value::as_str)
+    };
+    let message = text("message")
+        .map(capped)
+        .unwrap_or_else(|| format!("unrecognized error event: {}", capped(event_data)));
+    let kind = ErrorKind::Api {
+        service: Service::Anthropic,
+        status: None,
+        error_type: error_object
+            .and_then(|error| error.get("type"))
+            .and_then(|value| ErrorType::deserialize(value).ok()),
+        error_code: None,
+        retry_after: None,
+        retryable: error_object
+            .and_then(|error| error.get("retryable"))
+            .and_then(serde_json::Value::as_bool),
+    };
+    let request_id = payload
+        .as_ref()
+        .and_then(|payload| payload.get("request_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+    Error::new(kind, message).with_request_id(request_id)
 }
 
 #[cfg(test)]
@@ -459,9 +506,10 @@ mod tests {
         ))]);
 
         let mut sse_stream = Box::pin(process_sse(stream));
-        let event = sse_stream.next().await.unwrap();
 
-        assert!(event.is_err());
+        // A line without a colon is a field with an empty value; this unknown field is ignored,
+        // and a frame without data dispatches nothing.
+        assert!(sse_stream.next().await.is_none());
     }
 
     #[tokio::test]
@@ -715,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_structured_error_events_with_status_code() {
+    fn structured_error_event_with_a_status_code_has_no_status() {
         let error_json = r#"{"error":{"type":"rate_limit","message":"Too many requests","status_code":429,"retryable":true}}"#;
         let err = parse_message_stream_event(&SseEvent {
             event: "error".to_string(),
@@ -723,22 +771,17 @@ mod tests {
         })
         .unwrap_err();
 
-        assert_eq!(err.status_code(), Some(429));
+        assert_eq!(err.status(), None);
         assert!(err.to_string().contains("Too many requests"));
     }
 
     #[test]
-    fn error_event_type_becomes_an_anthropic_error_code() {
-        let parse = |data: &str| {
-            parse_message_stream_event(&SseEvent::new("error", data))
-                .unwrap_err()
-                .metadata()
-                .and_then(|metadata| metadata.error_code.clone())
-        };
+    fn error_event_type_becomes_a_typed_error_type() {
+        let parse = |data: &str| api_parts(&error_event(data)).1;
         let (code, warnings) = crate::test_support::unknown_warnings(|| {
             parse(r#"{"error":{"type":"overloaded_error","message":"busy"}}"#)
         });
-        assert_eq!(code, Some(ErrorCode::Anthropic(ErrorType::OverloadedError)));
+        assert_eq!(code, Some(ErrorType::OverloadedError));
         assert_eq!(warnings, Vec::<String>::new());
 
         let (codes, warnings) = crate::test_support::unknown_warnings(|| {
@@ -747,90 +790,49 @@ mod tests {
                 parse(r#"{"error":{"type":"kettle_error","message":"hot"}}"#),
             ]
         });
-        assert_eq!(
-            codes,
-            [
-                Some(ErrorCode::Anthropic(ErrorType::Unknown)),
-                Some(ErrorCode::Anthropic(ErrorType::Unknown))
-            ]
-        );
+        assert_eq!(codes, [Some(ErrorType::Unknown), Some(ErrorType::Unknown)]);
         assert_eq!(warnings, ["rust_type=ErrorType tag=kettle_error"]);
 
         assert_eq!(parse("not json"), None);
     }
 
     #[test]
-    fn stream_error_status_follows_the_documented_status_of_its_type() {
-        /// Whether an error is the expected `Error` variant.
-        type IsVariant = fn(&Error) -> bool;
-        // (type, status, variant check, retryable)
-        let cases: [(&str, u16, IsVariant, bool); 13] = [
-            ("invalid_request_error", 400, Error::is_bad_request, false),
-            ("authentication_error", 401, Error::is_authentication, false),
+    fn stream_error_retryability_follows_its_type() {
+        // (type, parsed type, retryable)
+        let cases = [
             (
-                "billing_error",
-                402,
-                |e| matches!(e, Error::Api { .. }),
+                "invalid_request_error",
+                ErrorType::InvalidRequestError,
                 false,
             ),
-            ("permission_error", 403, Error::is_permission, false),
-            ("not_found_error", 404, Error::is_not_found, false),
             (
-                "conflict_error",
-                409,
-                |e| matches!(e, Error::Api { .. }),
-                true,
-            ),
-            (
-                "request_too_large",
-                413,
-                |e| matches!(e, Error::Api { .. }),
+                "authentication_error",
+                ErrorType::AuthenticationError,
                 false,
             ),
-            ("rate_limit_error", 429, Error::is_rate_limit, true),
-            (
-                "api_error",
-                500,
-                |e| matches!(e, Error::InternalServer { .. }),
-                true,
-            ),
-            (
-                "timeout_error",
-                504,
-                |e| matches!(e, Error::ServiceUnavailable { .. }),
-                true,
-            ),
-            (
-                "overloaded_error",
-                529,
-                |e| matches!(e, Error::Overloaded { .. }),
-                true,
-            ),
+            ("billing_error", ErrorType::BillingError, false),
+            ("permission_error", ErrorType::PermissionError, false),
+            ("not_found_error", ErrorType::NotFoundError, false),
+            ("conflict_error", ErrorType::ConflictError, false),
+            ("request_too_large", ErrorType::RequestTooLarge, false),
+            ("rate_limit_error", ErrorType::RateLimitError, true),
+            ("api_error", ErrorType::ApiError, true),
+            ("timeout_error", ErrorType::TimeoutError, true),
+            ("overloaded_error", ErrorType::OverloadedError, true),
             // The old undocumented aliases are unknown types now.
-            (
-                "rate_limit",
-                500,
-                |e| matches!(e, Error::InternalServer { .. }),
-                true,
-            ),
-            (
-                "not_found",
-                500,
-                |e| matches!(e, Error::InternalServer { .. }),
-                true,
-            ),
+            ("rate_limit", ErrorType::Unknown, false),
+            ("not_found", ErrorType::Unknown, false),
         ];
-        for (error_type, status, is_variant, retryable) in cases {
-            let data = format!(r#"{{"error":{{"type":"{error_type}","message":"m"}}}}"#);
-            let err = parse_message_stream_event(&SseEvent::new("error", data)).unwrap_err();
-            assert_eq!(err.status_code(), Some(status), "{error_type}");
-            assert!(is_variant(&err), "{error_type}: {err:?}");
-            assert_eq!(err.is_retryable(), retryable, "{error_type}");
+        for (wire, error_type, retryable) in cases {
+            let data = format!(r#"{{"error":{{"type":"{wire}","message":"m"}}}}"#);
+            let err = error_event(&data);
+            assert_eq!(api_parts(&err), (None, Some(error_type), None), "{wire}");
+            assert_eq!(err.is_retryable(), retryable, "{wire}");
         }
     }
 
     #[test]
-    fn handle_structured_error_events_without_status_code() {
+    fn structured_error_event_without_a_status_code_has_no_status() {
         let error_json = r#"{"error":{"type":"not_found_error","message":"missing"}}"#;
         let err = parse_message_stream_event(&SseEvent {
             event: "error".to_string(),
@@ -838,7 +840,205 @@ mod tests {
         })
         .unwrap_err();
 
-        assert_eq!(err.status_code(), Some(404));
+        assert_eq!(err.status(), None);
         assert!(err.to_string().contains("missing"));
+    }
+
+    fn error_event(data: &str) -> Error {
+        parse_message_stream_event(&SseEvent::new("error", data)).unwrap_err()
+    }
+
+    fn api_parts(error: &Error) -> (Option<u16>, Option<ErrorType>, Option<bool>) {
+        match error.kind() {
+            ErrorKind::Api {
+                status,
+                error_type,
+                retryable,
+                ..
+            } => (*status, *error_type, *retryable),
+            other => panic!("expected an Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_events_have_no_status_and_follow_their_type() {
+        let error = error_event(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_7"}"#,
+        );
+        assert_eq!(
+            api_parts(&error),
+            (None, Some(ErrorType::OverloadedError), None)
+        );
+        assert!(error.is_retryable());
+        assert_eq!(error.request_id(), Some("req_7"));
+        assert_eq!(
+            error.to_string(),
+            "Anthropic API error: Overloaded (in stream, overloaded_error, request req_7)"
+        );
+
+        let error = error_event(r#"{"error":{"type":"invalid_request_error","message":"bad"}}"#);
+        assert_eq!(api_parts(&error).0, None);
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn stream_error_events_honor_the_retryable_flag() {
+        let error = error_event(
+            r#"{"error":{"type":"overloaded_error","message":"full","retryable":false}}"#,
+        );
+        assert_eq!(api_parts(&error).2, Some(false));
+        assert!(!error.is_retryable());
+
+        let error = error_event(
+            r#"{"error":{"type":"invalid_request_error","message":"flaky","retryable":true}}"#,
+        );
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn unparseable_and_unknown_error_payloads_are_not_a_500() {
+        for data in [
+            "not json at all",
+            r#"{"surprise":true}"#,
+            r#"{"error":"flat"}"#,
+        ] {
+            let error = error_event(data);
+            assert_eq!(api_parts(&error), (None, None, None), "{data}");
+            assert_eq!(error.status(), None, "{data}");
+            assert!(!error.is_retryable(), "{data}");
+            assert!(error.to_string().contains(data), "{error}");
+        }
+    }
+
+    #[test]
+    fn error_payload_text_is_capped_at_a_character_boundary() {
+        // Two-byte characters, so the 300-byte cap falls inside one when the count is odd.
+        let long = "\u{e9}".repeat(MAX_ERROR_TEXT_BYTES);
+        let error = error_event(&format!(
+            r#"{{"error":{{"type":"api_error","message":"{long}"}}}}"#
+        ));
+        assert!(
+            error.message().len() <= MAX_ERROR_TEXT_BYTES + 3,
+            "{}",
+            error.message()
+        );
+        assert!(error.message().ends_with("..."));
+
+        let error = error_event(&"x".repeat(MAX_EVENT_SIZE / 2));
+        assert!(error.message().len() < 400, "{}", error.message().len());
+
+        let odd = format!("a{}", "\u{e9}".repeat(MAX_ERROR_TEXT_BYTES));
+        // 1 + 2 * 149 = 299 bytes fit, and the 300th byte splits a character.
+        assert_eq!(capped(&odd).len(), 299 + 3);
+    }
+
+    async fn frames(bytes: &'static [u8]) -> Vec<Result<SseEvent>> {
+        let stream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(bytes))]);
+        process_sse(stream).collect().await
+    }
+
+    #[tokio::test]
+    async fn comment_lines_are_skipped() {
+        let frames = frames(b": keepalive\n\nevent: ping\n: note\ndata: {}\n\n").await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].as_ref().unwrap(), &SseEvent::new("ping", "{}"));
+    }
+
+    #[tokio::test]
+    async fn comment_only_frames_yield_nothing_in_a_message_stream() {
+        let stream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+            b": keepalive\n\n: another\n\n",
+        ))]);
+        let events: Vec<_> = process_message_stream_sse(stream).collect().await;
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn frames_with_fields_but_no_data_are_dropped() {
+        let frames = frames(b"event: foo\n\nid: 3\nevent: bar\n\nevent: ping\ndata: {}\n\n").await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].as_ref().unwrap(), &SseEvent::new("ping", "{}"));
+    }
+
+    #[tokio::test]
+    async fn bare_field_names_have_empty_values() {
+        let frames = frames(b"data\n\nevent\ndata: {}\n\ndata\ndata: x\nretry\n\n").await;
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].as_ref().unwrap(), &SseEvent::new("message", ""));
+        assert_eq!(frames[1].as_ref().unwrap(), &SseEvent::new("message", "{}"));
+        assert_eq!(
+            frames[2].as_ref().unwrap(),
+            &SseEvent::new("message", "\nx")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_fields_retry_and_id_are_ignored() {
+        let frames =
+            frames(b"retry: 3000\nid: 7\nflavor: mint\nevent: ping\ndata: {}\n\nretry: 10\n\n")
+                .await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].as_ref().unwrap(), &SseEvent::new("ping", "{}"));
+    }
+
+    #[tokio::test]
+    async fn event_name_defaults_to_message() {
+        let frames = frames(b"data: {}\n\nevent:\ndata: {}\n\n").await;
+        assert_eq!(frames.len(), 2);
+        for frame in frames {
+            assert_eq!(frame.unwrap(), SseEvent::new("message", "{}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn legal_sse_does_not_end_a_message_stream() {
+        let stream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+            b": keepalive\n\nretry: 5\n\ndata: {}\n\nevent: ping\ndata: {}\n\n",
+        ))]);
+        let events: Vec<_> = process_message_stream_sse(stream).collect().await;
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        assert!(matches!(events.last(), Some(Ok(MessageStreamEvent::Ping))));
+    }
+
+    #[tokio::test]
+    async fn stream_errors_say_how_many_events_were_delivered() {
+        let bad = "event: content_block_stop\ndata: nope\n\n";
+        let start = r#"event: message_start
+data: {"message":{"id":"msg_1","content":[],"model":"claude","role":"assistant","type":"message","usage":{"input_tokens":1,"output_tokens":1}}}
+
+"#;
+        let ping = "event: ping\ndata: {}\n\n";
+        let cases = [
+            (bad.to_string(), 0),
+            // Pings are not counted.
+            (format!("{ping}{ping}{bad}"), 0),
+            (format!("{start}{ping}{bad}"), 1),
+        ];
+        for (text, delivered) in cases {
+            let stream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(text))]);
+            let items: Vec<_> = process_message_stream_sse(stream).collect().await;
+            let error = items.last().unwrap().as_ref().unwrap_err();
+            assert_eq!(error.events_delivered(), Some(delivered), "{error}");
+            assert_eq!(error.kind(), &ErrorKind::Decode);
+        }
+    }
+
+    #[test]
+    fn undecodable_event_payloads_do_not_leak_into_errors() {
+        let cases = [
+            ("message_start", r#"{"message":"SECRET-PAYLOAD"}"#),
+            ("content_block_delta", r#"SECRET-PAYLOAD"#),
+            ("message_delta", r#"{"delta":"SECRET-PAYLOAD"}"#),
+        ];
+        for (name, data) in cases {
+            let error = parse_message_stream_event(&SseEvent::new(name, data)).unwrap_err();
+            assert_eq!(error.kind(), &ErrorKind::Decode);
+            assert!(!error.to_string().contains("SECRET-PAYLOAD"), "{error}");
+            assert!(std::error::Error::source(&error).is_none(), "{error:?}");
+            assert!(
+                error.to_string().contains(&format!("{} bytes", data.len())),
+                "{error}"
+            );
+        }
     }
 }

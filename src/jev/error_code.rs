@@ -16,6 +16,14 @@ pub enum JevErrorCode {
 }
 
 impl JevErrorCode {
+    /// The code as Jev sends it; `None` for a code Jev never sends or this client does not know.
+    pub(crate) fn wire_name(self) -> Option<&'static str> {
+        match self {
+            Self::MaxTokensExceeded => Some("max_tokens_exceeded"),
+            Self::EdgeBlocked | Self::Unknown => None,
+        }
+    }
+
     /// Reads a `detail.error_type`, logging a warning for a code this client does not know.
     pub(super) fn from_detail(code: &str) -> Self {
         match code {

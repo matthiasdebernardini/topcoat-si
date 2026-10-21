@@ -12,7 +12,7 @@ use super::{
     tool_result,
 };
 use crate::client_tool::ClientTool;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::types::{Content, TextBlock, ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock};
 
 /// Name the model calls the Firecrawl search tool by.
@@ -296,8 +296,10 @@ impl FirecrawlWebSearch {
         request.scrape_options = scrape_options.cloned();
         match self.client.search(&request).await {
             Ok(response) => Ok(Ok((response, filter, total))),
-            Err(error) if matches!(error.status_code(), Some(401 | 402)) => Err(error),
-            Err(Error::Validation { message, .. }) => Ok(Err(message)),
+            Err(error) if matches!(error.status(), Some(401 | 402)) => Err(error),
+            Err(error) if matches!(error.kind(), ErrorKind::Validation { .. }) => {
+                Ok(Err(error.to_string()))
+            }
             Err(error) => Ok(Err(format!("Web search failed: {error}"))),
         }
     }

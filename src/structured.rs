@@ -6,11 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use schemars::JsonSchema;
 use schemars::generate::SchemaSettings;
 use serde::de::DeserializeOwned;
-use serde_json::error::Category;
 use serde_json::{Map, Value};
 
+use crate::error::describe_json_error;
 use crate::{
-    Anthropic, ContentBlock, Error, Message, MessageCreateParams, OutputFormat, Result, StopReason,
+    Anthropic, ContentBlock, Error, ErrorKind, Message, MessageCreateParams, OutputFormat, Result,
+    StopReason,
 };
 
 /// String formats structured outputs accept; any other `format` moves into the description.
@@ -72,10 +73,10 @@ impl OutputFormat {
     ///
     /// # Errors
     ///
-    /// A validation error when the schema cannot be expressed: a recursive type ("Recursive
-    /// schemas" are not supported; the error names the type), a subschema with no `type`, `anyOf`,
-    /// `oneOf` or `allOf` (such as `serde_json::Value`), an unsupported type, or a `$ref` that
-    /// does not point into `$defs`.
+    /// An [`ErrorKind::UnsupportedSchema`] error naming the type for a recursive type, which
+    /// structured outputs do not support. A validation error when the schema cannot be expressed
+    /// otherwise: a subschema with no `type`, `anyOf`, `oneOf` or `allOf` (such as
+    /// `serde_json::Value`), an unsupported type, or a `$ref` that does not point into `$defs`.
     pub fn json_schema_for<T: JsonSchema>() -> Result<OutputFormat> {
         let generated = SchemaSettings::draft2020_12()
             .for_deserialize()
@@ -293,11 +294,13 @@ fn reject_recursion(schema: &Value, root_name: &str) -> Result<()> {
         };
         if on_path.contains(&next) {
             let name = if next == ROOT { root_name } else { &next };
-            return Err(Error::validation(
+            return Err(Error::new(
+                ErrorKind::UnsupportedSchema {
+                    type_name: name.to_string(),
+                },
                 format!(
                     "structured outputs do not support recursive schemas: type `{name}` contains itself"
                 ),
-                None,
             ));
         }
         if !finished.contains(&next) {
@@ -352,22 +355,23 @@ impl Message {
     ///
     /// # Errors
     ///
-    /// A serialization error when the reply stopped at `max_tokens` (the JSON is cut off; retry
-    /// with a higher `max_tokens`), when Claude refused (a refusal does not follow the schema), or
-    /// when the text does not parse as `T`. The parse error gives the error category, line, column
+    /// [`ErrorKind::MaxTokens`] when the reply stopped at `max_tokens` (the JSON is cut off; retry
+    /// with a higher `max_tokens`), [`ErrorKind::Refusal`] when Claude refused (a refusal does not
+    /// follow the schema), or [`ErrorKind::Decode`] when the text does not parse as `T`. The parse
+    /// error gives the error category, line, column
     /// and the text's byte count, never the text or serde's message, which can quote the reply.
     pub fn parse_json<T: DeserializeOwned>(&self) -> Result<T> {
         match self.stop_reason {
             Some(StopReason::MaxTokens) => {
-                return Err(Error::serialization(
+                return Err(Error::new(
+                    ErrorKind::MaxTokens,
                     "the reply was cut off at max_tokens, so its JSON is incomplete; retry with a higher max_tokens",
-                    None,
                 ));
             }
             Some(StopReason::Refusal) => {
-                return Err(Error::serialization(
+                return Err(Error::new(
+                    ErrorKind::Refusal,
                     "Claude refused the request, so the reply does not follow the schema",
-                    None,
                 ));
             }
             _ => {}
@@ -382,21 +386,13 @@ impl Message {
             .collect();
         // serde's message and the error itself can quote the reply, so neither is kept.
         serde_json::from_str(&text).map_err(|error| {
-            let category = match error.classify() {
-                Category::Io => "I/O error",
-                Category::Syntax => "syntax error",
-                Category::Data => "type or value mismatch",
-                Category::Eof => "unexpected end of input",
-            };
-            Error::serialization(
+            Error::new(
+                ErrorKind::Decode,
                 format!(
-                    "the reply's {} bytes of text are not the expected JSON: {category} at line \
-                     {} column {}",
+                    "the reply's {} bytes of text are not the expected JSON: {}",
                     text.len(),
-                    error.line(),
-                    error.column()
+                    describe_json_error(&error)
                 ),
-                None,
             )
         })
     }
@@ -569,18 +565,26 @@ mod tests {
     #[test]
     fn recursive_types_are_rejected_by_name() {
         let error = OutputFormat::json_schema_for::<Tree>().unwrap_err();
-        assert!(error.is_validation());
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::UnsupportedSchema {
+                type_name: "Tree".to_string()
+            }
+        );
         assert!(error.to_string().contains("`Tree`"), "{error}");
 
         let error = OutputFormat::json_schema_for::<Forest>().unwrap_err();
-        assert!(error.is_validation());
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::UnsupportedSchema { type_name } if type_name == "Branch"
+        ));
         assert!(error.to_string().contains("`Branch`"), "{error}");
     }
 
     #[test]
     fn untyped_values_are_rejected() {
         let error = OutputFormat::json_schema_for::<Value>().unwrap_err();
-        assert!(error.is_validation());
+        assert!(matches!(error.kind(), ErrorKind::Validation { .. }));
     }
 
     #[test]
@@ -624,6 +628,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_json_stops_have_their_own_kinds() {
+        let cut_off = message(
+            "max_tokens",
+            json!([{"type": "text", "text": "{\"mood\": "}]),
+        );
+        let error = cut_off.parse_json::<Plan>().unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::MaxTokens, "{error}");
+        assert!(!error.is_retryable());
+
+        let refused = message("refusal", json!([{"type": "text", "text": "I can't help"}]));
+        let error = refused.parse_json::<Plan>().unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Refusal, "{error}");
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
     fn parse_json_error_has_byte_count_not_text() {
         let cases = [
             ("SECRET-REPLY not json", "syntax error at line 1 column 1"),
@@ -639,7 +659,7 @@ mod tests {
         for (text, expected) in cases {
             let reply = message("end_turn", json!([{"type": "text", "text": text}]));
             let error = reply.parse_json::<Plan>().unwrap_err();
-            assert!(matches!(error, Error::Serialization { .. }));
+            assert!(matches!(error.kind(), ErrorKind::Decode));
             let shown = error.to_string();
             assert!(shown.contains(&format!("{} bytes", text.len())), "{shown}");
             assert!(shown.contains(expected), "{shown}");
@@ -701,7 +721,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.is_validation());
+        assert!(matches!(error.kind(), ErrorKind::Validation { .. }));
         assert!(recorded.lock().unwrap().is_empty());
     }
 }

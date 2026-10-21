@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::{Answer, JevClient, JevErrorCode, JevResponse, NamedAnswer, Questions};
 use crate::client_tool::ClientTool;
-use crate::error::{Error, ErrorCode, Result};
+use crate::error::{Error, ErrorCode, ErrorKind, Result};
 use crate::types::{TextBlock, ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock};
 
 const TOOL_NAME: &str = "jev";
@@ -48,10 +48,9 @@ impl JevTool {
             Ok(response) => Ok(ToolResultBlock::new(id)
                 .with_text_content(TextBlock::new(render(&response, &input.questions)))),
             Err(error) if is_fatal(&error) => Err(error),
-            Err(Error::Validation { message, .. }) => Ok(ToolResultBlock::error(
-                id,
-                format!("Invalid jev call: {message}"),
-            )),
+            Err(error) if matches!(error.kind(), ErrorKind::Validation { .. }) => Ok(
+                ToolResultBlock::error(id, format!("Invalid jev call: {error}")),
+            ),
             Err(error) => Ok(ToolResultBlock::error(id, format!("Jev failed: {error}"))),
         }
     }
@@ -194,22 +193,24 @@ pub(crate) struct ToolOption {
     description: Option<String>,
 }
 
-// Only these failures are the developer's to fix; everything else goes back to the model.
-// Timeouts and connection failures are checked first: a body-phase timeout carries the status
-// its headers arrived with, often 200.
+// Only these failures are the developer's to fix; everything else goes back to the model. Jev
+// answers in the `Api` kind only for non-2xx statuses; every transport or body failure has its
+// own kind and is not fatal.
 pub(crate) fn is_fatal(error: &Error) -> bool {
-    if matches!(error, Error::Timeout { .. } | Error::Connection { .. }) {
-        return false;
-    }
-    match error.status_code() {
-        // A 2xx here means the body read failed after the headers arrived.
-        Some(200..=299 | 400 | 408 | 413 | 422 | 429 | 500..=599) => false,
-        Some(403) => {
-            error.metadata().and_then(|m| m.error_code.as_ref())
-                != Some(&ErrorCode::Jev(JevErrorCode::EdgeBlocked))
-        }
-        Some(_) => true,
-        None => false,
+    match error.kind() {
+        ErrorKind::Api {
+            status: Some(403),
+            error_code,
+            ..
+        } => error_code != &Some(ErrorCode::Jev(JevErrorCode::EdgeBlocked)),
+        ErrorKind::Api {
+            status: Some(400 | 408 | 413 | 422 | 429 | 500..=599),
+            ..
+        } => false,
+        ErrorKind::Api {
+            status: Some(_), ..
+        } => true,
+        _ => false,
     }
 }
 

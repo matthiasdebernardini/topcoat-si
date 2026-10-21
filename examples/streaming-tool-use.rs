@@ -1,11 +1,12 @@
 use std::collections::HashSet;
+use std::error::Error;
 use std::io;
 
 use serde::Deserialize;
 use serde_json::json;
 use topcoat_si::{
-    AccumulatingStream, Anthropic, ContentBlock, ContentBlockDelta, Error, KnownModel, Message,
-    MessageCreateParams, MessageParam, MessageRole, MessageStreamEvent, Model, Result, StopReason,
+    AccumulatingStream, Anthropic, ContentBlock, ContentBlockDelta, KnownModel, Message,
+    MessageCreateParams, MessageParam, MessageRole, MessageStreamEvent, Model, StopReason,
     ToolChoice, ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock,
 };
 
@@ -46,7 +47,17 @@ fn run_tool(tool_use: &ToolUseBlock) -> ToolResultBlock {
     }
 }
 
-async fn stream_message(client: &Anthropic, params: &MessageCreateParams) -> Result<Message> {
+/// Whether sending a failed stream's request again is clean: the error is retryable and the
+/// stream had not yielded an event yet. The crate never resends a stream itself.
+fn clean_to_resend(err: &(dyn Error + 'static)) -> bool {
+    err.downcast_ref::<topcoat_si::Error>()
+        .is_some_and(|err| err.is_retryable() && err.events_delivered().unwrap_or(0) == 0)
+}
+
+async fn stream_message(
+    client: &Anthropic,
+    params: &MessageCreateParams,
+) -> Result<Message, Box<dyn Error>> {
     use futures::StreamExt;
     use std::io::Write;
 
@@ -91,16 +102,13 @@ async fn stream_message(client: &Anthropic, params: &MessageCreateParams) -> Res
     }
 
     match done.await {
-        Ok(result) => result,
-        Err(_) => Err(Error::streaming(
-            "failed to receive accumulated streaming message",
-            None,
-        )),
+        Ok(result) => Ok(result?),
+        Err(_) => Err("failed to receive accumulated streaming message".into()),
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let client = Anthropic::try_new(None)?;
     let prompt = "Use the math_add tool to add 24 and 18. Then respond with the sum.";
 
@@ -149,7 +157,14 @@ async fn main() -> Result<()> {
             params = params.with_tool_choice(ToolChoice::tool("math_add"));
         }
 
-        let response = stream_message(&client, &params).await?;
+        let response = match stream_message(&client, &params).await {
+            Ok(response) => response,
+            Err(err) if clean_to_resend(err.as_ref()) => {
+                println!("\nStream failed before any event ({err}); sending it again");
+                stream_message(&client, &params).await?
+            }
+            Err(err) => return Err(err),
+        };
 
         if response.stop_reason != Some(StopReason::ToolUse) {
             // Push the final reply so `messages` holds the whole conversation, e.g. for a

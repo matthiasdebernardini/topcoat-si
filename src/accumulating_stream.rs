@@ -7,10 +7,11 @@ use futures::Stream;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+use crate::error::describe_json_error;
 use crate::{
-    CacheControlEphemeral, Citation, ContentBlock, ContentBlockDelta, Error, McpToolUseBlock,
-    Message, MessageStreamEvent, ServerToolUseBlock, StopReason, TextBlock, TextCitation,
-    ThinkingBlock, ToolUseBlock,
+    CacheControlEphemeral, Citation, ContentBlock, ContentBlockDelta, Error, ErrorKind,
+    McpToolUseBlock, Message, MessageStreamEvent, ServerToolUseBlock, StopReason, TextBlock,
+    TextCitation, ThinkingBlock, ToolUseBlock,
 };
 
 /// A stream wrapper that accumulates `MessageStreamEvent`s into a complete `Message`.
@@ -26,6 +27,8 @@ pub struct AccumulatingStream {
     content_blocks: Vec<ContentBlockBuilder>,
     done: bool,
     completed: bool,
+    /// Events other than pings yielded so far, recorded on the error that ends the stream.
+    delivered: u64,
 }
 
 impl AccumulatingStream {
@@ -66,6 +69,7 @@ impl AccumulatingStream {
             content_blocks: Vec::new(),
             done: false,
             completed: false,
+            delivered: 0,
         };
         (this, rx)
     }
@@ -78,7 +82,10 @@ impl AccumulatingStream {
             MessageStreamEvent::ContentBlockStart(start) => {
                 let index = start.index;
                 if index > self.content_blocks.len() {
-                    return Err(Error::streaming("non-contiguous content block index", None));
+                    return Err(Error::new(
+                        ErrorKind::Decode,
+                        "non-contiguous content block index",
+                    ));
                 }
                 if index == self.content_blocks.len() {
                     self.content_blocks.push(ContentBlockBuilder::Empty);
@@ -88,9 +95,16 @@ impl AccumulatingStream {
             }
             MessageStreamEvent::ContentBlockDelta(delta_event) => {
                 let index = delta_event.index;
-                if index < self.content_blocks.len() {
-                    self.content_blocks[index].apply_delta(delta_event.delta.clone());
-                }
+                let Some(block) = self.content_blocks.get_mut(index) else {
+                    return Err(Error::new(
+                        ErrorKind::Decode,
+                        format!(
+                            "content block delta for index {index}, but only {} blocks have started",
+                            self.content_blocks.len()
+                        ),
+                    ));
+                };
+                block.apply_delta(delta_event.delta.clone());
             }
             MessageStreamEvent::ContentBlockStop(_) => {}
             MessageStreamEvent::MessageDelta(delta_event) => {
@@ -122,6 +136,7 @@ impl AccumulatingStream {
     }
 
     fn fail(&mut self, error: Error) -> Poll<Option<Result<MessageStreamEvent, Error>>> {
+        let error = error.with_events_delivered(self.delivered);
         self.done = true;
         if let Some(tx) = self.message_tx.take() {
             // The caller may drop the final-message receiver while still reading events.
@@ -131,10 +146,12 @@ impl AccumulatingStream {
     }
 
     fn finalize(&mut self) -> Result<Message, Error> {
-        let mut message = self
-            .message
-            .take()
-            .ok_or_else(|| Error::streaming("stream ended without a message start event", None))?;
+        let mut message = self.message.take().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Interrupted,
+                "stream ended without a message start event",
+            )
+        })?;
         message.content = std::mem::take(&mut self.content_blocks)
             .into_iter()
             .filter_map(|builder| builder.build(message.stop_reason).transpose())
@@ -162,6 +179,9 @@ impl Stream for AccumulatingStream {
                 if let Err(error) = self.accumulate_event(&event) {
                     return self.fail(error);
                 }
+                if !matches!(event, MessageStreamEvent::Ping) {
+                    self.delivered += 1;
+                }
                 Poll::Ready(Some(Ok(event)))
             }
             Poll::Ready(Some(Err(error))) => self.fail(error),
@@ -177,7 +197,7 @@ impl Stream for AccumulatingStream {
                     } else {
                         "stream ended before message completion"
                     };
-                    return self.fail(Error::streaming(reason, None));
+                    return self.fail(Error::new(ErrorKind::Interrupted, reason));
                 }
                 match self.finalize() {
                     Ok(message) => {
@@ -194,6 +214,24 @@ impl Stream for AccumulatingStream {
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+/// Parses the JSON a tool call's `input_json_delta` events added up to. Empty input is an empty
+/// object. The error gives where parsing failed and never the text.
+fn parse_tool_input(name: &str, input_json: &str) -> Result<Value, Error> {
+    if input_json.trim().is_empty() {
+        return Ok(Value::Object(serde_json::Map::new()));
+    }
+    serde_json::from_str(input_json).map_err(|error| {
+        Error::new(
+            ErrorKind::Decode,
+            format!(
+                "the input of the {name} tool call ({} bytes) is not valid JSON: {}",
+                input_json.len(),
+                describe_json_error(&error)
+            ),
+        )
+    })
 }
 
 enum ToolKind {
@@ -347,34 +385,23 @@ impl ContentBlockBuilder {
                 saw_delta,
                 cache_control,
             } => {
-                let input = if saw_delta {
-                    if input_json.trim().is_empty() {
-                        Value::Object(serde_json::Map::new())
-                    } else {
-                        match serde_json::from_str::<Value>(&input_json) {
-                            Ok(value) => value,
-                            Err(_err) => {
-                                if stop_reason == Some(StopReason::MaxTokens) {
-                                    return Ok(None);
-                                }
-                                Value::String(input_json)
-                            }
+                let input = if saw_delta || input_value.is_none() {
+                    match parse_tool_input(&name, &input_json) {
+                        Ok(input) => input,
+                        Err(_) if stop_reason == Some(StopReason::MaxTokens) => {
+                            tracing::warn!(
+                                target: "topcoat_si::client",
+                                tool = %name,
+                                id = %id,
+                                bytes = input_json.len(),
+                                "dropped a tool call cut off at max_tokens"
+                            );
+                            return Ok(None);
                         }
+                        Err(error) => return Err(error),
                     }
-                } else if let Some(input) = input_value {
-                    input
-                } else if input_json.trim().is_empty() {
-                    Value::Object(serde_json::Map::new())
                 } else {
-                    match serde_json::from_str::<Value>(&input_json) {
-                        Ok(value) => value,
-                        Err(_err) => {
-                            if stop_reason == Some(StopReason::MaxTokens) {
-                                return Ok(None);
-                            }
-                            Value::String(input_json)
-                        }
-                    }
+                    input_value.unwrap_or_default()
                 };
                 let block = match kind {
                     ToolKind::Client => ContentBlock::ToolUse(ToolUseBlock {
@@ -853,5 +880,131 @@ mod tests {
         assert!(error.to_string().contains("without a message start event"));
         assert!(acc_stream.next().await.is_none());
         assert!(rx.await.unwrap().is_err());
+    }
+
+    fn start_event() -> MessageStreamEvent {
+        MessageStreamEvent::MessageStart(MessageStartEvent::new(Message::new(
+            "msg_test",
+            Vec::new(),
+            Model::Known(KnownModel::ClaudeSonnet55),
+            Usage::new(1, 0),
+        )))
+    }
+
+    fn tool_start_event() -> MessageStreamEvent {
+        MessageStreamEvent::ContentBlockStart(ContentBlockStartEvent::new(
+            ContentBlock::ToolUse(ToolUseBlock::new("toolu_1", "lookup", Value::Null)),
+            0,
+        ))
+    }
+
+    fn json_delta_event(index: usize, json: &str) -> MessageStreamEvent {
+        MessageStreamEvent::ContentBlockDelta(ContentBlockDeltaEvent::new(
+            ContentBlockDelta::InputJsonDelta(InputJsonDelta::new(json.to_string())),
+            index,
+        ))
+    }
+
+    fn stop_event(reason: StopReason) -> MessageStreamEvent {
+        MessageStreamEvent::MessageDelta(MessageDeltaEvent::new(
+            MessageDelta::new().with_stop_reason(reason),
+            MessageDeltaUsage::new(1),
+        ))
+    }
+
+    /// Drains a stream over `events`, returning its items and the final message.
+    async fn drain(
+        events: Vec<Result<MessageStreamEvent, Error>>,
+    ) -> (
+        Vec<Result<MessageStreamEvent, Error>>,
+        Result<Message, Error>,
+    ) {
+        use futures::StreamExt;
+
+        let (acc_stream, rx) = AccumulatingStream::new(stream::iter(events));
+        let items: Vec<_> = acc_stream.collect().await;
+        (items, rx.await.expect("channel closed"))
+    }
+
+    #[tokio::test]
+    async fn tool_input_that_is_not_json_is_a_decode_error() {
+        let events = vec![
+            Ok(start_event()),
+            Ok(tool_start_event()),
+            Ok(json_delta_event(0, r#"{"query": SECRET-INPUT"#)),
+            Ok(stop_event(StopReason::ToolUse)),
+        ];
+        let (items, message) = drain(events).await;
+        let error = items.last().unwrap().as_ref().unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Decode, "{error}");
+        assert!(!error.is_retryable());
+        assert!(!error.to_string().contains("SECRET-INPUT"), "{error}");
+        assert!(error.to_string().contains("lookup"), "{error}");
+        assert!(message.is_err());
+    }
+
+    #[tokio::test]
+    async fn tool_input_cut_off_at_max_tokens_is_dropped_and_logged() {
+        let (_guard, targets) = crate::test_support::record_targets();
+        let events = vec![
+            Ok(start_event()),
+            Ok(tool_start_event()),
+            Ok(json_delta_event(0, r#"{"query": "ru"#)),
+            Ok(stop_event(StopReason::MaxTokens)),
+        ];
+        let (items, message) = drain(events).await;
+        assert!(items.iter().all(Result::is_ok));
+        assert!(message.unwrap().content.is_empty());
+        assert!(
+            targets
+                .lock()
+                .unwrap()
+                .contains(&"event topcoat_si::client".to_string()),
+            "{:?}",
+            targets.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_for_an_unknown_block_index_is_a_decode_error() {
+        let events = vec![
+            Ok(start_event()),
+            Ok(tool_start_event()),
+            Ok(json_delta_event(3, "{}")),
+        ];
+        let (items, message) = drain(events).await;
+        let error = items.last().unwrap().as_ref().unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Decode, "{error}");
+        assert!(error.to_string().contains("index 3"), "{error}");
+        assert!(message.is_err());
+    }
+
+    #[tokio::test]
+    async fn errors_say_how_many_events_were_delivered() {
+        let failure = || Error::new(ErrorKind::Interrupted, "cut off");
+        let (items, message) = drain(vec![Err(failure())]).await;
+        let error = items[0].as_ref().unwrap_err();
+        assert_eq!(error.events_delivered(), Some(0));
+        assert_eq!(message.unwrap_err().events_delivered(), Some(0));
+
+        let events = vec![Ok(start_event()), Ok(tool_start_event()), Err(failure())];
+        let (items, _) = drain(events).await;
+        let error = items[2].as_ref().unwrap_err();
+        assert_eq!(error.events_delivered(), Some(2));
+        assert_eq!(error.kind(), &ErrorKind::Interrupted);
+
+        // Pings are not counted.
+        let events = vec![
+            Ok(MessageStreamEvent::Ping),
+            Ok(start_event()),
+            Ok(MessageStreamEvent::Ping),
+            Err(failure()),
+        ];
+        let (items, _) = drain(events).await;
+        assert_eq!(items[3].as_ref().unwrap_err().events_delivered(), Some(1));
+
+        // A stream that ends early fails with the count too.
+        let (items, _) = drain(vec![Ok(start_event())]).await;
+        assert_eq!(items[1].as_ref().unwrap_err().events_delivered(), Some(1));
     }
 }

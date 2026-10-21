@@ -7,7 +7,7 @@ use std::time::Duration;
 use monty_pool::{Pool, PoolConfig};
 
 use super::limits::PYTHON_CALL_TIMEOUT;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 
 const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -29,8 +29,7 @@ pub async fn pool(monty: impl Into<PathBuf>, max_workers: usize) -> Result<Arc<P
     config.max_processes = max_workers;
     config.checkout_timeout = Some(CHECKOUT_TIMEOUT);
     config.request_timeout = Some(PYTHON_CALL_TIMEOUT);
-    Pool::new(config)
-        .await
-        .map(Arc::new)
-        .map_err(|error| Error::sandbox(format!("could not start the sandbox pool: {error}")))
+    Pool::new(config).await.map(Arc::new).map_err(|error| {
+        Error::new(ErrorKind::Sandbox, "could not start the sandbox pool").with_source(error)
+    })
 }

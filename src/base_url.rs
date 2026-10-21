@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 pub(crate) fn checked_url(service: &str, setting: &str, base_url: &str) -> Result<Url> {
     let invalid = |message: String| Error::validation(message, Some(setting.to_string()));
     let parsed = Url::parse(base_url.trim())
-        .map_err(|_| invalid(format!("{service} base URL is not a valid URL")))?;
+        .map_err(|e| invalid(format!("{service} base URL is not a valid URL")).with_source(e))?;
     match parsed.scheme() {
         "https" if parsed.host().is_some() => {}
         "http" if is_loopback(&parsed) => {}
@@ -102,6 +102,14 @@ mod tests {
             let result = checked_base_url("Test", "base_url", base_url);
             assert_eq!(result.is_ok(), accepted, "{base_url}: {result:?}");
         }
+    }
+
+    #[test]
+    fn unparseable_base_url_keeps_the_parse_error() {
+        let error = checked_base_url("Test", "base_url", "not a url").unwrap_err();
+        assert_eq!(error.to_string(), "Test base URL is not a valid URL");
+        let source = std::error::Error::source(&error).expect("the url::ParseError is the source");
+        assert!(source.is::<url::ParseError>(), "{source:?}");
     }
 
     /// Accepts one connection, then answers its request with `name` as the body.

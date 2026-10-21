@@ -170,7 +170,40 @@ pub(super) fn parse_answer(value: Value) -> Answer {
     };
     match decode_answer(kind, &value) {
         Some(answer) => answer,
-        None => Answer::Malformed { kind, raw: value },
+        None => {
+            // Only the shape is logged: the values may echo the caller's data.
+            tracing::warn!(
+                target: "topcoat_si::jev",
+                %kind,
+                raw_bytes = value.to_string().len(),
+                shape = describe_shape(&value),
+                "Jev answer could not be read"
+            );
+            Answer::Malformed { kind, raw: value }
+        }
+    }
+}
+
+/// Names the JSON type of `value`, and for an object its first keys, capped so a hostile
+/// response cannot flood the log.
+fn describe_shape(value: &Value) -> String {
+    const MAX_KEYS: usize = 8;
+    const MAX_KEY_CHARS: usize = 32;
+    match value {
+        Value::Object(map) => {
+            let keys: Vec<String> = map
+                .keys()
+                .take(MAX_KEYS)
+                .map(|key| key.chars().take(MAX_KEY_CHARS).collect())
+                .collect();
+            let more = if map.len() > MAX_KEYS { ", ..." } else { "" };
+            format!("object with keys {}{more}", keys.join(", "))
+        }
+        Value::Array(items) => format!("array of {}", items.len()),
+        Value::String(_) => "string".to_string(),
+        Value::Number(_) => "number".to_string(),
+        Value::Bool(_) => "boolean".to_string(),
+        Value::Null => "null".to_string(),
     }
 }
 

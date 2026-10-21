@@ -172,7 +172,12 @@ pub(super) fn exception(kind: ExcType, message: String) -> MontyException {
 
 /// A host function's typed result as JSON.
 pub(super) fn to_json(value: impl Serialize) -> Result<Value, HostError> {
-    serde_json::to_value(value).map_err(|error| HostError::Fatal(Error::from(error)))
+    serde_json::to_value(value).map_err(|error| {
+        HostError::Fatal(
+            Error::validation("could not serialize a host function's result", None)
+                .with_source(error),
+        )
+    })
 }
 
 #[cfg(test)]

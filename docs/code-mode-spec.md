@@ -346,8 +346,9 @@ Errors use `MontyException`'s `Display`: a CPython-style traceback with line num
 | `Protocol`, `Finished`, `Crashed`, `Timeout`, `Disconnected`, `Shutdown` | discard (step 4); `is_error` |
 | input not `{"code": string}` | `is_error` with the expected shape |
 
-Pool failures that become `Err` use a new `Error::Sandbox { message }` variant in
-`src/error.rs`, not retryable.
+Pool failures that become `Err` use `ErrorKind::Sandbox` in `src/error.rs`, with the
+`PoolError` kept as the error's source. They are not retryable. A `HostError::Fatal` error
+surfaces unchanged, with its own kind.
 
 ## Built-in packs
 

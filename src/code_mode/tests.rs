@@ -12,7 +12,7 @@ use super::pack::untyped;
 use super::tool::{CANCELLED, RESTARTED, TOOL_NAME, definition};
 use super::*;
 use crate::client_tool::ClientTool;
-use crate::error::Error;
+use crate::error::{Error, ErrorKind};
 use crate::firecrawl::FirecrawlClient;
 use crate::jev::JevClient;
 use crate::test_support::{Canned, serve};
@@ -411,7 +411,7 @@ async fn fatal_host_error_makes_run_tools_fail() {
     )])
     .await;
     let pack = Pack::new("fakes", "fakes").with_host(host("boom", |_| {
-        Err(HostError::Fatal(Error::authentication("rejected key")))
+        Err(HostError::Fatal(Error::tool("rejected key", None)))
     }));
     let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     let client = Anthropic::try_new(Some("test_key".to_string()))
@@ -425,7 +425,7 @@ async fn fatal_host_error_makes_run_tools_fail() {
         Model::Known(KnownModel::ClaudeSonnet55),
     );
     let error = client.run_tools(params, &[&code], 5).await.unwrap_err();
-    assert!(error.is_authentication(), "{error}");
+    assert_eq!(error.error.kind(), &ErrorKind::Tool, "{error}");
     assert!(code.session.lock().await.is_none());
 }
 
@@ -652,7 +652,7 @@ async fn firecrawl_pack_keeps_the_tool_policy() {
         json!({"code": "await search(query='x')"}),
     );
     let error = code.call(&tool_use).await.unwrap_err();
-    assert_eq!(error.status_code(), Some(402));
+    assert_eq!(error.status(), Some(402));
 }
 
 #[tokio::test]
@@ -809,7 +809,7 @@ async fn first_fatal_error_drops_the_rest_of_its_gather() {
     let pack = Pack::new("fakes", "fakes")
         .with_host(slow())
         .with_host(host("boom", |_| {
-            Err(HostError::Fatal(Error::authentication("rejected key")))
+            Err(HostError::Fatal(Error::tool("rejected key", None)))
         }));
     let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     let tool_use = ToolUseBlock::new(
@@ -819,7 +819,7 @@ async fn first_fatal_error_drops_the_rest_of_its_gather() {
     );
     let started = Instant::now();
     let error = code.call(&tool_use).await.unwrap_err();
-    assert!(error.is_authentication(), "{error}");
+    assert_eq!(error.kind(), &ErrorKind::Tool, "{error}");
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "{:?}",
@@ -864,7 +864,10 @@ async fn limits_past_the_python_call_timeout_are_rejected() {
     let error = CodeMode::try_new(test_pool().await, vec![], limits)
         .err()
         .unwrap();
-    assert!(error.is_validation(), "{error}");
+    assert!(
+        matches!(error.kind(), ErrorKind::Validation { .. }),
+        "{error}"
+    );
 }
 
 // A list holding one list twice, 30 deep: tiny in the sandbox, 2^30 items expanded.
@@ -999,10 +1002,13 @@ async fn broken_pack_source_is_an_error() {
     let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
     let tool_use = ToolUseBlock::new("toolu_1", TOOL_NAME, json!({"code": "1"}));
     let error = code.call(&tool_use).await.unwrap_err();
-    assert!(matches!(error, Error::Sandbox { .. }), "{error}");
+    assert!(matches!(error.kind(), ErrorKind::Sandbox), "{error}");
+    let source = std::error::Error::source(&error).map(ToString::to_string);
     assert!(
-        error.to_string().contains("ValueError: bad pack"),
-        "{error}"
+        source
+            .as_deref()
+            .is_some_and(|source| source.contains("ValueError: bad pack")),
+        "{source:?}"
     );
 }
 
@@ -1056,4 +1062,41 @@ async fn duplicate_packs_and_stray_examples_fail_in_try_new() {
             .to_string()
             .contains("pack a has an example for nope, which it does not define")
     );
+}
+
+#[tokio::test]
+async fn fatal_host_error_surfaces_unchanged() {
+    #[derive(Debug)]
+    struct Cause;
+    impl std::fmt::Display for Cause {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("the tool's own cause")
+        }
+    }
+    impl std::error::Error for Cause {}
+
+    let original = Error::tool("rejected key", Some(Box::new(Cause)));
+    let fatal = original.clone();
+    let pack = Pack::new("fakes", "fakes")
+        .with_host(host("boom", move |_| Err(HostError::Fatal(fatal.clone()))));
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let tool_use = ToolUseBlock::new("toolu_1", TOOL_NAME, json!({"code": "await boom()"}));
+    let error = code.call(&tool_use).await.unwrap_err();
+    // Not wrapped: same kind, same words, and the tool author's error is still the source.
+    assert_eq!(error.kind(), &ErrorKind::Tool);
+    assert_eq!(error.to_string(), original.to_string());
+    let source = std::error::Error::source(&error).expect("the tool's error is the source");
+    assert_eq!(source.to_string(), "the tool's own cause");
+    assert!(std::error::Error::source(source).is_none());
+}
+
+#[tokio::test]
+async fn pool_start_failure_keeps_the_pool_error_as_source() {
+    let Err(error) = pool("/nonexistent/monty-binary", 1).await else {
+        panic!("a missing binary should fail the pool");
+    };
+    assert!(matches!(error.kind(), ErrorKind::Sandbox), "{error}");
+    assert_eq!(error.to_string(), "could not start the sandbox pool");
+    let source = std::error::Error::source(&error).expect("the pool error is the source");
+    assert!(!source.to_string().is_empty());
 }

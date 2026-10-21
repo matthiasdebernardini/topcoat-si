@@ -411,7 +411,7 @@ mod tests {
         let err = ToolUnionParam::WebFetch20260318(tool)
             .validate()
             .unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(
             ToolUnionParam::WebFetch20260318(WebFetchTool::new())
                 .validate()

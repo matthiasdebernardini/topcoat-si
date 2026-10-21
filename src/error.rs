@@ -1,32 +1,23 @@
-//! Errors preserve transport sources and HTTP diagnostics without response bodies.
-use std::str::Utf8Error;
+//! One error type for every client: what failed, which service failed, and whether sending the
+//! same request again might work.
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{error, fmt, io};
+use std::{error, fmt};
+
+use serde_json::error::Category;
 
 use crate::jev::JevErrorCode;
 use crate::types::ErrorType;
 
-/// Diagnostics shared by every HTTP response error.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct HttpMetadata {
-    /// HTTP status code.
-    pub status: u16,
-    /// The service's error code, when the body had one.
-    pub error_code: Option<ErrorCode>,
-    /// The `request-id` header or body field.
-    pub request_id: Option<String>,
-    /// The delay from the `retry-after` header.
-    pub retry_after: Option<Duration>,
-}
-
-/// The error code an HTTP error body carried, by service.
+/// The error code an error body carried, by service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ErrorCode {
-    /// An Anthropic API error: the body's `error.type`.
-    Anthropic(ErrorType),
+    /// An Anthropic API error's `error.details.error_code` as sent, such as
+    /// `enforced_spend_limit_reached`. Anthropic documents codes only for some errors, so the
+    /// set is open.
+    Anthropic(String),
     /// A Jev error: the body's `detail.error_type`, or a code this client sets itself.
     Jev(JevErrorCode),
     /// A Firecrawl error: the body's `code` as sent. Firecrawl documents codes only for some
@@ -34,786 +25,826 @@ pub enum ErrorCode {
     Firecrawl(String),
 }
 
-/// SDK failure, with original sources retained when available.
-#[derive(Clone, Debug)]
+impl ErrorCode {
+    /// The code as the service sends it; `None` for a code with no wire form.
+    fn wire_name(&self) -> Option<&str> {
+        match self {
+            Self::Anthropic(code) | Self::Firecrawl(code) => Some(code),
+            Self::Jev(code) => code.wire_name(),
+        }
+    }
+}
+
+/// The service that refused a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum Error {
-    /// Any other HTTP status.
-    Api {
-        /// The API's error text.
-        message: String,
-        /// Status, error type, request id and `retry-after` of the response.
-        metadata: HttpMetadata,
-        /// The underlying failure, when there was one.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
-    },
-    /// HTTP 401.
-    Authentication {
-        /// The API's error text.
-        message: String,
-        /// Status, error type, request id and `retry-after` of the response.
-        metadata: HttpMetadata,
-        /// The underlying failure, when there was one.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
-    },
-    /// HTTP 403.
-    Permission {
-        /// The API's error text.
-        message: String,
-        /// Status, error type, request id and `retry-after` of the response.
-        metadata: HttpMetadata,
-        /// The underlying failure, when there was one.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
-    },
-    /// HTTP 404.
-    NotFound {
-        /// The API's error text.
-        message: String,
-        /// Status, error type, request id and `retry-after` of the response.
-        metadata: HttpMetadata,
-        /// The underlying failure, when there was one.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
-    },
-    /// HTTP 429.
-    RateLimit {
-        /// The API's error text.
-        message: String,
-        /// Status, error type, request id and `retry-after` of the response.
-        metadata: HttpMetadata,
-        /// The underlying failure, when there was one.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
-    },
-    /// HTTP 400.
-    BadRequest {
-        /// The API's error text.
-        message: String,
-        /// Status, error type, request id and `retry-after` of the response.
-        metadata: HttpMetadata,
-        /// The underlying failure, when there was one.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
-    },
-    /// HTTP 500.
-    InternalServer {
-        /// The API's error text.
-        message: String,
-        /// Status, error type, request id and `retry-after` of the response.
-        metadata: HttpMetadata,
-        /// The underlying failure, when there was one.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
-    },
-    /// HTTP 502, 503 or 504.
-    ServiceUnavailable {
-        /// The API's error text.
-        message: String,
-        /// Status, error type, request id and `retry-after` of the response.
-        metadata: HttpMetadata,
-        /// The underlying failure, when there was one.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
-    },
-    /// HTTP 529.
-    Overloaded {
-        /// The API's error text.
-        message: String,
-        /// Status, error type, request id and `retry-after` of the response.
-        metadata: HttpMetadata,
-        /// The underlying failure, when there was one.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
-    },
-    /// The request timed out.
-    Timeout {
-        /// Response diagnostics, when headers were received.
-        metadata: Option<Box<HttpMetadata>>,
-        /// Human-readable error message.
-        message: String,
-        /// The underlying failure, when there was one.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
-    },
-    /// Request was aborted by the client.
-    Abort {
-        /// Human-readable error message.
-        message: String,
-    },
+pub enum Service {
+    /// The Anthropic API.
+    Anthropic,
+    /// The Firecrawl API.
+    Firecrawl,
+    /// TypeSafe's Jev API.
+    Jev,
+}
 
-    /// Connection error.
-    Connection {
-        /// Human-readable error message.
-        message: String,
-        /// Underlying cause.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
-    },
+impl fmt::Display for Service {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Anthropic => "Anthropic",
+            Self::Firecrawl => "Firecrawl",
+            Self::Jev => "Jev",
+        })
+    }
+}
 
-    /// Error during JSON serialization or deserialization.
-    Serialization {
-        /// Human-readable error message.
-        message: String,
-        /// The underlying error.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
-    },
-
-    /// I/O error.
-    Io {
-        /// Human-readable error message.
-        message: String,
-        /// The underlying error.
-        source: Arc<io::Error>,
-    },
-
-    /// HTTP client error.
-    HttpClient {
-        /// Human-readable error message.
-        message: String,
-        /// The underlying error.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
-    },
-
-    /// Error during validation of request parameters.
+/// What failed. [`Error::is_retryable`] says whether sending the same request again might work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// Rejected before sending: bad parameters or configuration, or a request that fails to
+    /// serialize.
+    #[non_exhaustive]
     Validation {
-        /// Human-readable error message.
-        message: String,
-        /// Parameter that failed validation.
+        /// The parameter, setting or environment variable at fault, when there is one.
         param: Option<String>,
     },
-
-    /// A URL parsing or manipulation error.
-    Url {
-        /// Human-readable error message.
-        message: String,
-        /// The underlying error.
-        source: Option<url::ParseError>,
+    /// A local size cap was exceeded.
+    #[non_exhaustive]
+    RequestTooLarge {
+        /// The size of the request in bytes.
+        size: usize,
+        /// The cap in bytes.
+        limit: usize,
     },
-
-    /// A streaming error occurred.
-    Streaming {
-        /// Human-readable error message.
-        message: String,
-        /// The underlying error.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
+    /// Structured outputs cannot use this type, for example a recursive schema.
+    #[non_exhaustive]
+    UnsupportedSchema {
+        /// The Rust type name.
+        type_name: String,
     },
-
-    /// Encoding/decoding error.
-    Encoding {
-        /// Human-readable error message.
-        message: String,
-        /// The underlying error.
-        source: Option<Arc<dyn error::Error + Send + Sync>>,
+    /// No connection was made: DNS failure, refused, TLS failure, or a connect timeout. Nothing
+    /// reached the server.
+    Connection,
+    /// The request was sent, but no complete response arrived in time.
+    Timeout,
+    /// The service refused: an HTTP error status, or an `error` event inside a stream.
+    #[non_exhaustive]
+    Api {
+        /// The service that refused.
+        service: Service,
+        /// The HTTP status; `None` for an `error` event inside a stream.
+        status: Option<u16>,
+        /// Anthropic's `error.type`, such as `overloaded_error`.
+        error_type: Option<ErrorType>,
+        /// The service's error code: Anthropic's `error.details.error_code`, Jev's
+        /// `detail.error_type` or Firecrawl's `code`.
+        error_code: Option<ErrorCode>,
+        /// The delay the service asked for in `retry-after`.
+        retry_after: Option<Duration>,
+        /// The stream payload's own `retryable` flag, when it sent one.
+        retryable: Option<bool>,
     },
-
-    /// The Python sandbox failed in a way the model cannot fix: a pool that would not start, a
-    /// worker that would not spawn, a pack whose source fails to run, or a session that would
-    /// not finish. Never retryable.
-    Sandbox {
-        /// Human-readable error message.
-        message: String,
+    /// The request was sent, then the connection failed before a complete response arrived. The
+    /// server may already have done the work.
+    Interrupted,
+    /// A success response arrived but is not what was expected: bad JSON, bad SSE framing or
+    /// UTF-8, or a bad batch result line.
+    Decode,
+    /// Structured output was cut off at `max_tokens`; retry with more tokens.
+    MaxTokens,
+    /// The model refused, so the reply does not follow the schema.
+    Refusal,
+    /// Reading a local file failed.
+    #[non_exhaustive]
+    Io {
+        /// The file, when known.
+        path: Option<PathBuf>,
     },
+    /// Code mode: a sandbox pool, worker or pack failure.
+    Sandbox,
+    /// A [`ClientTool`](crate::ClientTool) author's own fatal failure.
+    Tool,
+}
 
-    /// Unknown error.
-    Unknown {
-        /// Human-readable error message.
-        message: String,
-    },
-
-    /// Unimplemented functionality.
-    ToDo {
-        /// Human-readable error message.
-        message: String,
-    },
+/// A failure from any client in this crate.
+///
+/// The message says what failed and where; the cause is only in
+/// [`source`](error::Error::source).
+#[derive(Clone, Debug)]
+#[must_use]
+pub struct Error {
+    // Boxed so `Result<T, Error>` stays small.
+    kind: Box<ErrorKind>,
+    message: String,
+    request_id: Option<String>,
+    events_delivered: Option<u64>,
+    source: Option<Arc<dyn error::Error + Send + Sync>>,
 }
 
 impl Error {
-    /// Builds the variant that matches `metadata.status`:
-    ///
-    /// | Status | Variant |
-    /// |---|---|
-    /// | 400 | [`Error::BadRequest`] |
-    /// | 401 | [`Error::Authentication`] |
-    /// | 403 | [`Error::Permission`] |
-    /// | 404 | [`Error::NotFound`] |
-    /// | 429 | [`Error::RateLimit`] |
-    /// | 500 | [`Error::InternalServer`] |
-    /// | 502, 503, 504 | [`Error::ServiceUnavailable`] |
-    /// | 529 | [`Error::Overloaded`] |
-    /// | any other | [`Error::Api`] |
-    #[must_use]
-    pub fn from_http(
-        message: impl Into<String>,
-        metadata: HttpMetadata,
-        source: Option<Box<dyn error::Error + Send + Sync>>,
-    ) -> Self {
-        let message: String = message.into();
-        let source: Option<Arc<dyn error::Error + Send + Sync>> = source.map(Arc::from);
-        match metadata.status {
-            400 => Self::BadRequest {
-                message,
-                metadata,
-                source,
-            },
-            401 => Self::Authentication {
-                message,
-                metadata,
-                source,
-            },
-            403 => Self::Permission {
-                message,
-                metadata,
-                source,
-            },
-            404 => Self::NotFound {
-                message,
-                metadata,
-                source,
-            },
-            429 => Self::RateLimit {
-                message,
-                metadata,
-                source,
-            },
-            500 => Self::InternalServer {
-                message,
-                metadata,
-                source,
-            },
-            502..=504 => Self::ServiceUnavailable {
-                message,
-                metadata,
-                source,
-            },
-            529 => Self::Overloaded {
-                message,
-                metadata,
-                source,
-            },
-            _ => Self::Api {
-                message,
-                metadata,
-                source,
-            },
-        }
-    }
-    /// Builds the [`Error::from_http`] variant for `status`, with no source or `retry-after`.
-    #[must_use]
-    pub fn api(
-        status: u16,
-        error_code: Option<ErrorCode>,
-        message: impl Into<String>,
-        request_id: Option<String>,
-    ) -> Self {
-        Self::from_http(
-            message,
-            HttpMetadata {
-                status,
-                error_code,
-                request_id,
-                retry_after: None,
-            },
-            None,
-        )
-    }
-    /// Creates a new timeout error.
-    #[must_use]
-    pub fn timeout(message: impl Into<String>) -> Self {
-        Self::Timeout {
-            message: message.into(),
-            source: None,
-            metadata: None,
-        }
-    }
-    /// Creates a new HTTP 401 authentication error.
-    #[must_use]
-    pub fn authentication(message: impl Into<String>) -> Self {
-        Self::from_http(
-            message,
-            HttpMetadata {
-                status: 401,
-                ..Default::default()
-            },
-            None,
-        )
-    }
-    /// Creates a new HTTP 403 permission error.
-    #[must_use]
-    pub fn permission(message: impl Into<String>) -> Self {
-        Self::from_http(
-            message,
-            HttpMetadata {
-                status: 403,
-                ..Default::default()
-            },
-            None,
-        )
-    }
-    /// Creates a new HTTP 404 not-found error.
-    #[must_use]
-    pub fn not_found(message: impl Into<String>) -> Self {
-        Self::from_http(
-            message,
-            HttpMetadata {
-                status: 404,
-                ..Default::default()
-            },
-            None,
-        )
-    }
-    /// Creates a new HTTP 429 rate-limit error.
-    #[must_use]
-    pub fn rate_limit(message: impl Into<String>, retry_after: Option<Duration>) -> Self {
-        Self::from_http(
-            message,
-            HttpMetadata {
-                status: 429,
-                retry_after,
-                ..Default::default()
-            },
-            None,
-        )
-    }
-    /// Creates a new HTTP 400 bad-request error.
-    #[must_use]
-    pub fn bad_request(message: impl Into<String>) -> Self {
-        Self::from_http(
-            message,
-            HttpMetadata {
-                status: 400,
-                ..Default::default()
-            },
-            None,
-        )
-    }
-    /// Creates a new HTTP 500 internal-server error.
-    #[must_use]
-    pub fn internal_server(message: impl Into<String>, request_id: Option<String>) -> Self {
-        Self::from_http(
-            message,
-            HttpMetadata {
-                status: 500,
-                request_id,
-                ..Default::default()
-            },
-            None,
-        )
-    }
-    /// Creates a new HTTP 503 service-unavailable error.
-    #[must_use]
-    pub fn service_unavailable(message: impl Into<String>, retry_after: Option<Duration>) -> Self {
-        Self::from_http(
-            message,
-            HttpMetadata {
-                status: 503,
-                retry_after,
-                ..Default::default()
-            },
-            None,
-        )
-    }
-    /// Creates a new abort error.
-    #[must_use]
-    pub fn abort(message: impl Into<String>) -> Self {
-        Error::Abort {
-            message: message.into(),
-        }
-    }
-
-    /// Creates a new connection error.
-    #[must_use]
-    pub fn connection(
-        message: impl Into<String>,
-        source: Option<Box<dyn error::Error + Send + Sync>>,
-    ) -> Self {
-        Error::Connection {
-            message: message.into(),
-            source: source.map(Arc::from),
-        }
-    }
-
-    /// Creates a new serialization error.
-    #[must_use]
-    pub fn serialization(
-        message: impl Into<String>,
-        source: Option<Box<dyn error::Error + Send + Sync>>,
-    ) -> Self {
-        Error::Serialization {
-            message: message.into(),
-            source: source.map(Arc::from),
-        }
-    }
-
-    /// Creates a new I/O error.
-    #[must_use]
-    pub fn io(message: impl Into<String>, source: io::Error) -> Self {
-        Error::Io {
-            message: message.into(),
-            source: Arc::new(source),
-        }
-    }
-
-    /// Creates a new HTTP client error.
-    #[must_use]
-    pub fn http_client(
-        message: impl Into<String>,
-        source: Option<Box<dyn error::Error + Send + Sync>>,
-    ) -> Self {
-        Error::HttpClient {
-            message: message.into(),
-            source: source.map(Arc::from),
-        }
-    }
-
-    /// Creates a new validation error.
-    #[must_use]
+    /// Builds a [`ErrorKind::Validation`] error for a request rejected before sending.
     pub fn validation(message: impl Into<String>, param: Option<String>) -> Self {
-        Error::Validation {
-            message: message.into(),
-            param,
-        }
+        Self::new(ErrorKind::Validation { param }, message)
     }
 
-    /// Creates a new URL error.
-    #[must_use]
-    pub fn url(message: impl Into<String>, source: Option<url::ParseError>) -> Self {
-        Error::Url {
-            message: message.into(),
-            source,
-        }
-    }
-
-    /// Creates a new streaming error.
-    #[must_use]
-    pub fn streaming(
+    /// Builds a [`ErrorKind::Tool`] error: a [`ClientTool`](crate::ClientTool) failure the model
+    /// cannot fix, with the tool's own error as the source.
+    pub fn tool(
         message: impl Into<String>,
         source: Option<Box<dyn error::Error + Send + Sync>>,
     ) -> Self {
-        Error::Streaming {
-            message: message.into(),
+        Self {
             source: source.map(Arc::from),
+            ..Self::new(ErrorKind::Tool, message)
         }
     }
 
-    /// Creates a new encoding error.
-    #[must_use]
-    pub fn encoding(
+    /// Builds a [`ErrorKind::Api`] error, for example to simulate a 429 in a test. A `status` of
+    /// `None` is an `error` event inside a stream.
+    pub fn api(
+        service: Service,
+        status: Option<u16>,
+        error_type: Option<ErrorType>,
         message: impl Into<String>,
-        source: Option<Box<dyn error::Error + Send + Sync>>,
+        retry_after: Option<Duration>,
     ) -> Self {
-        Error::Encoding {
+        let kind = ErrorKind::Api {
+            service,
+            status,
+            error_type,
+            error_code: None,
+            retry_after,
+            retryable: None,
+        };
+        Self::new(kind, message)
+    }
+
+    /// Builds an error of `kind` with no source.
+    pub(crate) fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind: Box::new(kind),
             message: message.into(),
-            source: source.map(Arc::from),
+            request_id: None,
+            events_delivered: None,
+            source: None,
         }
     }
 
-    /// Creates a new sandbox error.
-    #[must_use]
-    pub fn sandbox(message: impl Into<String>) -> Self {
-        Error::Sandbox {
-            message: message.into(),
-        }
+    /// Builds the [`ErrorKind::Api`] error for an HTTP error status. Every client parses its own
+    /// body shape, then calls this. A body without a message gets
+    /// `HTTP {status} with no error message`.
+    pub(crate) fn http_status(
+        service: Service,
+        status: u16,
+        message: Option<String>,
+        error_type: Option<ErrorType>,
+        error_code: Option<ErrorCode>,
+        request_id: Option<String>,
+        retry_after: Option<Duration>,
+    ) -> Self {
+        let kind = ErrorKind::Api {
+            service,
+            status: Some(status),
+            error_type,
+            error_code,
+            retry_after,
+            retryable: None,
+        };
+        let message = message.unwrap_or_else(|| format!("HTTP {status} with no error message"));
+        Self::new(kind, message).with_request_id(request_id)
     }
 
-    /// Creates a new unknown error.
-    #[must_use]
-    pub fn unknown(message: impl Into<String>) -> Self {
-        Error::Unknown {
-            message: message.into(),
-        }
+    /// Keeps `source` as the cause. It never reaches the message.
+    pub(crate) fn with_source(mut self, source: impl error::Error + Send + Sync + 'static) -> Self {
+        self.source = Some(Arc::new(source));
+        self
     }
 
-    /// Creates a new ToDo error for unimplemented functionality.
-    #[must_use]
-    pub fn todo(message: impl Into<String>) -> Self {
-        Error::ToDo {
-            message: message.into(),
-        }
-    }
-
-    /// Returns true if this error is related to authentication.
-    #[must_use]
-    pub fn is_authentication(&self) -> bool {
-        matches!(self, Error::Authentication { .. })
-    }
-
-    /// Returns true if this error is related to permissions.
-    #[must_use]
-    pub fn is_permission(&self) -> bool {
-        matches!(self, Error::Permission { .. })
-    }
-
-    /// Returns true if this error is a "not found" error.
-    #[must_use]
-    pub fn is_not_found(&self) -> bool {
-        matches!(self, Error::NotFound { .. })
-    }
-
-    /// Returns true if this error is related to rate limiting.
-    #[must_use]
-    pub fn is_rate_limit(&self) -> bool {
-        matches!(self, Error::RateLimit { .. })
-    }
-
-    /// Returns true if this error is a bad request.
-    #[must_use]
-    pub fn is_bad_request(&self) -> bool {
-        matches!(self, Error::BadRequest { .. })
-    }
-
-    /// Returns true if this error is a timeout.
-    #[must_use]
-    pub fn is_timeout(&self) -> bool {
-        matches!(self, Error::Timeout { .. })
-    }
-
-    /// Returns true if this error is an abort.
-    #[must_use]
-    pub fn is_abort(&self) -> bool {
-        matches!(self, Error::Abort { .. })
-    }
-
-    /// Returns true if this error is a connection error.
-    #[must_use]
-    pub fn is_connection(&self) -> bool {
-        matches!(self, Error::Connection { .. })
-    }
-
-    /// Returns true if this error is a server error: any HTTP 5xx status.
-    #[must_use]
-    pub fn is_server_error(&self) -> bool {
-        matches!(
-            self,
-            Error::InternalServer { .. }
-                | Error::ServiceUnavailable { .. }
-                | Error::Overloaded { .. }
-        ) || matches!(self.status_code(), Some(500..=599))
-    }
-
-    /// Strict policy: only pre-header connection failures and explicit retryable HTTP statuses.
-    #[must_use]
-    pub fn is_retryable(&self) -> bool {
-        match self {
-            Self::Connection { .. } => true,
-            error if error.metadata().is_some() => {
-                matches!(error.status_code(), Some(408 | 409 | 429 | 500..=599))
-            }
-            _ => false,
-        }
-    }
-    /// Returns true if this error is a [`Error::ToDo`].
-    #[must_use]
-    pub fn is_todo(&self) -> bool {
-        matches!(self, Self::ToDo { .. })
-    }
-    /// Returns true if this error is a validation error.
-    #[must_use]
-    pub fn is_validation(&self) -> bool {
-        matches!(self, Self::Validation { .. })
-    }
-    /// HTTP diagnostics, when the error came from a response.
-    #[must_use]
-    pub fn metadata(&self) -> Option<&HttpMetadata> {
-        match self {
-            Self::Api { metadata, .. }
-            | Self::Authentication { metadata, .. }
-            | Self::Permission { metadata, .. }
-            | Self::NotFound { metadata, .. }
-            | Self::RateLimit { metadata, .. }
-            | Self::BadRequest { metadata, .. }
-            | Self::InternalServer { metadata, .. }
-            | Self::ServiceUnavailable { metadata, .. }
-            | Self::Overloaded { metadata, .. } => Some(metadata),
-            Self::Timeout { metadata, .. } => metadata.as_deref(),
-            _ => None,
-        }
-    }
-    /// The response's `request-id`, when known.
-    #[must_use]
-    pub fn request_id(&self) -> Option<&str> {
-        self.metadata().and_then(|m| m.request_id.as_deref())
-    }
-    /// The response's HTTP status, when the error came from a response.
-    #[must_use]
-    pub fn status_code(&self) -> Option<u16> {
-        self.metadata().map(|m| m.status)
-    }
-    /// The delay the server asked for in `retry-after`, when it sent one.
-    #[must_use]
-    pub fn retry_after(&self) -> Option<Duration> {
-        self.metadata().and_then(|m| m.retry_after)
-    }
-    #[must_use]
-    pub(crate) fn with_http_metadata(self, metadata: HttpMetadata) -> Self {
-        match self {
-            Self::Timeout {
-                message, source, ..
-            } => Self::Timeout {
-                message,
-                source,
-                metadata: Some(Box::new(metadata)),
-            },
-            error => Self::from_http(error.to_string(), metadata, Some(Box::new(error))),
-        }
-    }
-
-    #[must_use]
+    /// Attaches the response's request id, when there is one. The kind never changes.
     pub(crate) fn with_request_id(mut self, request_id: Option<String>) -> Self {
-        if request_id.is_none() {
-            return self;
-        }
-        match &mut self {
-            Self::Api { metadata, .. }
-            | Self::Authentication { metadata, .. }
-            | Self::Permission { metadata, .. }
-            | Self::NotFound { metadata, .. }
-            | Self::RateLimit { metadata, .. }
-            | Self::BadRequest { metadata, .. }
-            | Self::InternalServer { metadata, .. }
-            | Self::ServiceUnavailable { metadata, .. }
-            | Self::Overloaded { metadata, .. } => metadata.request_id = request_id,
-            _ => {
-                return self.with_http_metadata(HttpMetadata {
-                    status: 200,
-                    request_id,
-                    ..Default::default()
-                });
-            }
+        if request_id.is_some() {
+            self.request_id = request_id;
         }
         self
     }
-}
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Api { message, .. } => write!(f, "Api: {message}")?,
-            Self::Authentication { message, .. } => write!(f, "Authentication: {message}")?,
-            Self::Permission { message, .. } => write!(f, "Permission: {message}")?,
-            Self::NotFound { message, .. } => write!(f, "NotFound: {message}")?,
-            Self::RateLimit { message, .. } => write!(f, "RateLimit: {message}")?,
-            Self::BadRequest { message, .. } => write!(f, "BadRequest: {message}")?,
-            Self::InternalServer { message, .. } => write!(f, "InternalServer: {message}")?,
-            Self::ServiceUnavailable { message, .. } => write!(f, "ServiceUnavailable: {message}")?,
-            Self::Overloaded { message, .. } => write!(f, "Overloaded: {message}")?,
-            Self::Timeout { message, .. } => write!(f, "Timeout: {message}")?,
-            Self::Abort { message, .. } => write!(f, "Abort: {message}")?,
-            Self::Connection { message, .. } => write!(f, "Connection: {message}")?,
-            Self::Serialization { message, .. } => write!(f, "Serialization: {message}")?,
-            Self::Io { message, .. } => write!(f, "Io: {message}")?,
-            Self::HttpClient { message, .. } => write!(f, "HttpClient: {message}")?,
-            Self::Validation { message, .. } => write!(f, "Validation: {message}")?,
-            Self::Url { message, .. } => write!(f, "Url: {message}")?,
-            Self::Streaming { message, .. } => write!(f, "Streaming: {message}")?,
-            Self::Encoding { message, .. } => write!(f, "Encoding: {message}")?,
-            Self::Sandbox { message, .. } => write!(f, "Sandbox: {message}")?,
-            Self::Unknown { message, .. } => write!(f, "Unknown: {message}")?,
-            Self::ToDo { message, .. } => write!(f, "ToDo: {message}")?,
-        }
-        if let Some(id) = self.request_id() {
-            write!(f, " (Request ID: {id})")?;
-        }
-        Ok(())
+
+    /// Records how many events a stream yielded before this error. The kind never changes.
+    pub(crate) fn with_events_delivered(mut self, events_delivered: u64) -> Self {
+        self.events_delivered = Some(events_delivered);
+        self
     }
-}
-impl error::Error for Error {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match self {
-            Error::Api { source, .. }
-            | Error::Authentication { source, .. }
-            | Error::Permission { source, .. }
-            | Error::NotFound { source, .. }
-            | Error::RateLimit { source, .. }
-            | Error::BadRequest { source, .. }
-            | Error::InternalServer { source, .. }
-            | Error::ServiceUnavailable { source, .. }
-            | Error::Overloaded { source, .. }
-            | Error::Timeout { source, .. }
-            | Error::Connection { source, .. } => source
-                .as_ref()
-                .map(|e| e.as_ref() as &(dyn error::Error + 'static)),
-            Error::Serialization { source, .. } => source
-                .as_ref()
-                .map(|e| e.as_ref() as &(dyn error::Error + 'static)),
-            Error::Io { source, .. } => Some(source),
-            Error::HttpClient { source, .. } => source
-                .as_ref()
-                .map(|e| e.as_ref() as &(dyn error::Error + 'static)),
-            Error::Url { source, .. } => {
-                source.as_ref().map(|e| e as &(dyn error::Error + 'static))
-            }
-            Error::Streaming { source, .. } => source
-                .as_ref()
-                .map(|e| e.as_ref() as &(dyn error::Error + 'static)),
-            Error::Encoding { source, .. } => source
-                .as_ref()
-                .map(|e| e.as_ref() as &(dyn error::Error + 'static)),
+
+    /// Rewrites the parameter of a [`ErrorKind::Validation`] error with `rename`, keeping the
+    /// message and source. Other kinds, and a validation error without a parameter, are
+    /// returned as they are.
+    pub(crate) fn rename_param(mut self, rename: impl FnOnce(&str) -> String) -> Self {
+        if let ErrorKind::Validation { param: Some(param) } = self.kind.as_mut() {
+            *param = rename(param);
+        }
+        self
+    }
+
+    /// This layer's words, without the request id.
+    #[cfg(test)]
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// What failed.
+    #[must_use]
+    pub fn kind(&self) -> &ErrorKind {
+        &self.kind
+    }
+
+    /// The response's request id, when one came back.
+    #[must_use]
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
+    /// The HTTP status of an [`ErrorKind::Api`] error; `None` for every other kind and for an
+    /// `error` event inside a stream.
+    #[must_use]
+    pub fn status(&self) -> Option<u16> {
+        match self.kind.as_ref() {
+            ErrorKind::Api { status, .. } => *status,
             _ => None,
         }
     }
-}
 
-impl From<io::Error> for Error {
-    fn from(err: io::Error) -> Self {
-        Error::io(err.to_string(), err)
+    /// The delay an [`ErrorKind::Api`] error asked for in `retry-after`.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self.kind.as_ref() {
+            ErrorKind::Api { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// For an error yielded by a stream, the number of events the stream yielded before it.
+    /// `Some(0)` means resending the request is clean.
+    #[must_use]
+    pub fn events_delivered(&self) -> Option<u64> {
+        self.events_delivered
+    }
+
+    /// Whether sending the same request again might succeed.
+    ///
+    /// True for [`ErrorKind::Connection`], [`ErrorKind::Timeout`] and
+    /// [`ErrorKind::Interrupted`]; for HTTP 408, 409, 429 and 5xx, except a 429 for an
+    /// exhausted spend limit; and for stream `error` events that say they are retryable or, when
+    /// they don't say, have a transient type. False for everything else.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self.kind.as_ref() {
+            ErrorKind::Connection | ErrorKind::Timeout | ErrorKind::Interrupted => true,
+            ErrorKind::Api {
+                status: Some(429),
+                error_code: Some(ErrorCode::Anthropic(code)),
+                ..
+            } if code == "enforced_spend_limit_reached" => false,
+            ErrorKind::Api {
+                status: Some(status),
+                ..
+            } => matches!(status, 408 | 409 | 429 | 500..=599),
+            ErrorKind::Api {
+                status: None,
+                retryable: Some(retryable),
+                ..
+            } => *retryable,
+            ErrorKind::Api {
+                status: None,
+                error_type,
+                ..
+            } => matches!(
+                error_type,
+                Some(
+                    ErrorType::OverloadedError
+                        | ErrorType::ApiError
+                        | ErrorType::RateLimitError
+                        | ErrorType::TimeoutError
+                )
+            ),
+            ErrorKind::Validation { .. }
+            | ErrorKind::RequestTooLarge { .. }
+            | ErrorKind::UnsupportedSchema { .. }
+            | ErrorKind::Decode
+            | ErrorKind::MaxTokens
+            | ErrorKind::Refusal
+            | ErrorKind::Io { .. }
+            | ErrorKind::Sandbox
+            | ErrorKind::Tool => false,
+        }
     }
 }
 
-impl From<serde_json::Error> for Error {
-    fn from(err: serde_json::Error) -> Self {
-        Error::serialization(format!("JSON error: {err}"), Some(Box::new(err)))
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ErrorKind::Api {
+            service,
+            status,
+            error_type,
+            error_code,
+            ..
+        } = self.kind.as_ref()
+        else {
+            f.write_str(&self.message)?;
+            if let Some(id) = &self.request_id {
+                write!(f, " (request {id})")?;
+            }
+            return Ok(());
+        };
+        write!(f, "{service} API error: {} (", self.message)?;
+        // Anthropic's error type, else the service's own code, as the service sends it.
+        let error_type = match error_type {
+            Some(error_type) => error_type.wire_name(),
+            None => error_code.as_ref().and_then(ErrorCode::wire_name),
+        };
+        match (status, error_type) {
+            (Some(status), Some(error_type)) => write!(f, "HTTP {status} {error_type}")?,
+            (Some(status), None) => write!(f, "HTTP {status}")?,
+            (None, Some(error_type)) => write!(f, "in stream, {error_type}")?,
+            (None, None) => f.write_str("in stream")?,
+        }
+        if let Some(id) = &self.request_id {
+            write!(f, ", request {id}")?;
+        }
+        f.write_str(")")
     }
 }
 
-impl From<url::ParseError> for Error {
-    fn from(err: url::ParseError) -> Self {
-        Error::url(format!("URL parse error: {err}"), Some(err))
-    }
-}
-
-impl From<Utf8Error> for Error {
-    fn from(err: Utf8Error) -> Self {
-        Error::encoding(format!("UTF-8 error: {err}"), Some(Box::new(err)))
+impl error::Error for Error {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn error::Error + 'static))
     }
 }
 
 /// A specialized Result type for Topcoat SI operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Phase determines whether a transport failure is safe to retry.
-#[derive(Clone, Copy)]
+/// Says where serde_json gave up, as the error category, line and column. It never quotes the
+/// text that failed to parse, which is response content and may be sensitive.
+pub(crate) fn describe_json_error(error: &serde_json::Error) -> String {
+    let category = match error.classify() {
+        Category::Io => "I/O error",
+        Category::Syntax => "syntax error",
+        Category::Data => "type or value mismatch",
+        Category::Eof => "unexpected end of input",
+    };
+    format!(
+        "{category} at line {} column {}",
+        error.line(),
+        error.column()
+    )
+}
+
+/// Whether response headers had arrived when a transport failure happened.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum RequestPhase {
     Headers,
     Body,
 }
 
+/// Maps a reqwest failure by what happened. The message names the host; the reqwest error is the
+/// source.
 pub(crate) fn map_reqwest_error(err: reqwest::Error, phase: RequestPhase) -> Error {
-    let mut message = err.to_string();
-    let mut source = error::Error::source(&err);
-    while let Some(inner) = source {
-        message.push_str(": ");
-        message.push_str(&inner.to_string());
-        source = inner.source();
-    }
-    if err.is_timeout() {
-        Error::Timeout {
-            message,
-            source: Some(Arc::new(err)),
-            metadata: None,
-        }
-    } else if err.is_builder() {
-        Error::http_client(message, Some(Box::new(err)))
-    } else if matches!(phase, RequestPhase::Headers) && (err.is_connect() || err.is_request()) {
-        Error::connection(message, Some(Box::new(err)))
+    let host = err
+        .url()
+        .and_then(|url| url.host_str())
+        .unwrap_or("the server")
+        .to_string();
+    // reqwest reports a connect timeout as both a connect and a timeout failure, so the connect
+    // check comes first.
+    let (kind, message) = if err.is_builder() {
+        (
+            ErrorKind::Validation { param: None },
+            format!("could not build the request to {host}"),
+        )
+    } else if err.is_connect() {
+        (
+            ErrorKind::Connection,
+            format!("could not connect to {host}"),
+        )
+    } else if err.is_timeout() {
+        (ErrorKind::Timeout, format!("request to {host} timed out"))
     } else {
-        Error::http_client(message, Some(Box::new(err)))
-    }
+        // reqwest reports every failed body read as a decode error, so the phase decides.
+        let message = match phase {
+            RequestPhase::Headers => {
+                format!("connection to {host} failed before a response arrived")
+            }
+            RequestPhase::Body => format!("connection to {host} failed while reading the response"),
+        };
+        (ErrorKind::Interrupted, message)
+    };
+    Error::new(kind, message).with_source(err)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
     use super::*;
 
+    fn http(status: u16) -> Error {
+        Error::http_status(Service::Anthropic, status, None, None, None, None, None)
+    }
+
+    fn stream_event(error_type: Option<ErrorType>, retryable: Option<bool>) -> Error {
+        let kind = ErrorKind::Api {
+            service: Service::Anthropic,
+            status: None,
+            error_type,
+            error_code: None,
+            retry_after: None,
+            retryable,
+        };
+        Error::new(kind, "stream failed")
+    }
+
     #[test]
-    fn every_5xx_status_is_a_server_error() {
-        for status in [500, 501, 503, 529, 599] {
-            let error = Error::api(status, None, "failed", None);
-            assert!(error.is_server_error(), "{status}");
+    fn retryable_kinds() {
+        let cases = [
+            (ErrorKind::Validation { param: None }, false),
+            (ErrorKind::RequestTooLarge { size: 2, limit: 1 }, false),
+            (
+                ErrorKind::UnsupportedSchema {
+                    type_name: "Node".to_string(),
+                },
+                false,
+            ),
+            (ErrorKind::Connection, true),
+            (ErrorKind::Timeout, true),
+            (ErrorKind::Interrupted, true),
+            (ErrorKind::Decode, false),
+            (ErrorKind::MaxTokens, false),
+            (ErrorKind::Refusal, false),
+            (ErrorKind::Io { path: None }, false),
+            (ErrorKind::Sandbox, false),
+            (ErrorKind::Tool, false),
+        ];
+        for (kind, retryable) in cases {
+            let error = Error::new(kind.clone(), "failed");
+            assert_eq!(error.is_retryable(), retryable, "{kind:?}");
         }
-        for status in [400, 429, 600] {
-            let error = Error::api(status, None, "failed", None);
-            assert!(!error.is_server_error(), "{status}");
+    }
+
+    #[test]
+    fn retryable_statuses() {
+        for status in [408, 409, 429, 500, 501, 502, 503, 504, 529, 599] {
+            assert!(http(status).is_retryable(), "{status}");
         }
+        for status in [200, 400, 401, 402, 403, 404, 413, 422, 600] {
+            assert!(!http(status).is_retryable(), "{status}");
+        }
+    }
+
+    #[test]
+    fn spend_limit_429_is_not_retryable() {
+        let spend_cap = Error::http_status(
+            Service::Anthropic,
+            429,
+            Some("Spend limit reached".to_string()),
+            Some(ErrorType::RateLimitError),
+            Some(ErrorCode::Anthropic(
+                "enforced_spend_limit_reached".to_string(),
+            )),
+            None,
+            None,
+        );
+        assert!(!spend_cap.is_retryable());
+        let other_code = Error::http_status(
+            Service::Anthropic,
+            429,
+            None,
+            None,
+            Some(ErrorCode::Anthropic("something_else".to_string())),
+            None,
+            None,
+        );
+        assert!(other_code.is_retryable());
+    }
+
+    #[test]
+    fn stream_events_follow_their_flag_then_their_type() {
+        for error_type in [
+            ErrorType::OverloadedError,
+            ErrorType::ApiError,
+            ErrorType::RateLimitError,
+            ErrorType::TimeoutError,
+        ] {
+            assert!(
+                stream_event(Some(error_type), None).is_retryable(),
+                "{error_type:?}"
+            );
+            assert!(
+                !stream_event(Some(error_type), Some(false)).is_retryable(),
+                "{error_type:?}"
+            );
+        }
+        for error_type in [
+            ErrorType::InvalidRequestError,
+            ErrorType::RequestTooLarge,
+            ErrorType::Unknown,
+        ] {
+            assert!(
+                !stream_event(Some(error_type), None).is_retryable(),
+                "{error_type:?}"
+            );
+        }
+        assert!(!stream_event(None, None).is_retryable());
+        assert!(stream_event(Some(ErrorType::InvalidRequestError), Some(true)).is_retryable());
+        assert!(stream_event(None, Some(true)).is_retryable());
+    }
+
+    #[test]
+    fn api_display_names_service_status_type_and_request() {
+        let error = Error::http_status(
+            Service::Anthropic,
+            529,
+            Some("Overloaded".to_string()),
+            Some(ErrorType::OverloadedError),
+            None,
+            Some("req_123".to_string()),
+            None,
+        );
+        assert_eq!(
+            error.to_string(),
+            "Anthropic API error: Overloaded (HTTP 529 overloaded_error, request req_123)"
+        );
+        let error = Error::api(Service::Firecrawl, Some(404), None, "Not found", None);
+        assert_eq!(
+            error.to_string(),
+            "Firecrawl API error: Not found (HTTP 404)"
+        );
+        let error = Error::http_status(Service::Jev, 503, None, None, None, None, None);
+        assert_eq!(
+            error.to_string(),
+            "Jev API error: HTTP 503 with no error message (HTTP 503)"
+        );
+        let error = Error::http_status(
+            Service::Firecrawl,
+            429,
+            Some("Slow down".to_string()),
+            None,
+            Some(ErrorCode::Firecrawl("RATE_LIMIT".to_string())),
+            None,
+            None,
+        );
+        assert_eq!(
+            error.to_string(),
+            "Firecrawl API error: Slow down (HTTP 429 RATE_LIMIT)"
+        );
+        let error = Error::http_status(
+            Service::Anthropic,
+            500,
+            Some("Odd".to_string()),
+            Some(ErrorType::Unknown),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(error.to_string(), "Anthropic API error: Odd (HTTP 500)");
+    }
+
+    #[test]
+    fn stream_event_display_says_in_stream() {
+        let error = stream_event(Some(ErrorType::OverloadedError), None)
+            .with_request_id(Some("req_1".to_string()));
+        assert_eq!(
+            error.to_string(),
+            "Anthropic API error: stream failed (in stream, overloaded_error, request req_1)"
+        );
+        assert_eq!(
+            stream_event(None, None).to_string(),
+            "Anthropic API error: stream failed (in stream)"
+        );
+    }
+
+    #[test]
+    fn other_kinds_display_their_message_and_request() {
+        let error = Error::new(ErrorKind::Decode, "could not parse the response");
+        assert_eq!(error.to_string(), "could not parse the response");
+        let error = error.with_request_id(Some("req_9".to_string()));
+        assert_eq!(
+            error.to_string(),
+            "could not parse the response (request req_9)"
+        );
+    }
+
+    #[test]
+    fn display_never_names_a_variant() {
+        let kinds = [
+            ErrorKind::Validation { param: None },
+            ErrorKind::Connection,
+            ErrorKind::Timeout,
+            ErrorKind::Interrupted,
+            ErrorKind::Decode,
+            ErrorKind::Sandbox,
+            ErrorKind::Tool,
+        ];
+        let mut errors: Vec<Error> = Vec::new();
+        for kind in kinds {
+            errors.push(Error::new(kind, "failed").with_request_id(Some("req".to_string())));
+        }
+        errors.push(http(503));
+        errors.push(stream_event(Some(ErrorType::ApiError), None));
+        for error in errors {
+            let text = error.to_string();
+            for name in [
+                "Api:",
+                "Timeout:",
+                "Connection:",
+                "Validation:",
+                "Decode",
+                "Interrupted",
+                "Sandbox",
+                "ErrorKind",
+            ] {
+                assert!(!text.contains(name), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn attaching_request_id_or_events_never_changes_the_kind() {
+        let kinds = [
+            ErrorKind::Validation { param: None },
+            ErrorKind::Connection,
+            ErrorKind::Timeout,
+            ErrorKind::Interrupted,
+            ErrorKind::Decode,
+            ErrorKind::Tool,
+            http(529).kind().clone(),
+        ];
+        for kind in kinds {
+            let error = Error::new(kind.clone(), "failed")
+                .with_request_id(Some("req_1".to_string()))
+                .with_events_delivered(3);
+            assert_eq!(error.kind(), &kind);
+            assert_eq!(error.request_id(), Some("req_1"));
+            assert_eq!(error.events_delivered(), Some(3));
+        }
+        let kept = Error::new(ErrorKind::Decode, "failed")
+            .with_request_id(Some("req_1".to_string()))
+            .with_request_id(None);
+        assert_eq!(kept.request_id(), Some("req_1"));
+    }
+
+    #[test]
+    fn accessors_read_the_api_kind_only() {
+        let error = Error::api(
+            Service::Anthropic,
+            Some(429),
+            None,
+            "slow down",
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(error.status(), Some(429));
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(5)));
+        let error = Error::new(ErrorKind::Timeout, "timed out");
+        assert_eq!(error.status(), None);
+        assert_eq!(error.retry_after(), None);
+    }
+
+    #[test]
+    fn source_is_kept_and_not_copied_into_the_message() {
+        let cause = std::io::Error::other("disk on fire");
+        let error =
+            Error::new(ErrorKind::Io { path: None }, "could not read the key").with_source(cause);
+        assert!(!error.to_string().contains("disk on fire"));
+        assert_eq!(
+            error.source().map(ToString::to_string).as_deref(),
+            Some("disk on fire")
+        );
+    }
+
+    #[test]
+    fn renaming_a_validation_param_keeps_message_and_source() {
+        let cause = std::io::Error::other("bad byte");
+        let error = Error::validation("bad role", Some("messages[0].role".to_string()))
+            .with_source(cause)
+            .rename_param(|param| format!("requests[2].params.{param}"));
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::Validation {
+                param: Some("requests[2].params.messages[0].role".to_string())
+            }
+        );
+        assert_eq!(error.to_string(), "bad role");
+        assert_eq!(
+            error.source().map(ToString::to_string).as_deref(),
+            Some("bad byte")
+        );
+        let unnamed = Error::validation("bad", None).rename_param(|_| "renamed".to_string());
+        assert_eq!(unnamed.kind(), &ErrorKind::Validation { param: None });
+    }
+
+    async fn reqwest_error(client: reqwest::Client, url: &str, phase: RequestPhase) -> Error {
+        let error = match phase {
+            RequestPhase::Headers => client
+                .get(url)
+                .send()
+                .await
+                .expect_err("the request should fail"),
+            RequestPhase::Body => client
+                .get(url)
+                .send()
+                .await
+                .expect("headers should arrive")
+                .bytes()
+                .await
+                .expect_err("the body should fail"),
+        };
+        map_reqwest_error(error, phase)
+    }
+
+    fn local_client(timeout: Option<Duration>) -> reqwest::Client {
+        let builder = reqwest::Client::builder().no_proxy();
+        let builder = match timeout {
+            Some(timeout) => builder.timeout(timeout),
+            None => builder,
+        };
+        builder.build().expect("client")
+    }
+
+    #[tokio::test]
+    async fn refused_connection_is_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        drop(listener);
+        let url = format!("http://{address}/");
+        let error = reqwest_error(local_client(None), &url, RequestPhase::Headers).await;
+        assert_eq!(error.kind(), &ErrorKind::Connection, "{error}");
+        assert!(error.is_retryable());
+        assert_eq!(error.to_string(), "could not connect to 127.0.0.1");
+        assert!(error.source().is_some());
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_is_connection_and_retryable() {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(100))
+            .no_proxy()
+            .build()
+            .expect("client");
+        // TEST-NET-1 is never routed, so the connection never completes.
+        let error = reqwest_error(client, "http://192.0.2.1/", RequestPhase::Headers).await;
+        assert_eq!(error.kind(), &ErrorKind::Connection, "{error}");
+        assert!(error.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn response_timeout_after_connect_is_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0; 1024];
+            let _ = socket.read(&mut buffer).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let client = local_client(Some(Duration::from_millis(200)));
+        let url = format!("http://{address}/");
+        let error = reqwest_error(client, &url, RequestPhase::Headers).await;
+        assert_eq!(error.kind(), &ErrorKind::Timeout, "{error}");
+        assert!(error.is_retryable());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn body_dropped_mid_way_is_interrupted() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0; 1024];
+            let _ = socket.read(&mut buffer).await;
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial";
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+        let url = format!("http://{address}/");
+        let error = reqwest_error(local_client(None), &url, RequestPhase::Body).await;
+        assert_eq!(error.kind(), &ErrorKind::Interrupted, "{error}");
+        assert_eq!(
+            error.to_string(),
+            "connection to 127.0.0.1 failed while reading the response"
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_error_is_validation() {
+        let error = reqwest_error(local_client(None), "not a url", RequestPhase::Headers).await;
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::Validation { param: None },
+            "{error}"
+        );
+        assert!(!error.is_retryable());
     }
 }

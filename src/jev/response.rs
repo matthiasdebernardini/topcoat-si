@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::{Answer, ChoiceAnswer, Choices, Levels, Outcome, ScoreAnswer};
 use super::{answer, outcome};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result, describe_json_error};
 
 /// Tokens one request consumed. Either count may be missing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -84,18 +84,19 @@ impl JevResponse {
         request_id: Option<String>,
         attempts: usize,
     ) -> Result<Self> {
-        let Ok(wire) = serde_json::from_slice::<WireResponse>(&response_body) else {
-            let id = request_id
-                .as_deref()
-                .map(|id| format!(", request id {id}"))
-                .unwrap_or_default();
-            return Err(Error::serialization(
-                format!(
-                    "Failed to parse Jev response ({} bytes{id})",
-                    response_body.len()
-                ),
-                None,
-            ));
+        let wire = match serde_json::from_slice::<WireResponse>(&response_body) {
+            Ok(wire) => wire,
+            Err(error) => {
+                return Err(Error::new(
+                    ErrorKind::Decode,
+                    format!(
+                        "Failed to parse Jev response ({} bytes): {}",
+                        response_body.len(),
+                        describe_json_error(&error)
+                    ),
+                )
+                .with_request_id(request_id));
+            }
         };
         let answers: Vec<_> = wire
             .answers
@@ -129,16 +130,16 @@ impl JevResponse {
                 )
             })?;
         match answer {
-            Answer::Unknown(raw) => Err(Error::serialization(
+            Answer::Unknown(raw) => Err(Error::new(
+                ErrorKind::Decode,
                 format!(
                     "Jev answer {name:?} has type {:?}, which this client does not know",
                     answer::type_tag(raw)
                 ),
-                None,
             )),
-            Answer::Malformed { kind, .. } => Err(Error::serialization(
+            Answer::Malformed { kind, .. } => Err(Error::new(
+                ErrorKind::Decode,
                 format!("the {kind} answer for {name:?} could not be read"),
-                None,
             )),
             answer => Ok(answer),
         }
@@ -189,12 +190,12 @@ impl JevResponse {
             .find(|option| option.label == answer.choice)
             .map(|option| option.value)
             .ok_or_else(|| {
-                Error::serialization(
+                Error::new(
+                    ErrorKind::Decode,
                     format!(
                         "Jev's choice for {name:?} is not a label of {}",
                         std::any::type_name::<T>()
                     ),
-                    None,
                 )
             })?;
         Ok(outcome::gate(value, answer.confidence, min_confidence))
@@ -226,12 +227,12 @@ impl JevResponse {
             .and_then(|index| T::LEVELS.get(index))
             .map(|level| level.value)
             .ok_or_else(|| {
-                Error::serialization(
+                Error::new(
+                    ErrorKind::Decode,
                     format!(
                         "Jev's level for {name:?} is not a level of {}",
                         std::any::type_name::<T>()
                     ),
-                    None,
                 )
             })?;
         Ok(outcome::gate(value, answer.confidence, min_confidence))
@@ -242,9 +243,9 @@ fn finite(name: &str, value: f64) -> Result<f64> {
     if value.is_finite() {
         Ok(value)
     } else {
-        Err(Error::serialization(
+        Err(Error::new(
+            ErrorKind::Decode,
             format!("Jev answer {name:?} holds a non-finite number"),
-            None,
         ))
     }
 }

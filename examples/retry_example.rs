@@ -1,5 +1,35 @@
 use std::time::Duration;
-use topcoat_si::{Anthropic, KnownModel, MessageCreateParams, MessageParam, Model};
+use topcoat_si::{
+    Anthropic, Error, ErrorKind, ErrorType, KnownModel, MessageCreateParams, MessageParam, Model,
+    Service,
+};
+
+/// Says what to do about a failed request, using the three questions an `Error` answers: what
+/// failed (`kind`), which service, and whether sending again might work (`is_retryable`).
+fn advise(err: &Error) -> String {
+    if err.is_retryable() {
+        return match err.retry_after() {
+            Some(wait) => format!("retryable: the service asked for {wait:?}"),
+            None => "retryable: try again with a backoff of your own".to_string(),
+        };
+    }
+    match err.kind() {
+        ErrorKind::Api {
+            service,
+            status: Some(401),
+            ..
+        } => format!("check the {service} API key"),
+        ErrorKind::Api {
+            service, status, ..
+        } => {
+            format!("{service} refused with {status:?}; sending the same request again won't help")
+        }
+        ErrorKind::Validation { param, .. } => format!("fix the request ({param:?})"),
+        ErrorKind::MaxTokens => "raise max_tokens".to_string(),
+        // `ErrorKind` is non-exhaustive, so a wildcard arm is required.
+        _ => "not retryable".to_string(),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,14 +40,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The Debug output shows the timeout and max_retries the client will use.
     println!("Client configured with retry settings: {client:?}");
-    println!("- Retried: connection failures and HTTP 408, 409, 429 and 5xx responses");
+    println!("- Retried: errors whose is_retryable() is true, except as noted below");
+    println!("- Never resent automatically: a Timeout");
     println!(
-        "- Backoff before retry n (from 0): 0.5 s * 2^n capped at 8 s, plus up to 25% jitter, \
-         never above 8 s"
+        "- Interrupted (the request was sent, then the connection failed before a complete \
+         response arrived): only GET requests resend it"
     );
     println!(
-        "- A longer Retry-After header is waited out instead; one over 60 seconds fails at once"
+        "- Delay before retry n (from 0): 0.5 s * 2^n capped at 8 s, plus up to 25% jitter, or \
+         the server's Retry-After when that is longer"
     );
+    println!("- A Retry-After over 60 seconds fails at once");
+    println!();
+
+    // `Error::api` simulates a 429 without a network, as a downstream test would.
+    let simulated = Error::api(
+        Service::Anthropic,
+        Some(429),
+        Some(ErrorType::RateLimitError),
+        "Rate limited",
+        Some(Duration::from_secs(20)),
+    );
+    println!("Simulated: {simulated}");
+    println!("  -> {}", advise(&simulated));
     println!();
 
     let message = MessageParam::user("Hello, how are you?");
@@ -39,18 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Err(e) => {
+            // The client has already retried what it may; this is what is left.
             println!("Request failed: {e}");
-            if e.is_rate_limit() {
-                println!(
-                    "This was a rate limit error - it was retried up to max_retries times, unless Retry-After was over 60 s"
-                );
-            } else if e.is_retryable() {
-                println!(
-                    "This was a retryable error - the client would have automatically retried"
-                );
-            } else {
-                println!("This was a non-retryable error - no retry was attempted");
-            }
+            println!("  request id: {:?}", e.request_id());
+            println!("  -> {}", advise(&e));
         }
     }
 

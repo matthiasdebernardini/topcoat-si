@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::code_mode::{Example, HostError, Pack, PyError, host_fn, value};
-use crate::error::{Error, Result};
+use crate::error::{ErrorKind, Result};
 use crate::jev::{self, JevClient, JevResponse, Questions, ToolQuestion};
 
 // The one question the shortcuts ask. Jev never sees names.
@@ -213,9 +213,9 @@ fn score<'a>(
 fn mapped<T>(outcome: Result<T>) -> std::result::Result<T, HostError> {
     outcome.map_err(|error| match error {
         error if jev::is_fatal(&error) => HostError::Fatal(error),
-        Error::Validation { message, .. } => HostError::Raise {
+        error if matches!(error.kind(), ErrorKind::Validation { .. }) => HostError::Raise {
             kind: PyError::ValueError,
-            message: format!("Invalid jev call: {message}"),
+            message: format!("Invalid jev call: {error}"),
         },
         error => HostError::Raise {
             kind: PyError::RuntimeError,

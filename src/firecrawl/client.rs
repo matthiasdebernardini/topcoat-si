@@ -8,12 +8,14 @@ use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest::redirect;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::time::sleep;
 
 use super::{ScrapeRequest, ScrapeResponse, SearchRequest, SearchResponse};
-use crate::backoff;
+use crate::backoff::{self, RetryPolicy};
 use crate::base_url;
-use crate::error::{Error, ErrorCode, HttpMetadata, RequestPhase, Result, map_reqwest_error};
+use crate::error::{
+    Error, ErrorCode, ErrorKind, RequestPhase, Result, Service, describe_json_error,
+    map_reqwest_error,
+};
 use crate::types::retry_after_from_headers;
 
 const DEFAULT_BASE_URL: &str = "https://api.firecrawl.dev";
@@ -60,11 +62,12 @@ impl FirecrawlClient {
             ));
         }
         let mut authorization =
-            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| {
+            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
                 Error::validation(
                     "Firecrawl API key contains characters not allowed in an HTTP header",
                     Some("api_key".to_string()),
                 )
+                .with_source(e)
             })?;
         authorization.set_sensitive(true);
         Ok(Self {
@@ -107,9 +110,11 @@ impl FirecrawlClient {
 
     /// Run a search.
     ///
-    /// The request is validated before anything is sent. Responses 408, 429, 500, 502, 503
-    /// and 504 and connection failures are retried, honoring `Retry-After`. A
-    /// `Retry-After` over 30 seconds fails at once without retrying.
+    /// The request is validated before anything is sent. Whatever [`Error::is_retryable`]
+    /// accepts (408, 409, 429, 5xx, connection failures) is retried, except timeouts and a
+    /// response cut off mid-body, which Firecrawl may already have billed. Each wait is the
+    /// backoff delay or `Retry-After`, whichever is longer; a `Retry-After` over 30 seconds fails
+    /// at once without retrying.
     pub async fn search(&self, request: &SearchRequest) -> Result<SearchResponse> {
         request.validate()?;
         self.post("/v2/search", &request.wire(), None).await
@@ -138,30 +143,29 @@ impl FirecrawlClient {
         T: DeserializeOwned + Succeeded,
     {
         let url = format!("{}{path}", self.base_url);
-        let mut attempt = 0;
-        loop {
-            let error = match self.send_once(&url, body, timeout).await {
-                Ok(response) => return Ok(response),
-                Err(error) => error,
-            };
-            let too_long = error.retry_after().is_some_and(|d| d > MAX_RETRY_AFTER);
-            if attempt >= self.max_retries || !is_retryable(&error) || too_long {
-                return Err(error);
-            }
-            let delay = error
-                .retry_after()
-                .unwrap_or_else(|| backoff::next(attempt));
-            tracing::warn!(
-                target: "topcoat_si::firecrawl",
-                error = &error as &dyn std::error::Error,
-                path,
-                attempt = attempt + 1,
-                sleep_seconds = delay.as_secs_f64(),
-                "Retrying Firecrawl request"
-            );
-            sleep(delay).await;
-            attempt += 1;
-        }
+        let policy = RetryPolicy {
+            max_retries: self.max_retries,
+            max_retry_after: MAX_RETRY_AFTER,
+            budget: None,
+            resend_timeouts: false,
+            resend_interrupted: false,
+        };
+        let retried = backoff::retry(
+            &policy,
+            |_, _| self.send_once(&url, body, timeout),
+            |error, attempt, delay| {
+                tracing::warn!(
+                    target: "topcoat_si::firecrawl",
+                    error = error as &dyn std::error::Error,
+                    path,
+                    attempt = attempt + 1,
+                    sleep_seconds = delay.as_secs_f64(),
+                    "Retrying Firecrawl request"
+                );
+            },
+        )
+        .await;
+        retried.result
     }
 
     async fn send_once<B, T>(&self, url: &str, body: &B, timeout: Option<Duration>) -> Result<T>
@@ -183,20 +187,37 @@ impl FirecrawlClient {
             .map_err(|e| map_reqwest_error(e, RequestPhase::Headers))?;
         let status = response.status().as_u16();
         let retry_after = retry_after_from_headers(response.headers());
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| map_reqwest_error(e, RequestPhase::Body))?;
-        if !(200..300).contains(&status) {
+        let success = (200..300).contains(&status);
+        // An error status whose body failed is still that status, so it stays retryable as one.
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) if success => return Err(map_reqwest_error(e, RequestPhase::Body)),
+            Err(e) => {
+                let error = Error::http_status(
+                    Service::Firecrawl,
+                    status,
+                    None,
+                    None,
+                    None,
+                    None,
+                    retry_after,
+                );
+                return Err(error.with_source(e));
+            }
+        };
+        if !success {
             return Err(http_error(status, &bytes, retry_after));
         }
+        // The serde error quotes the bad value, which is response content, so only its position
+        // is kept.
         let parsed: T = serde_json::from_slice(&bytes).map_err(|e| {
-            Error::serialization(
+            Error::new(
+                ErrorKind::Decode,
                 format!(
-                    "Failed to parse Firecrawl response ({} bytes): {e}",
-                    bytes.len()
+                    "Failed to parse Firecrawl response ({} bytes): {}",
+                    bytes.len(),
+                    describe_json_error(&e)
                 ),
-                Some(Box::new(e)),
             )
         })?;
         if !parsed.succeeded() {
@@ -215,12 +236,7 @@ fn http_client(base_url: &str) -> Result<ReqwestClient> {
         .timeout(DEFAULT_TIMEOUT);
     base_url::with_proxy_rule(builder, base_url)
         .build()
-        .map_err(|e| {
-            Error::http_client(
-                format!("Failed to build HTTP client: {e}"),
-                Some(Box::new(e)),
-            )
-        })
+        .map_err(|e| Error::validation("Failed to build HTTP client", None).with_source(e))
 }
 
 /// A response body carrying Firecrawl's `success` flag.
@@ -240,12 +256,6 @@ impl Succeeded for ScrapeResponse {
     }
 }
 
-/// Firecrawl's transient statuses (408, 429, 500, 502, 503, 504) and connection failures.
-fn is_retryable(error: &Error) -> bool {
-    matches!(error, Error::Connection { .. })
-        || matches!(error.status_code(), Some(408 | 429 | 500 | 502 | 503 | 504))
-}
-
 fn http_error(status: u16, body: &[u8], retry_after: Option<Duration>) -> Error {
     let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
     let field = |name: &str| {
@@ -254,39 +264,15 @@ fn http_error(status: u16, body: &[u8], retry_after: Option<Duration>) -> Error 
             .and_then(|value| value[name].as_str())
             .map(String::from)
     };
-    let code = field("code");
-    let message = match (field("error"), &code) {
-        (Some(error), Some(code)) => format!("Firecrawl returned {status}: {error} (code {code})"),
-        (Some(error), None) => format!("Firecrawl returned {status}: {error}"),
-        (None, Some(code)) => format!("Firecrawl returned {status} (code {code})"),
-        (None, None) => format!("Firecrawl returned {status}"),
-    };
-    let metadata = HttpMetadata {
+    // Display already shows the service and status, so the message is Firecrawl's own words; its
+    // `code` (such as `RATE_LIMIT`) is the error code that Display shows next to the status.
+    Error::http_status(
+        Service::Firecrawl,
         status,
-        error_code: code.map(ErrorCode::Firecrawl),
-        request_id: None,
+        field("error"),
+        None,
+        field("code").map(ErrorCode::Firecrawl),
+        None,
         retry_after,
-    };
-    match status {
-        401 => Error::Authentication {
-            message,
-            metadata,
-            source: None,
-        },
-        429 => Error::RateLimit {
-            message,
-            metadata,
-            source: None,
-        },
-        408 => Error::Timeout {
-            metadata: Some(Box::new(metadata)),
-            message,
-            source: None,
-        },
-        _ => Error::Api {
-            message,
-            metadata,
-            source: None,
-        },
-    }
+    )
 }

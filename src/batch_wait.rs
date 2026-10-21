@@ -7,18 +7,23 @@ use crate::{
     Anthropic, Error, MessageBatch, MessageBatchProcessingStatus, MessageBatchResultVariant, Result,
 };
 
+/// How many polls in a row may fail with a retryable error before the wait gives up.
+const MAX_CONSECUTIVE_POLL_FAILURES: usize = 5;
+
 impl Anthropic {
     /// Polls [`Anthropic::get_message_batch`] every `poll_interval` until the batch has ended, and
     /// returns its final state.
     ///
     /// There is no overall timeout, and a batch can take up to 24 hours; wrap the call in
-    /// `tokio::time::timeout` to bound it. Each poll retries like any other request, and the first
-    /// poll error ends the wait.
+    /// `tokio::time::timeout` to bound it. Each poll retries like any other request. A poll that
+    /// still fails with a retryable error (see [`Error::is_retryable`]) is tried again after
+    /// `poll_interval`; the wait gives up with that error after 5 such failures in a row, and any
+    /// successful poll resets the count. An error that is not retryable ends the wait at once.
     ///
     /// # Errors
     ///
-    /// A validation error, before any request, when `poll_interval` is zero; otherwise any error
-    /// from [`Anthropic::get_message_batch`].
+    /// A validation error, before any request, when `poll_interval` is zero; otherwise the error
+    /// from [`Anthropic::get_message_batch`] that ended the wait.
     pub async fn wait_for_message_batch(
         &self,
         message_batch_id: &str,
@@ -30,16 +35,34 @@ impl Anthropic {
                 Some("poll_interval".to_string()),
             ));
         }
+        let mut failures = 0;
         loop {
-            let batch = self.get_message_batch(message_batch_id).await?;
-            if batch.processing_status == MessageBatchProcessingStatus::Ended {
-                return Ok(batch);
+            match self.get_message_batch(message_batch_id).await {
+                Ok(batch) => {
+                    failures = 0;
+                    if batch.processing_status == MessageBatchProcessingStatus::Ended {
+                        return Ok(batch);
+                    }
+                    tracing::debug!(
+                        batch_id = %batch.id,
+                        processing = batch.request_counts.processing,
+                        "message batch still processing"
+                    );
+                }
+                Err(error) if error.is_retryable() => {
+                    failures += 1;
+                    if failures >= MAX_CONSECUTIVE_POLL_FAILURES {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        target: "topcoat_si::client",
+                        error = &error as &dyn std::error::Error,
+                        failures,
+                        "polling the message batch failed; polling again"
+                    );
+                }
+                Err(error) => return Err(error),
             }
-            tracing::debug!(
-                batch_id = %batch.id,
-                processing = batch.request_counts.processing,
-                "message batch still processing"
-            );
             tokio::time::sleep(poll_interval).await;
         }
     }
@@ -74,6 +97,7 @@ impl Anthropic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ErrorKind;
     use crate::test_support::{Canned, serve};
 
     fn client(base_url: String) -> Anthropic {
@@ -129,8 +153,92 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.is_validation());
+        assert!(matches!(error.kind(), ErrorKind::Validation { .. }));
         assert!(recorded.lock().unwrap().is_empty());
+    }
+
+    fn unavailable() -> Canned {
+        Canned::json(503, r#"{"error":{"type":"api_error","message":"down"}}"#)
+    }
+
+    #[tokio::test]
+    async fn wait_keeps_polling_through_retryable_errors() {
+        let (base_url, recorded) = serve(vec![
+            unavailable(),
+            unavailable(),
+            Canned::json(200, batch("ended")),
+        ])
+        .await;
+
+        let ended = client(base_url)
+            .with_max_retries(0)
+            .wait_for_message_batch("msgbatch_1", Duration::from_millis(1))
+            .await
+            .unwrap();
+
+        assert_eq!(ended.processing_status, MessageBatchProcessingStatus::Ended);
+        assert_eq!(recorded.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn wait_gives_up_after_five_consecutive_failures() {
+        let (base_url, recorded) = serve(vec![
+            unavailable(),
+            unavailable(),
+            unavailable(),
+            unavailable(),
+            unavailable(),
+            Canned::json(200, batch("ended")),
+        ])
+        .await;
+
+        let error = client(base_url)
+            .with_max_retries(0)
+            .wait_for_message_batch("msgbatch_1", Duration::from_millis(1))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status(), Some(503));
+        assert_eq!(recorded.lock().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_successful_poll_resets_the_failure_count() {
+        let mut responses = vec![unavailable(); 4];
+        responses.push(Canned::json(200, batch("in_progress")));
+        responses.extend(vec![unavailable(); 4]);
+        responses.push(Canned::json(200, batch("ended")));
+        let (base_url, recorded) = serve(responses).await;
+
+        let ended = client(base_url)
+            .with_max_retries(0)
+            .wait_for_message_batch("msgbatch_1", Duration::from_millis(1))
+            .await
+            .unwrap();
+
+        assert_eq!(ended.processing_status, MessageBatchProcessingStatus::Ended);
+        assert_eq!(recorded.lock().unwrap().len(), 10);
+    }
+
+    #[tokio::test]
+    async fn wait_stops_at_once_on_a_non_retryable_error() {
+        let (base_url, recorded) = serve(vec![
+            Canned::json(
+                401,
+                r#"{"error":{"type":"authentication_error","message":"no"}}"#,
+            ),
+            Canned::json(200, batch("ended")),
+        ])
+        .await;
+
+        let error = client(base_url)
+            .with_max_retries(0)
+            .wait_for_message_batch("msgbatch_1", Duration::from_millis(1))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status(), Some(401));
+        assert_eq!(recorded.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -58,20 +58,21 @@ impl<'de> Deserialize<'de> for ErrorType {
 }
 
 impl ErrorType {
-    /// The HTTP status the API documents for this error type; 500 for an unknown type.
-    pub(crate) fn http_status(self) -> u16 {
-        match self {
-            Self::InvalidRequestError => 400,
-            Self::AuthenticationError => 401,
-            Self::BillingError => 402,
-            Self::PermissionError => 403,
-            Self::NotFoundError => 404,
-            Self::ConflictError => 409,
-            Self::RequestTooLarge => 413,
-            Self::RateLimitError => 429,
-            Self::ApiError | Self::Unknown => 500,
-            Self::TimeoutError => 504,
-            Self::OverloadedError => 529,
-        }
+    /// The type as the API sends it; `None` for an unknown type.
+    pub(crate) fn wire_name(self) -> Option<&'static str> {
+        Some(match self {
+            Self::InvalidRequestError => "invalid_request_error",
+            Self::AuthenticationError => "authentication_error",
+            Self::BillingError => "billing_error",
+            Self::PermissionError => "permission_error",
+            Self::NotFoundError => "not_found_error",
+            Self::ConflictError => "conflict_error",
+            Self::RequestTooLarge => "request_too_large",
+            Self::RateLimitError => "rate_limit_error",
+            Self::ApiError => "api_error",
+            Self::TimeoutError => "timeout_error",
+            Self::OverloadedError => "overloaded_error",
+            Self::Unknown => return None,
+        })
     }
 }

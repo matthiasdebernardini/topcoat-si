@@ -136,8 +136,8 @@ impl FirecrawlFetchPage {
     /// message the model can act on; `Err` is fatal (401, 402).
     async fn fetch(&self, url: &str, filter: &Filter) -> Result<std::result::Result<Page, String>> {
         let request = ScrapeRequest::new(url).with_options(self.scrape_options.clone());
-        if let Err(Error::Validation { message, .. }) = request.validate() {
-            return Ok(Err(format!("Could not fetch {url}: {message}")));
+        if let Err(error) = request.validate() {
+            return Ok(Err(format!("Could not fetch {url}: {error}")));
         }
         if !filter.permits(url) {
             return Ok(Err(format!(
@@ -146,10 +146,7 @@ impl FirecrawlFetchPage {
         }
         match self.client.scrape(&request).await {
             Ok(response) => Ok(self.page(url, response, filter)),
-            Err(error) if matches!(error.status_code(), Some(401 | 402)) => Err(error),
-            Err(Error::Validation { message, .. }) => {
-                Ok(Err(format!("Could not fetch {url}: {message}")))
-            }
+            Err(error) if matches!(error.status(), Some(401 | 402)) => Err(error),
             Err(error) => Ok(Err(format!("Could not fetch {url}: {error}"))),
         }
     }

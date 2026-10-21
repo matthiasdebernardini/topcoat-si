@@ -139,11 +139,14 @@ use std::io::Write;
 
 use futures::StreamExt;
 use topcoat_si::{
-    AccumulatingStream, Anthropic, ContentBlockDelta, Error, KnownModel, Message,
-    MessageCreateParams, MessageParam, MessageStreamEvent, Model,
+    AccumulatingStream, Anthropic, ContentBlockDelta, KnownModel, Message, MessageCreateParams,
+    MessageParam, MessageStreamEvent, Model,
 };
 
-async fn stream_reply(client: &Anthropic, prompt: &str) -> topcoat_si::Result<Message> {
+async fn stream_reply(
+    client: &Anthropic,
+    prompt: &str,
+) -> Result<Message, Box<dyn std::error::Error>> {
     let params = MessageCreateParams::new_streaming(
         4096,
         vec![MessageParam::user(prompt)],
@@ -159,8 +162,9 @@ async fn stream_reply(client: &Anthropic, prompt: &str) -> topcoat_si::Result<Me
             std::io::stdout().flush()?;
         }
     }
-    done.await
-        .map_err(|_| Error::streaming("stream ended without a final message", None))?
+    Ok(done
+        .await
+        .map_err(|_| "stream ended without a final message")??)
 }
 ```
 
@@ -303,7 +307,20 @@ async fn research(client: &Anthropic) -> topcoat_si::Result<()> {
         Model::Known(model),
     );
     let tools: [&dyn ClientTool; 2] = [&search, &fetch];
-    let run = client.run_tools(params, &tools, 12).await?;
+    let run = match client.run_tools(params.clone(), &tools, 12).await {
+        Ok(run) => run,
+        Err(failed) if failed.error.is_retryable() => {
+            // Resume from the transcript instead of paying for every turn again.
+            eprintln!("{}; resuming", failed.error);
+            let mut resumed = params;
+            resumed.messages = failed.messages;
+            client
+                .run_tools(resumed, &tools, 12)
+                .await
+                .map_err(|failed| failed.error)?
+        }
+        Err(failed) => return Err(failed.error),
+    };
 
     match run.text() {
         Some(answer) => println!("{answer}"),
@@ -337,6 +354,8 @@ The result is a `ToolRun`:
 | `messages` | the whole conversation, ready to extend with a new user message |
 
 `run.text()` joins the text blocks of `message`. It is `None` when there is no text, which can happen on the forced last turn: Sonnet sometimes replies there with only a thinking block.
+
+**When a run fails.** `run_tools` returns `Box<ToolRunError>`. It holds the `error`, every response received before it (`responses`, already billed) and the conversation so far (`messages`). After a failed model call, `messages` ends with your last tool results, so you can send it again, as the snippet above does. After a failing tool, it ends with the assistant turn whose `tool_use` blocks are unanswered: answer them first. Its `Display` is the error plus the number of model responses, and `source()` is the `Error`.
 
 History is append-only, because models reject replayed thinking when earlier messages change. It therefore grows every turn. For long runs, set `context_management` or `compaction` on the request rather than trimming messages.
 
@@ -375,6 +394,8 @@ Both return each page's main content as markdown. Their other defaults:
 - bad tool configuration, such as every allowed domain also being blocked, or a content limit of 0.
 
 Every other failure is an `is_error` result the model can react to.
+
+The Firecrawl client resends a request after a connection failure or a 408, 409, 429 or any 5xx response, including one whose body failed to arrive. A 408 from the server is an `Api` error, not `Timeout`. A client-side timeout and a success response whose body failed (`Interrupted`) are not resent. See [Errors and retries](#errors-and-retries).
 
 Both tools work with `run_tools`. You can also drive web search by hand:
 
@@ -489,7 +510,7 @@ For a single question, three shortcuts ask and gate in one call:
 | Retries | 2 | `with_max_retries` |
 | Total time across attempts | 30 s | `with_retry_budget` |
 
-Timeouts, connection failures and responses 408, 429 and 5xx are retried, honoring `Retry-After`.
+A request is sent again when its error is retryable (see [Errors and retries](#errors-and-retries)): a timeout, a connection failure, or a 408, 409, 429 or 5xx response, including one whose body failed to arrive. A `retry-after` longer than 60 s, or past the retry budget, gives up at once. A success response whose body fails while it is read (`Interrupted`) is not resent, because Jev may already have done the work. A request body over the size cap fails before sending with `RequestTooLarge`.
 
 ### Jev as a tool
 
@@ -574,7 +595,8 @@ async fn research(
     let run = client.run_tools(params, &tools, 15).await;
     code.finish().await?;
 
-    match run?.text() {
+    // On failure, `ToolRunError` also holds the partial transcript (see "The tool loop").
+    match run.map_err(|failed| failed.error)?.text() {
         Some(answer) => println!("{answer}"),
         None => eprintln!("Claude ended without a text answer"),
     }
@@ -939,38 +961,64 @@ async fn summarise(client: &Anthropic, text: &str) -> topcoat_si::Result<()> {
 
 ## Errors and retries
 
-Every call returns `topcoat_si::Result<T>`.
+Every call returns `topcoat_si::Result<T>`. An `Error` is `Clone + Send + Sync + 'static` and tells you three things:
 
-These failures are retried, up to `with_max_retries` times (default 3):
+- **What failed:** `kind()` returns a `#[non_exhaustive]` `ErrorKind`. Always keep a wildcard arm.
+- **Which service:** `ErrorKind::Api { service, .. }` is `Anthropic`, `Firecrawl` or `Jev`.
+- **Whether sending again might work:** `is_retryable()`.
 
-- connection failures before any response arrives;
-- responses 408, 409 and 429;
-- every 5xx response, overloads included.
+Other accessors: `request_id()` when a response carried one, `status()` and `retry_after()` for `Api` errors, and `events_delivered()` for errors yielded by a stream. `ErrorKind::Api` also carries `error_type`, Anthropic's `error.type` as an `ErrorType`, and `error_code`, an `ErrorCode`: Anthropic's `error.details.error_code`, Jev's `detail.error_type` or Firecrawl's `code`. The message says what failed and where. The cause is only in `source()`, and the message never quotes response content.
 
-A client-side timeout is not retried: it fails at once with `Error::Timeout`. Only a 408 sent by the server is retried.
+| Kind | Meaning | Retryable |
+|---|---|---|
+| `Validation` | rejected before sending: bad parameters or configuration | no |
+| `RequestTooLarge` | a local size cap was exceeded (Jev's request body) | no |
+| `UnsupportedSchema` | structured outputs cannot use this type, such as a recursive one | no |
+| `Connection` | no connection was made, so nothing reached the server | yes |
+| `Timeout` | the request was sent, but no complete response arrived in time | yes |
+| `Api` | the service refused: an HTTP error status, or an `error` event in a stream, which has no status | 408, 409, 429, 5xx; a stream event that says `retryable`, else one of type `overloaded_error`, `api_error`, `rate_limit_error` or `timeout_error` |
+| `Interrupted` | the request was sent, then the connection failed before a complete response arrived, or a stream ended early | yes |
+| `Decode` | a success response is not what was expected | no |
+| `MaxTokens` | structured output was cut off; retry with more tokens | no |
+| `Refusal` | the model refused, so the reply does not follow the schema | no |
+| `Io` | reading the API key file failed | no |
+| `Sandbox` | code mode pool, worker or pack failure | no |
+| `Tool` | your `ClientTool`'s own fatal failure | no |
 
-The wait between attempts:
+A 429 whose `error_code` is `ErrorCode::Anthropic("enforced_spend_limit_reached")` is not retryable: it keeps failing until the next month.
 
-- doubles from half a second up to 8 seconds;
-- follows the server's `retry-after` header when that is longer;
-- never passes 60 seconds: a longer `retry-after` returns the error at once.
+**What the client resends.** Each client sends a request again, up to `with_max_retries` times (Anthropic 3, Firecrawl 2, Jev 2), when the error is retryable, with three exceptions:
 
-Errors carry the HTTP status and request ID:
+- Only GET requests resend `Interrupted`, such as a `download_file` whose body fails. Any other request may already have been done and billed by the server.
+- `Timeout` is resent only by Jev.
+- A `retry-after` over the cap gives up at once: 60 s for Anthropic, 30 s for Firecrawl, and 60 s for Jev, which also gives up when a wait would pass its 30 s retry budget.
+
+The wait is a backoff that doubles from half a second up to 8 seconds, or the server's `retry-after` when that is longer, so a `retry-after: 0` never resends at once.
+
+**Streams.** The crate never resends a stream after it starts. Stream items carry the right kind and request ID. When one fails, check `is_retryable()` and send the request again yourself. `events_delivered() == Some(0)` means no event other than a ping had been yielded, so resending is clean; with a larger count you have already shown the caller part of a reply.
 
 ```rust,no_run
-use topcoat_si::{Anthropic, Error, MessageCreateParams};
+use topcoat_si::{Anthropic, ErrorKind, MessageCreateParams, Service};
 
 async fn send(client: &Anthropic, params: &MessageCreateParams) {
     match client.send(params).await {
         Ok(message) => println!("{}", message.id),
-        Err(err) if err.is_rate_limit() => {
-            eprintln!("rate limited, retry after {:?}", err.retry_after())
+        Err(err) if err.is_retryable() => {
+            // The client already retried; waiting out `retry_after` may still help.
+            eprintln!("try again later ({:?}): {err}", err.retry_after());
         }
-        Err(err @ Error::Authentication { .. }) => eprintln!("check the API key: {err}"),
-        Err(err) => eprintln!("{err}; {:?}", err.metadata()),
+        Err(err) => match err.kind() {
+            ErrorKind::Api { service: Service::Anthropic, status: Some(401), .. } => {
+                eprintln!("check the API key: {err}")
+            }
+            ErrorKind::Validation { param, .. } => eprintln!("fix {param:?}: {err}"),
+            _ => eprintln!("{err}; request {:?}", err.request_id()),
+        },
     }
 }
 ```
+
+`wait_for_message_batch` keeps polling through retryable errors and gives up with the last one after 5 failed polls in a row. Any successful poll resets the count.
 
 ## Testing your code
 
@@ -1010,7 +1058,7 @@ Every example needs an Anthropic API key in `ANTHROPIC_API_KEY` or `TOPCOAT_SI_A
 | `streaming-tool-use` | a hand-written tool loop over a stream |
 | `server_tools` | web fetch and code execution |
 | `models_example` | listing and retrieving models |
-| `retry_example` | retry settings |
+| `retry_example` | retry settings and branching on errors |
 | `cache` | a cache write, then a cache read |
 | `batch` | a Message Batch |
 | `files` | uploading and referencing a file |

@@ -21,7 +21,7 @@ use super::limits::{HOST_CALL_TIMEOUT, LIMIT_MARGIN, PYTHON_CALL_TIMEOUT};
 use super::pack::Function;
 use super::{HostError, HostFunction, Limits, Pack, value};
 use crate::client_tool::ClientTool;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::types::{ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock};
 
 pub(super) const TOOL_NAME: &str = "python";
@@ -196,11 +196,9 @@ impl CodeMode {
 
     pub(super) async fn end_session(&self) -> Result<()> {
         match self.session.lock().await.take() {
-            Some(session) => session
-                .checkout
-                .finish()
-                .await
-                .map_err(|error| Error::sandbox(format!("could not end the session: {error}"))),
+            Some(session) => session.checkout.finish().await.map_err(|error| {
+                Error::new(ErrorKind::Sandbox, "could not end the session").with_source(error)
+            }),
             None => Ok(()),
         }
     }
@@ -323,10 +321,11 @@ impl CodeMode {
                     "No sandbox worker free; try again.".to_string(),
                 )));
             }
-            Err(PoolError::Spawn(message)) => {
-                return Err(Error::sandbox(format!(
-                    "could not spawn a sandbox worker: {message}"
-                )));
+            Err(error @ PoolError::Spawn(_)) => {
+                return Err(
+                    Error::new(ErrorKind::Sandbox, "could not spawn a sandbox worker")
+                        .with_source(error),
+                );
             }
             Err(error) => {
                 return Ok(Err(Reply::error(format!(
@@ -365,12 +364,16 @@ impl CodeMode {
                 checkout,
                 mid_turn: false,
             })),
-            Outcome::Raised(exception) => Err(Error::sandbox(format!(
-                "the pack source failed to run:\n{exception}"
-            ))),
-            Outcome::Pool(error) => Err(Error::sandbox(format!(
-                "the pack source failed to run: {error}"
-            ))),
+            Outcome::Raised(exception) => Err(Error::new(
+                ErrorKind::Sandbox,
+                "the pack source failed to run",
+            )
+            .with_source(exception)),
+            Outcome::Pool(error) => Err(Error::new(
+                ErrorKind::Sandbox,
+                "the pack source failed to run",
+            )
+            .with_source(error)),
         }
     }
 

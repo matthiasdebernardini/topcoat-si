@@ -8,7 +8,9 @@ use time::macros::date;
 
 use super::*;
 use crate::ClientTool;
-use crate::error::{Error, ErrorCode};
+use std::error::Error as _;
+
+use crate::error::{ErrorCode, ErrorKind, Service};
 use crate::test_support::{Canned, Recorded, serve, uses_proxies};
 use crate::types::{
     Content, ContentBlock, SearchResultBlock, ToolResultBlock, ToolResultBlockContent,
@@ -241,7 +243,7 @@ async fn rate_limit_with_retry_after_then_success() {
 }
 
 #[tokio::test]
-async fn rate_limit_after_retries_is_rate_limit_error() {
+async fn rate_limit_after_retries_returns_the_429() {
     let limited = || {
         Canned::json(
             429,
@@ -255,8 +257,8 @@ async fn rate_limit_after_retries_is_rate_limit_error() {
         .search(&SearchRequest::new("retry"))
         .await
         .unwrap_err();
-    assert!(err.is_rate_limit(), "{err:?}");
-    assert!(err.to_string().contains("slow down (code RATE_LIMIT)"));
+    assert_eq!(err.status(), Some(429), "{err:?}");
+    assert!(err.to_string().contains("slow down (HTTP 429 RATE_LIMIT)"));
     assert_eq!(recorded.lock().unwrap().len(), 2);
 }
 
@@ -272,10 +274,57 @@ async fn error_code_is_kept_as_sent() {
         .search(&SearchRequest::new("code"))
         .await
         .unwrap_err();
+    let ErrorKind::Api { error_code, .. } = err.kind() else {
+        panic!("expected an Api error, got {err:?}");
+    };
     assert_eq!(
-        err.metadata().unwrap().error_code,
-        Some(ErrorCode::Firecrawl("RATE_LIMIT".to_string()))
+        error_code,
+        &Some(ErrorCode::Firecrawl("RATE_LIMIT".to_string()))
     );
+}
+
+#[tokio::test]
+async fn conflict_and_not_implemented_are_retried() {
+    for status in [409, 501] {
+        let (url, recorded) = serve(vec![
+            Canned::json(
+                status,
+                json!({"success": false, "error": "try again"}).to_string(),
+            ),
+            ok(json!({"success": true, "data": {}})),
+        ])
+        .await;
+        client(&url)
+            .search(&SearchRequest::new("retry"))
+            .await
+            .unwrap_or_else(|err| panic!("{status}: {err:?}"));
+        assert_eq!(recorded.lock().unwrap().len(), 2, "{status}");
+    }
+}
+
+#[tokio::test]
+async fn error_status_with_a_cut_body_keeps_its_status_and_is_retried() {
+    let cut = || Canned::json(503, r#"{"success":false"#).with_cut_body();
+    let (url, _) = serve(vec![cut()]).await;
+    let err = client(&url)
+        .with_max_retries(0)
+        .search(&SearchRequest::new("cut"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.status(), Some(503), "{err:?}");
+    assert!(err.is_retryable());
+    assert!(err.source().is_some());
+    assert!(
+        err.to_string().contains("HTTP 503 with no error message"),
+        "{err}"
+    );
+
+    let (url, recorded) = serve(vec![cut(), ok(json!({"success": true, "data": {}}))]).await;
+    client(&url)
+        .search(&SearchRequest::new("cut"))
+        .await
+        .unwrap();
+    assert_eq!(recorded.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -292,14 +341,14 @@ async fn payment_required_is_err() {
         .execute(&tool_use(json!({"query": "q"})))
         .await
         .unwrap_err();
-    assert_eq!(err.status_code(), Some(402));
-    assert!(matches!(err, Error::Api { .. }));
+    assert_eq!(err.status(), Some(402));
+    assert!(matches!(err.kind(), ErrorKind::Api { .. }));
     assert!(err.to_string().contains("Insufficient credits"));
     assert_eq!(recorded.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
-async fn unauthorized_is_authentication_err() {
+async fn unauthorized_is_err_without_the_key() {
     let (url, recorded) = serve(vec![
         Canned::json(
             401,
@@ -312,7 +361,7 @@ async fn unauthorized_is_authentication_err() {
         .execute(&tool_use(json!({"query": "q"})))
         .await
         .unwrap_err();
-    assert!(err.is_authentication());
+    assert_eq!(err.status(), Some(401));
     assert!(!format!("{err:?}").contains("fc-test-key"));
     assert_eq!(recorded.lock().unwrap().len(), 1);
 }
@@ -329,7 +378,7 @@ async fn bad_request_is_error_tool_result() {
         .await
         .unwrap();
     assert_eq!(result.is_error, Some(true));
-    assert!(string_content(&result).contains("Invalid tbs (code BAD_REQUEST)"));
+    assert!(string_content(&result).contains("Invalid tbs (HTTP 400 BAD_REQUEST)"));
     assert_eq!(recorded.lock().unwrap().len(), 1, "400 must not be retried");
 }
 
@@ -350,7 +399,10 @@ async fn validation_errors_are_raised_before_sending() {
     ];
     for request in cases {
         let err = client.search(&request).await.unwrap_err();
-        assert!(err.is_validation(), "{request:?}: {err:?}");
+        assert!(
+            matches!(err.kind(), ErrorKind::Validation { .. }),
+            "{request:?}: {err:?}"
+        );
     }
     assert!(SearchRequest::new("é".repeat(500)).validate().is_ok());
     assert!(
@@ -447,7 +499,24 @@ fn unknown_response_fields_are_ignored() {
 
 #[test]
 fn empty_api_key_is_rejected() {
-    assert!(FirecrawlClient::try_new(" ").unwrap_err().is_validation());
+    assert!(matches!(
+        FirecrawlClient::try_new(" ").unwrap_err().kind(),
+        ErrorKind::Validation { .. }
+    ));
+}
+
+#[test]
+fn api_key_not_allowed_in_a_header_keeps_the_header_error() {
+    let error = FirecrawlClient::try_new("fc-key\nInjected: 1").unwrap_err();
+    assert!(
+        matches!(error.kind(), ErrorKind::Validation { .. }),
+        "{error:?}"
+    );
+    let source = error.source().expect("the header error is the source");
+    assert!(
+        source.is::<reqwest::header::InvalidHeaderValue>(),
+        "{source:?}"
+    );
 }
 
 #[test]
@@ -472,7 +541,7 @@ fn base_url_needs_https_or_loopback_http() {
     ] {
         let error = firecrawl().with_base_url(url).unwrap_err();
         assert!(
-            matches!(&error, Error::Validation { param, .. } if param.as_deref() == Some("base_url")),
+            matches!(error.kind(), ErrorKind::Validation { param, .. } if param.as_deref() == Some("base_url")),
             "{url}: {error}"
         );
     }
@@ -501,7 +570,7 @@ async fn retry_after_over_cap_fails_without_retrying() {
         .search(&SearchRequest::new("q"))
         .await
         .unwrap_err();
-    assert!(err.is_rate_limit(), "{err:?}");
+    assert_eq!(err.status(), Some(429), "{err:?}");
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(recorded.lock().unwrap().len(), 1);
 
@@ -617,7 +686,10 @@ async fn invalid_developer_config_is_err() {
             .execute(&tool_use(json!({"query": "q"})))
             .await
             .unwrap_err();
-        assert!(err.is_validation(), "{search:?}: {err:?}");
+        assert!(
+            matches!(err.kind(), ErrorKind::Validation { .. }),
+            "{search:?}: {err:?}"
+        );
     }
 }
 
@@ -909,7 +981,10 @@ async fn scrape_validation_errors_are_raised_before_sending() {
     ];
     for request in cases {
         let err = client.scrape(&request).await.unwrap_err();
-        assert!(err.is_validation(), "{request:?}: {err:?}");
+        assert!(
+            matches!(err.kind(), ErrorKind::Validation { .. }),
+            "{request:?}: {err:?}"
+        );
     }
     assert!(recorded.lock().unwrap().is_empty());
     assert!(
@@ -1101,7 +1176,7 @@ async fn fetch_page_payment_required_is_err() {
         .call(&fetch_use(json!({"url": "https://example.com"})))
         .await
         .unwrap_err();
-    assert_eq!(err.status_code(), Some(402));
+    assert_eq!(err.status(), Some(402));
     assert_eq!(recorded.lock().unwrap().len(), 1);
 }
 
@@ -1242,4 +1317,128 @@ fn chunks_never_leave_empty_pieces_or_trailing_blank_lines() {
     assert_eq!(blocks[0], "Intro.");
     assert_eq!(blocks[1], format!("  {}", "x".repeat(1498)));
     assert_eq!(blocks[2], "x".repeat(502));
+}
+
+fn not_found() -> Canned {
+    Canned::json(
+        404,
+        json!({"success": false, "error": "Resource not found", "code": "NOT_FOUND"}).to_string(),
+    )
+}
+
+#[tokio::test]
+async fn not_found_is_api_with_exact_display() {
+    let (url, recorded) = serve(vec![not_found(), not_found()]).await;
+    let err = client(&url)
+        .search(&SearchRequest::new("q"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.kind(),
+            ErrorKind::Api {
+                service: Service::Firecrawl,
+                status: Some(404),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "Firecrawl API error: Resource not found (HTTP 404 NOT_FOUND)"
+    );
+    assert!(!err.is_retryable());
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn error_without_a_body_message_uses_the_shared_fallback() {
+    let (url, _) = serve(vec![Canned::json(404, "<html>nope</html>")]).await;
+    let err = client(&url)
+        .search(&SearchRequest::new("q"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Firecrawl API error: HTTP 404 with no error message (HTTP 404)"
+    );
+}
+
+#[tokio::test]
+async fn request_timeout_status_is_api_and_retried() {
+    let timed_out = || Canned::json(408, json!({"success": false, "error": "slow"}).to_string());
+    let (url, recorded) = serve(vec![timed_out(), ok(json!({"success": true}))]).await;
+    client(&url).search(&SearchRequest::new("q")).await.unwrap();
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+
+    let (url, _) = serve(vec![timed_out()]).await;
+    let err = client(&url)
+        .with_max_retries(0)
+        .search(&SearchRequest::new("q"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.kind(),
+            ErrorKind::Api {
+                status: Some(408),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(err.is_retryable());
+}
+
+#[tokio::test]
+async fn unparseable_success_leaks_neither_text_nor_source() {
+    let secret = "sk-secret-value-123";
+    let body = json!({"success": secret}).to_string();
+    let (url, _) = serve(vec![Canned::json(200, body.clone())]).await;
+    let err = client(&url)
+        .search(&SearchRequest::new("q"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::Decode), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "Failed to parse Firecrawl response ({} bytes): type or value mismatch at line 1 \
+             column {}",
+            body.len(),
+            body.len() - 1
+        )
+    );
+    assert!(!format!("{err:?}").contains(secret), "{err:?}");
+    assert!(err.source().is_none());
+}
+
+#[tokio::test]
+async fn fetch_page_unauthorized_is_err_and_not_found_is_an_error_result() {
+    let (url, recorded) = serve(vec![Canned::json(
+        401,
+        json!({"success": false, "error": "Unauthorized"}).to_string(),
+    )])
+    .await;
+    let err = FirecrawlFetchPage::new(client(&url))
+        .call(&fetch_use(json!({"url": "https://example.com"})))
+        .await
+        .unwrap_err();
+    assert_eq!(err.status(), Some(401));
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+
+    let (url, _) = serve(vec![not_found()]).await;
+    let result = FirecrawlFetchPage::new(client(&url))
+        .call(&fetch_use(json!({"url": "https://example.com"})))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
+
+    let (url, _) = serve(vec![not_found()]).await;
+    let result = FirecrawlWebSearch::new(client(&url))
+        .execute(&tool_use(json!({"query": "q"})))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
 }

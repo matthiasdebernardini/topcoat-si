@@ -101,20 +101,15 @@ impl MessageBatchCreateParams {
                 ));
             }
 
-            request.params.validate().map_err(|err| match err {
-                crate::Error::Validation { message, param } => crate::Error::validation(
-                    message,
-                    param.map(|param| format!("requests[{i}].params.{param}")),
-                ),
-                other => other,
-            })?;
+            request
+                .params
+                .validate()
+                .map_err(|err| err.rename_param(|param| format!("requests[{i}].params.{param}")))?;
         }
 
         let body = serde_json::to_vec(self).map_err(|e| {
-            crate::Error::serialization(
-                format!("Failed to serialize message batch create params: {e}"),
-                Some(Box::new(e)),
-            )
+            crate::Error::validation("Failed to serialize message batch create params", None)
+                .with_source(e)
         })?;
         if body.len() > MAX_MESSAGE_BATCH_BODY_BYTES {
             return Err(crate::Error::validation(
@@ -665,7 +660,10 @@ mod tests {
     #[test]
     fn batch_create_params_reject_empty_requests() {
         let params = MessageBatchCreateParams::new(Vec::new());
-        assert!(params.validate().unwrap_err().is_validation());
+        assert!(matches!(
+            params.validate().unwrap_err().kind(),
+            crate::ErrorKind::Validation { .. }
+        ));
     }
 
     #[test]
@@ -674,14 +672,17 @@ mod tests {
             valid_batch_request("request_1");
             MAX_MESSAGE_BATCH_REQUESTS + 1
         ]);
-        assert!(params.validate().unwrap_err().is_validation());
+        assert!(matches!(
+            params.validate().unwrap_err().kind(),
+            crate::ErrorKind::Validation { .. }
+        ));
     }
 
     #[test]
     fn batch_create_params_reject_invalid_custom_id() {
         let params = MessageBatchCreateParams::new(vec![valid_batch_request("bad id")]);
         let err = params.validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("custom_id"));
     }
 
@@ -692,7 +693,7 @@ mod tests {
             valid_batch_request("same-id"),
         ]);
         let err = params.validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("Duplicate custom_id"));
     }
 
@@ -702,7 +703,7 @@ mod tests {
         request.params.stream = true;
         let params = MessageBatchCreateParams::new(vec![request]);
         let err = params.validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("stream"));
     }
 
@@ -712,7 +713,7 @@ mod tests {
         request.params.speed = Some(InferenceSpeed::Fast);
         let params = MessageBatchCreateParams::new(vec![request]);
         let err = params.validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("speed"));
     }
 
@@ -723,7 +724,7 @@ mod tests {
         let params = MessageBatchCreateParams::new(vec![request]);
         let err = params.validate().unwrap_err();
         assert!(
-            matches!(&err, crate::Error::Validation { param, .. }
+            matches!(err.kind(), crate::ErrorKind::Validation { param, .. }
                 if param.as_deref() == Some("requests[0].params.messages[0].role")),
             "{err}"
         );

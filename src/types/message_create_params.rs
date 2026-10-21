@@ -1386,7 +1386,7 @@ mod tests {
             .with_compaction(CompactionRequest::new())
             .with_context_management(ContextManagement::new(vec![ContextEdit::compact()]));
         let err = params.validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("mutually exclusive"));
     }
 
@@ -1397,7 +1397,7 @@ mod tests {
                 .with_output_config(OutputConfig::new().with_task_budget(TaskBudget::new(total)))
         };
         let err = make(19_999).validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("task_budget"));
         assert!(make(20_000).validate().is_ok());
     }
@@ -1411,7 +1411,7 @@ mod tests {
         };
         let too_many = simple_params().with_container(Container::new_with_skills(skills(21)));
         let err = too_many.validate().unwrap_err();
-        assert!(err.is_validation());
+        assert!(matches!(err.kind(), crate::ErrorKind::Validation { .. }));
         assert!(err.to_string().contains("skills"));
         let ok = simple_params().with_container(Container::new_with_skills(skills(20)));
         assert!(ok.validate().is_ok());
@@ -1420,7 +1420,10 @@ mod tests {
     #[test]
     fn validate_rejects_unknown_values_read_from_replies() {
         let param_of = |params: MessageCreateParams| match params.validate() {
-            Err(crate::Error::Validation { param, .. }) => param,
+            Err(error) => match error.kind() {
+                crate::ErrorKind::Validation { param, .. } => param.clone(),
+                _ => panic!("expected a validation error, got {error:?}"),
+            },
             other => panic!("expected a validation error, got {other:?}"),
         };
 

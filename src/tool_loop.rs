@@ -1,8 +1,10 @@
 //! A tool loop: call Claude, run the client tools it asks for, send the results back, repeat.
 
+use std::{error, fmt};
+
 use crate::anthropic::Anthropic;
 use crate::client_tool::ClientTool;
-use crate::error::{Error, Result};
+use crate::error::Error;
 use crate::types::{
     ContentBlock, Message, MessageCreateParams, MessageParam, MessageRole, StopReason, ToolChoice,
     ToolResultBlock, ToolUnionParam, ToolUseBlock,
@@ -24,6 +26,52 @@ pub struct ToolRun {
     /// The whole conversation, starting with the caller's messages and ending with the final
     /// assistant turn, ready to extend with a new user message and send again.
     pub messages: Vec<MessageParam>,
+}
+
+/// A [`Anthropic::run_tools`] run that failed part way, with everything it had paid for.
+///
+/// `responses` holds every response received before the failure, so summing their `usage` gives
+/// the cost. `messages` is the conversation so far, ready to resume. After a failed model call it
+/// ends with the last turn that went through. After a failing tool it ends with the assistant
+/// turn whose `tool_use` blocks are unanswered: answer them before sending `messages` again. A
+/// run that failed on its first call, or before sending anything, has no responses, and
+/// `messages` is the caller's own.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ToolRunError {
+    /// What ended the run.
+    pub error: Error,
+    /// Every response received before the failure, in order.
+    pub responses: Vec<Message>,
+    /// The conversation so far.
+    pub messages: Vec<MessageParam>,
+}
+
+impl ToolRunError {
+    fn boxed(error: Error, responses: Vec<Message>, messages: Vec<MessageParam>) -> Box<Self> {
+        Box::new(Self {
+            error,
+            responses,
+            messages,
+        })
+    }
+}
+
+impl fmt::Display for ToolRunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} (after {} model responses)",
+            self.error,
+            self.responses.len()
+        )
+    }
+}
+
+impl error::Error for ToolRunError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 impl ToolRun {
@@ -69,6 +117,9 @@ impl Anthropic {
     ///
     /// Fails with a validation error, before any request, when `max_turns` is 0 or two tools share
     /// a name, counting the named tools already in `params.tools` (an MCP toolset has no name).
+    /// Any failure comes back as a [`ToolRunError`] that holds the responses and conversation so
+    /// far, so a caller can resume instead of paying for the finished turns again. The error is
+    /// boxed because it is large.
     ///
     /// Read the answer with [`ToolRun::text`] and handle `None`: when the last turn is forced to
     /// answer in text, Sonnet can still reply with only a thinking block.
@@ -77,11 +128,15 @@ impl Anthropic {
         mut params: MessageCreateParams,
         tools: &[&dyn ClientTool],
         max_turns: u32,
-    ) -> Result<ToolRun> {
+    ) -> Result<ToolRun, Box<ToolRunError>> {
         if max_turns == 0 {
-            return Err(Error::validation(
-                "max_turns must be at least 1",
-                Some("max_turns".to_string()),
+            return Err(ToolRunError::boxed(
+                Error::validation(
+                    "max_turns must be at least 1",
+                    Some("max_turns".to_string()),
+                ),
+                Vec::new(),
+                params.messages,
             ));
         }
         let existing = params.tools.iter().flatten().filter_map(tool_name);
@@ -90,9 +145,13 @@ impl Anthropic {
             .collect();
         for (index, name) in names.iter().enumerate() {
             if names.iter().take(index).any(|earlier| earlier == name) {
-                return Err(Error::validation(
-                    format!("two tools are named {name}"),
-                    Some("tools".to_string()),
+                return Err(ToolRunError::boxed(
+                    Error::validation(
+                        format!("two tools are named {name}"),
+                        Some("tools".to_string()),
+                    ),
+                    Vec::new(),
+                    params.messages,
                 ));
             }
         }
@@ -106,7 +165,7 @@ impl Anthropic {
         // `tool_choice: none` is only valid alongside tools.
         let has_tools = params.tools.as_ref().is_some_and(|tools| !tools.is_empty());
         let caller_tool_choice = params.tool_choice.clone();
-        let mut responses = Vec::new();
+        let mut responses: Vec<Message> = Vec::new();
         let mut turn = 0_u32;
 
         loop {
@@ -118,7 +177,11 @@ impl Anthropic {
                 caller_tool_choice.clone()
             };
 
-            let response = self.send(&params).await?;
+            let response = match self.send(&params).await {
+                Ok(response) => response,
+                Err(error) => return Err(ToolRunError::boxed(error, responses, params.messages)),
+            };
+            responses.push(response.clone());
             params.messages.push(MessageParam::new_with_blocks(
                 response.content.clone(),
                 MessageRole::Assistant,
@@ -141,7 +204,16 @@ impl Anthropic {
                     let mut results = Vec::with_capacity(tool_uses.len());
                     for tool_use in tool_uses {
                         let result = match tools.iter().find(|tool| tool.name() == tool_use.name) {
-                            Some(tool) => tool.call(tool_use).await?,
+                            Some(tool) => match tool.call(tool_use).await {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    return Err(ToolRunError::boxed(
+                                        error,
+                                        responses,
+                                        params.messages,
+                                    ));
+                                }
+                            },
                             None => ToolResultBlock::error(
                                 tool_use.id.clone(),
                                 format!("No tool named {} is available.", tool_use.name),
@@ -159,14 +231,12 @@ impl Anthropic {
             };
 
             if !next {
-                responses.push(response.clone());
                 return Ok(ToolRun {
                     message: response,
                     responses,
                     messages: params.messages,
                 });
             }
-            responses.push(response);
         }
     }
 }
@@ -202,6 +272,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::error::{ErrorKind, Result};
     use crate::test_support::{Canned, Recorded, serve};
     use crate::types::{KnownModel, Model, WebFetchTool};
 
@@ -229,7 +300,7 @@ mod tests {
         ) -> BoxFuture<'a, Result<ToolResultBlock>> {
             Box::pin(async move {
                 if self.fail {
-                    return Err(Error::authentication("rejected key"));
+                    return Err(Error::tool("rejected key", None));
                 }
                 Ok(ToolResultBlock::new(tool_use.id.clone())
                     .with_string_content(format!("echo {}", tool_use.input["text"])))
@@ -394,7 +465,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err.is_authentication(), "{err}");
+        assert_eq!(err.error.kind(), &ErrorKind::Tool, "{err}");
         assert_eq!(recorded.lock().unwrap().len(), 1);
     }
 
@@ -457,10 +528,16 @@ mod tests {
             .run_tools(params(), &[&ECHO, &ECHO], 5)
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Validation { .. }), "{err}");
+        assert!(
+            matches!(err.error.kind(), ErrorKind::Validation { .. }),
+            "{err}"
+        );
 
         let err = client.run_tools(params(), &[&ECHO], 0).await.unwrap_err();
-        assert!(matches!(err, Error::Validation { .. }), "{err}");
+        assert!(
+            matches!(err.error.kind(), ErrorKind::Validation { .. }),
+            "{err}"
+        );
 
         assert!(recorded.lock().unwrap().is_empty());
     }
@@ -490,12 +567,12 @@ mod tests {
                 .run_tools(params().with_tools(vec![existing]), &[tool], 5)
                 .await
                 .unwrap_err();
-            match err {
-                Error::Validation { message, param } => {
-                    assert_eq!(message, expected);
+            match err.error.kind() {
+                ErrorKind::Validation { param, .. } => {
+                    assert_eq!(err.error.message(), expected);
                     assert_eq!(param.as_deref(), Some("tools"));
                 }
-                other => panic!("expected a validation error, got {other}"),
+                _ => panic!("expected a validation error, got {err}"),
             }
         }
 
@@ -545,5 +622,70 @@ mod tests {
 
         let run = client.run_tools(params(), &[], 1).await.unwrap();
         assert_eq!(run.text(), None);
+    }
+
+    #[tokio::test]
+    async fn send_failure_on_turn_two_returns_turn_one() {
+        let (base_url, recorded) = serve(vec![
+            reply("tool_use", json!([tool_use("toolu_1", "echo")])),
+            Canned::json(
+                401,
+                r#"{"error":{"type":"authentication_error","message":"no"}}"#,
+            ),
+        ])
+        .await;
+        let err = client(base_url)
+            .run_tools(params(), &[&ECHO], 5)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.error.status(), Some(401), "{err}");
+        assert_eq!(err.responses.len(), 1);
+        assert_eq!(err.responses[0].stop_reason, Some(StopReason::ToolUse));
+        // The caller's message, turn one's assistant turn and its tool results.
+        assert_eq!(err.messages.len(), 3);
+        assert_eq!(err.messages[1].role, MessageRole::Assistant);
+        assert_eq!(err.messages[2].role, MessageRole::User);
+        assert!(err.to_string().contains("after 1 model responses"), "{err}");
+        assert!(std::error::Error::source(&err).is_some());
+        assert_eq!(recorded.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tool_failure_returns_the_unanswered_turn() {
+        let failing = Echo {
+            name: "echo",
+            fail: true,
+        };
+        let (base_url, _recorded) = serve(vec![reply(
+            "tool_use",
+            json!([tool_use("toolu_1", "echo")]),
+        )])
+        .await;
+        let err = client(base_url)
+            .run_tools(params(), &[&failing], 5)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.error.kind(), &ErrorKind::Tool);
+        assert_eq!(err.responses.len(), 1);
+        assert_eq!(err.messages.len(), 2);
+        assert_eq!(err.messages[1].role, MessageRole::Assistant);
+    }
+
+    #[tokio::test]
+    async fn first_call_failure_returns_the_callers_messages() {
+        let (base_url, _recorded) = serve(vec![Canned::json(
+            401,
+            r#"{"error":{"type":"authentication_error","message":"no"}}"#,
+        )])
+        .await;
+        let err = client(base_url)
+            .run_tools(params(), &[&ECHO], 5)
+            .await
+            .unwrap_err();
+
+        assert!(err.responses.is_empty());
+        assert_eq!(err.messages.len(), 1);
     }
 }

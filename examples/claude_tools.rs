@@ -27,7 +27,18 @@ async fn main() -> topcoat_si::Result<()> {
         Model::Known(model),
     );
     let tools: [&dyn ClientTool; 3] = [&search, &fetch, &jev];
-    let run = client.run_tools(params, &tools, 12).await?;
+    let run = match client.run_tools(params, &tools, 12).await {
+        Ok(run) => run,
+        Err(failed) => {
+            // The failed turns were still billed, and `failed.messages` can resume the run.
+            eprintln!(
+                "run failed after {} model calls: {}",
+                failed.responses.len(),
+                failed.error
+            );
+            return Err(failed.error);
+        }
+    };
 
     match run.text() {
         Some(answer) => println!("{answer}"),

@@ -530,8 +530,11 @@ mod tests {
         );
 
         let param = |params: UsageReportParams| match params.check_known_values() {
-            Err(crate::Error::Validation { param, .. }) => param,
-            other => panic!("expected a validation error, got {other:?}"),
+            Err(error) => match error.kind() {
+                crate::ErrorKind::Validation { param } => param.clone(),
+                other => panic!("expected a validation error, got {other:?}"),
+            },
+            Ok(()) => panic!("expected a validation error"),
         };
         let tier = params
             .clone()

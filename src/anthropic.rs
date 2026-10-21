@@ -12,15 +12,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest::{Client as ReqwestClient, Response, header, redirect};
+use reqwest::{Client as ReqwestClient, Method, Response, header, redirect};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tracing::{Span, field};
 
 use crate::AccumulatingStream;
-use crate::backoff;
+use crate::backoff::{self, RetryPolicy};
 use crate::base_url;
-use crate::error::{Error, ErrorCode, HttpMetadata, RequestPhase, Result, map_reqwest_error};
+use crate::error::{
+    Error, ErrorCode, ErrorKind, RequestPhase, Result, Service, describe_json_error,
+    map_reqwest_error,
+};
 use crate::observability;
 use crate::sse::process_message_stream_sse;
 use crate::types::{
@@ -38,7 +41,7 @@ fn final_failure(error: &Error) {
     if let Some(id) = error.request_id() {
         span.record("request_id", id);
     }
-    if let Some(status) = error.status_code() {
+    if let Some(status) = error.status() {
         span.record("http.status_code", status);
     }
     tracing::error!(
@@ -285,16 +288,22 @@ struct MessageBatchJsonlState<S> {
 
 fn parse_message_batch_result_line(line: &[u8]) -> Result<MessageBatchResult> {
     let text = std::str::from_utf8(line).map_err(|e| {
-        Error::encoding(
-            format!("Invalid UTF-8 in message batch results JSONL: {e}"),
-            Some(Box::new(e)),
+        Error::new(
+            ErrorKind::Decode,
+            "Invalid UTF-8 in message batch results JSONL",
         )
+        .with_source(e)
     })?;
 
-    serde_json::from_str::<MessageBatchResult>(text).map_err(|e| {
-        Error::serialization(
-            format!("Failed to parse message batch results JSONL line: {e}"),
-            Some(Box::new(e)),
+    // serde's message can quote the line, so neither it nor the error itself is kept.
+    serde_json::from_str::<MessageBatchResult>(text).map_err(|error| {
+        Error::new(
+            ErrorKind::Decode,
+            format!(
+                "Failed to parse message batch results JSONL line ({} bytes): {}",
+                line.len(),
+                describe_json_error(&error)
+            ),
         )
     })
 }
@@ -309,6 +318,8 @@ fn trim_jsonl_line(mut line: Vec<u8>) -> Vec<u8> {
     line
 }
 
+/// Decodes the JSONL body of batch results. An error item carries
+/// [`Error::events_delivered`]: the number of results yielded before it.
 fn process_message_batch_result_jsonl<S>(
     byte_stream: S,
 ) -> impl Stream<Item = Result<MessageBatchResult>>
@@ -349,12 +360,12 @@ where
                         state.buffer.clear();
                         state.finished = true;
                         return Some((
-                            Err(Error::streaming(
+                            Err(Error::new(
+                                ErrorKind::Decode,
                                 format!(
                                     "Message batch results JSONL line exceeded maximum size of {} bytes",
                                     MAX_MESSAGE_BATCH_RESULT_LINE_BYTES
                                 ),
-                                None,
                             )),
                             state,
                         ));
@@ -377,9 +388,25 @@ where
             }
         }
     })
+    .scan(0_u64, |delivered, result| {
+        futures::future::ready(Some(match result {
+            Ok(result) => {
+                *delivered += 1;
+                Ok(result)
+            }
+            Err(error) => Err(error.with_events_delivered(*delivered)),
+        }))
+    })
 }
 
-fn response_metadata(response: &Response) -> HttpMetadata {
+/// The diagnostics of a received response.
+struct ResponseMetadata {
+    status: u16,
+    request_id: Option<String>,
+    retry_after: Option<Duration>,
+}
+
+fn response_metadata(response: &Response) -> ResponseMetadata {
     let headers = response.headers();
     Span::current().record("http.status_code", response.status().as_u16());
     if let Some(id) = headers
@@ -389,9 +416,8 @@ fn response_metadata(response: &Response) -> HttpMetadata {
         Span::current().record("request_id", id);
     }
     let retry_after = retry_after_from_headers(headers);
-    HttpMetadata {
+    ResponseMetadata {
         status: response.status().as_u16(),
-        error_code: None,
         request_id: headers
             .get("request-id")
             .and_then(|value| value.to_str().ok())
@@ -482,12 +508,7 @@ impl Anthropic {
         };
         base_url::with_proxy_rule(builder, base_url)
             .build()
-            .map_err(|e| {
-                Error::http_client(
-                    format!("Failed to build HTTP client: {e}"),
-                    Some(Box::new(e)),
-                )
-            })
+            .map_err(|e| Error::validation("Failed to build HTTP client", None).with_source(e))
     }
 
     /// Resolve an API key value, handling file:// URLs
@@ -498,7 +519,15 @@ impl Anthropic {
         };
         fs::read_to_string(path)
             .map(|content| content.trim().to_string())
-            .map_err(|error| Error::io(format!("Failed to read API key file '{path}'"), error))
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Io {
+                        path: Some(path.into()),
+                    },
+                    format!("Failed to read API key file '{path}'"),
+                )
+                .with_source(error)
+            })
     }
 
     /// Create a new Anthropic client.
@@ -526,8 +555,9 @@ impl Anthropic {
             None => configured_value(&get, &["TOPCOAT_SI_API_KEY", "ANTHROPIC_API_KEY"])?
                 .map(|(_, key)| key)
                 .ok_or_else(|| {
-                    Error::authentication(
+                    Error::validation(
                         "No nonempty API key configured in TOPCOAT_SI_API_KEY or ANTHROPIC_API_KEY",
+                        Some("api_key".to_string()),
                     )
                 })?,
         };
@@ -612,15 +642,7 @@ impl Anthropic {
         self.stream_client =
             Self::build_http_client(timeout, ResponseMode::Streaming, &self.base_url)?;
 
-        self.client = Self::build_http_client(timeout, ResponseMode::Buffered, &self.base_url)
-            .map_err(|e| match e {
-                Error::HttpClient { source, .. } => Error::http_client(
-                    "Failed to build HTTP client with new timeout",
-                    source
-                        .map(|source| Box::new(source) as Box<dyn std::error::Error + Send + Sync>),
-                ),
-                other => other,
-            })?;
+        self.client = Self::build_http_client(timeout, ResponseMode::Buffered, &self.base_url)?;
         Ok(self)
     }
 
@@ -667,10 +689,8 @@ impl Anthropic {
         headers.insert(
             "x-api-key",
             HeaderValue::from_str(api_key).map_err(|e| {
-                Error::validation(
-                    format!("Invalid API key format: {e}"),
-                    Some("api_key".to_string()),
-                )
+                Error::validation("Invalid API key format", Some("api_key".to_string()))
+                    .with_source(e)
             })?,
         );
         headers.insert(
@@ -683,9 +703,10 @@ impl Anthropic {
                 header::AUTHORIZATION,
                 HeaderValue::from_str(&bearer).map_err(|e| {
                     Error::validation(
-                        format!("Invalid Authorization header value: {e}"),
+                        "Invalid Authorization header value",
                         Some("api_key".to_string()),
                     )
+                    .with_source(e)
                 })?,
             );
         }
@@ -735,103 +756,106 @@ impl Anthropic {
 
     /// Build headers with the `anthropic-beta` header set from the given betas.
     ///
-    /// Returns `None` if there are no betas, avoiding an unnecessary header clone.
-    fn headers_with_betas(&self, betas: &[String]) -> Option<HeaderMap> {
+    /// Returns `None` if there are no betas, avoiding an unnecessary header clone. A beta that
+    /// cannot be part of a header value is a validation error naming `betas`.
+    fn headers_with_betas(&self, betas: &[String]) -> Result<Option<HeaderMap>> {
         if betas.is_empty() {
-            return None;
+            return Ok(None);
         }
         let mut headers = self.default_headers();
-        let value = betas.join(", ");
-        // Beta header values are ASCII, so from_str should not fail.
-        if let Ok(header_value) = HeaderValue::from_str(&value) {
-            headers.insert("anthropic-beta", header_value);
-        }
-        Some(headers)
+        let header_value = HeaderValue::from_str(&betas.join(", ")).map_err(|error| {
+            Error::validation(
+                "betas must be printable ASCII to go in the anthropic-beta header",
+                Some("betas".to_string()),
+            )
+            .with_source(error)
+        })?;
+        headers.insert("anthropic-beta", header_value);
+        Ok(Some(headers))
     }
 
-    /// Retry wrapper that implements exponential backoff with header-based retry-after
-    async fn retry_with_backoff<F, Fut, T>(&self, operation: F) -> Result<T>
+    /// [`Anthropic::headers_with_betas`] for a public method: a failure is also reported to the
+    /// request's span and metrics, like any other validation failure.
+    fn checked_beta_headers(&self, betas: &[String], start: Instant) -> Result<Option<HeaderMap>> {
+        self.headers_with_betas(betas).inspect_err(|error| {
+            final_failure(error);
+            observability::request_failed(start.elapsed());
+        })
+    }
+
+    /// Runs `operation` under the shared retry loop. Only GET requests resend an
+    /// [`ErrorKind::Interrupted`] failure, since the server may have done a POST's work already.
+    async fn retry_with_backoff<F, Fut, T>(&self, method: Method, operation: F) -> Result<T>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        let mut last_error = None;
-
-        for attempt in 0..=self.max_retries {
-            match operation().await {
-                Ok(result) => {
-                    Span::current().record("attempts", attempt + 1);
-                    return Ok(result);
-                }
-                Err(error) => {
-                    // Check if error is retryable
-                    if !error.is_retryable()
-                        || error
-                            .retry_after()
-                            .is_some_and(|delay| delay > Duration::from_secs(60))
-                    {
-                        Span::current().record("attempts", attempt + 1);
-                        final_failure(&error);
-                        return Err(error);
-                    }
-
-                    // Don't sleep on the last attempt
-                    if attempt == self.max_retries {
-                        Span::current().record("attempts", attempt + 1);
-                        last_error = Some(error);
-                        break;
-                    }
-
-                    let sleep_duration =
-                        backoff::next(attempt).max(error.retry_after().unwrap_or_default());
-
-                    tracing::warn!(
-                        target: "topcoat_si::client",
-                        error = &error as &dyn std::error::Error,
-                        attempt = attempt + 1,
-                        sleep_seconds = sleep_duration.as_secs_f64(),
-                        "Retrying API request"
-                    );
-                    observability::retry(sleep_duration);
-                    tokio::time::sleep(sleep_duration).await;
-                    last_error = Some(error);
-                }
-            }
+        let policy = RetryPolicy {
+            max_retries: self.max_retries,
+            max_retry_after: Duration::from_secs(60),
+            budget: None,
+            resend_timeouts: false,
+            resend_interrupted: method == Method::GET,
+        };
+        let retried = backoff::retry(
+            &policy,
+            |_, _| operation(),
+            |error, attempt, sleep_duration| {
+                tracing::warn!(
+                    target: "topcoat_si::client",
+                    error = error as &dyn std::error::Error,
+                    attempt = attempt + 1,
+                    sleep_seconds = sleep_duration.as_secs_f64(),
+                    "Retrying API request"
+                );
+                observability::retry(sleep_duration);
+            },
+        )
+        .await;
+        Span::current().record("attempts", retried.attempts);
+        if let Err(error) = &retried.result {
+            final_failure(error);
         }
-
-        let error = last_error
-            .unwrap_or_else(|| Error::unknown("Failed after retries without capturing error"));
-        final_failure(&error);
-        Err(error)
+        retried.result
     }
 
     /// Process API response errors and convert to our Error type
     async fn process_error_response(response: Response) -> Error {
-        let mut metadata = response_metadata(&response);
+        let metadata = response_metadata(&response);
         let body = match response.bytes().await {
             Ok(body) => body,
             Err(error) => {
-                return Error::from_http(
-                    "Failed to read error response",
-                    metadata,
-                    Some(Box::new(error)),
-                );
+                return Error::http_status(
+                    Service::Anthropic,
+                    metadata.status,
+                    Some("Failed to read error response".to_string()),
+                    None,
+                    None,
+                    metadata.request_id,
+                    metadata.retry_after,
+                )
+                .with_source(error);
             }
         };
         let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
-        if let Some(value) = parsed.as_ref() {
-            metadata.error_code = ErrorType::deserialize(&value["error"]["type"])
-                .ok()
-                .map(ErrorCode::Anthropic);
-            metadata.request_id = metadata
-                .request_id
-                .or_else(|| value["request_id"].as_str().map(String::from));
-        }
-        let message = parsed
-            .as_ref()
-            .and_then(|value| value["error"]["message"].as_str())
-            .unwrap_or("HTTP error response");
-        Error::from_http(message, metadata, None)
+        let field = |pointer: &str| {
+            parsed
+                .as_ref()
+                .and_then(|value| value.pointer(pointer))
+                .and_then(serde_json::Value::as_str)
+                .map(String::from)
+        };
+        Error::http_status(
+            Service::Anthropic,
+            metadata.status,
+            field("/error/message"),
+            parsed
+                .as_ref()
+                .and_then(|value| ErrorType::deserialize(&value["error"]["type"]).ok()),
+            field("/error/details/error_code").map(ErrorCode::Anthropic),
+            metadata.request_id.or_else(|| field("/request_id")),
+            metadata.retry_after,
+        )
     }
 
     /// Remember the rate-limit headers of a received response.
@@ -839,6 +863,10 @@ impl Anthropic {
     /// Responses without any `anthropic-ratelimit-*`, `anthropic-priority-*`, `anthropic-fast-*`
     /// or `retry-after` header (for example an error page from a proxy) leave the previously
     /// recorded state in place.
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned lock means a thread panicked mid-update, so its state is not read"
+    )]
     fn record_rate_limits(&self, response: &Response) {
         let headers = response.headers();
         let has_rate_limit_headers = headers.keys().any(|name| {
@@ -852,9 +880,10 @@ impl Anthropic {
             return;
         }
         let limits = RateLimits::from_headers(headers);
-        if let Ok(mut slot) = self.last_rate_limits.lock() {
-            *slot = Some(limits);
-        }
+        *self
+            .last_rate_limits
+            .lock()
+            .expect("rate-limit lock poisoned") = Some(limits);
     }
 
     /// Rate-limit state from the headers of the most recent HTTP response that carried them.
@@ -864,9 +893,16 @@ impl Anthropic {
     /// `anthropic-fast-*` or `retry-after` header; responses without them leave the previous
     /// value in place.  Clones of this client share the same slot.  Returns `None` before the
     /// first such response.
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned lock means a thread panicked mid-update, so its state is not read"
+    )]
     #[must_use]
     pub fn last_rate_limits(&self) -> Option<RateLimits> {
-        self.last_rate_limits.lock().ok()?.clone()
+        self.last_rate_limits
+            .lock()
+            .expect("rate-limit lock poisoned")
+            .clone()
     }
 
     fn map_request_error(&self, error: reqwest::Error) -> Error {
@@ -876,15 +912,21 @@ impl Anthropic {
     async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T> {
         let metadata = response_metadata(&response);
         let body = response.bytes().await.map_err(|error| {
-            map_reqwest_error(error, RequestPhase::Body).with_http_metadata(metadata.clone())
+            map_reqwest_error(error, RequestPhase::Body)
+                .with_request_id(metadata.request_id.clone())
         })?;
         tracing::trace!(target: "topcoat_si::wire", response = %String::from_utf8_lossy(&body));
+        // serde's message can quote the body, so neither it nor the error itself is kept.
         serde_json::from_slice(&body).map_err(|error| {
-            Error::from_http(
-                format!("Failed to parse response ({} bytes): {error}", body.len()),
-                metadata,
-                Some(Box::new(error)),
+            Error::new(
+                ErrorKind::Decode,
+                format!(
+                    "Failed to parse response ({} bytes): {}",
+                    body.len(),
+                    describe_json_error(&error)
+                ),
             )
+            .with_request_id(metadata.request_id)
         })
     }
 
@@ -925,10 +967,8 @@ impl Anthropic {
     ) -> Result<T> {
         let mut headers = headers.unwrap_or_else(|| self.default_headers());
         let content_type = HeaderValue::from_str(content_type).map_err(|error| {
-            Error::validation(
-                format!("Invalid content type: {error}"),
-                Some("content_type".to_string()),
-            )
+            Error::validation("Invalid content type", Some("content_type".to_string()))
+                .with_source(error)
         })?;
         headers.insert(header::CONTENT_TYPE, content_type);
 
@@ -1090,10 +1130,10 @@ impl Anthropic {
             auto_betas.push(THINKING_DISPLAY_UPDATES_BETA);
         }
         let all_betas = self.collect_betas(params.betas.as_deref(), &auto_betas);
-        let headers = self.headers_with_betas(&all_betas);
+        let headers = self.checked_beta_headers(&all_betas, start)?;
 
         let result: Result<Message> = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::POST, || async {
                 let url = self.build_url("messages");
                 self.execute_post_request(&url, &params, headers.clone())
                     .await
@@ -1155,13 +1195,14 @@ impl Anthropic {
             auto_betas.push(THINKING_DISPLAY_UPDATES_BETA);
         }
         let all_betas = self.collect_betas(params.betas.as_deref(), &auto_betas);
+        let beta_headers = self.checked_beta_headers(&all_betas, start)?;
 
         let response = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::POST, || async {
                 let url = self.build_url("messages");
 
-                let mut headers = self
-                    .headers_with_betas(&all_betas)
+                let mut headers = beta_headers
+                    .clone()
                     .unwrap_or_else(|| self.default_headers());
                 headers.insert(
                     header::ACCEPT,
@@ -1254,10 +1295,10 @@ impl Anthropic {
         // Collect betas: client defaults + per-request + auto-detected
         let auto_betas = count_params_betas(&params);
         let all_betas = self.collect_betas(params.betas.as_deref(), &auto_betas);
-        let headers = self.headers_with_betas(&all_betas);
+        let headers = self.checked_beta_headers(&all_betas, start)?;
 
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::POST, || async {
                 let url = self.build_url("messages/count_tokens");
                 self.execute_post_request(&url, &params, headers.clone())
                     .await
@@ -1307,10 +1348,10 @@ impl Anthropic {
         } else {
             self.collect_betas(Some(&request_betas), &auto_betas)
         };
-        let headers = self.headers_with_betas(&all_betas);
+        let headers = self.checked_beta_headers(&all_betas, start)?;
 
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::POST, || async {
                 let url = self.build_url("messages/batches");
                 self.execute_post_request(&url, &params, headers.clone())
                     .await
@@ -1332,10 +1373,10 @@ impl Anthropic {
         let start = Instant::now();
 
         let all_betas = self.collect_betas(None, &[]);
-        let headers = self.headers_with_betas(&all_betas);
+        let headers = self.checked_beta_headers(&all_betas, start)?;
 
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::GET, || async {
                 let url = self.build_url(&format!("messages/batches/{message_batch_id}"));
                 self.execute_get_request(&url, None, headers.clone()).await
             })
@@ -1360,10 +1401,10 @@ impl Anthropic {
 
         let request_betas = params.as_ref().and_then(|p| p.betas.as_deref());
         let all_betas = self.collect_betas(request_betas, &[]);
-        let headers = self.headers_with_betas(&all_betas);
+        let headers = self.checked_beta_headers(&all_betas, start)?;
 
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::GET, || async {
                 let url = self.build_url("messages/batches");
                 let query_params = params.as_ref().map(|p| {
                     let mut params = Vec::new();
@@ -1399,10 +1440,10 @@ impl Anthropic {
         let start = Instant::now();
 
         let all_betas = self.collect_betas(None, &[]);
-        let headers = self.headers_with_betas(&all_betas);
+        let headers = self.checked_beta_headers(&all_betas, start)?;
 
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::POST, || async {
                 let url = self.build_url(&format!("messages/batches/{message_batch_id}/cancel"));
                 self.execute_post_empty_request(&url, headers.clone()).await
             })
@@ -1426,10 +1467,10 @@ impl Anthropic {
         let start = Instant::now();
 
         let all_betas = self.collect_betas(None, &[]);
-        let headers = self.headers_with_betas(&all_betas);
+        let headers = self.checked_beta_headers(&all_betas, start)?;
 
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::DELETE, || async {
                 let url = self.build_url(&format!("messages/batches/{message_batch_id}"));
                 self.execute_delete_request(&url, headers.clone()).await
             })
@@ -1453,10 +1494,10 @@ impl Anthropic {
         let start = Instant::now();
 
         let all_betas = self.collect_betas(None, &[]);
-        let headers = self.headers_with_betas(&all_betas);
+        let headers = self.checked_beta_headers(&all_betas, start)?;
 
         let response = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::GET, || async {
                 let url = self.build_url(&format!("messages/batches/{message_batch_id}/results"));
                 self.execute_get_stream_request(&url, headers.clone()).await
             })
@@ -1498,10 +1539,10 @@ impl Anthropic {
         // Collect betas: client defaults + per-request from ModelListParams
         let request_betas = params.as_ref().and_then(|p| p.betas.as_deref());
         let all_betas = self.collect_betas(request_betas, &[]);
-        let headers = self.headers_with_betas(&all_betas);
+        let headers = self.checked_beta_headers(&all_betas, start)?;
 
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::GET, || async {
                 let url = self.build_url("models");
 
                 let query_params = params.as_ref().map(ModelListParams::query_pairs);
@@ -1535,11 +1576,11 @@ impl Anthropic {
         }
 
         let all_betas = self.collect_betas(None, &[]);
-        let headers = self.headers_with_betas(&all_betas);
+        let headers = self.checked_beta_headers(&all_betas, start)?;
         let query = params.to_query();
 
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::GET, || async {
                 let url = format!(
                     "{}?{query}",
                     self.build_url("organizations/usage_report/messages")
@@ -1566,11 +1607,11 @@ impl Anthropic {
         let start = Instant::now();
 
         let all_betas = self.collect_betas(None, &[]);
-        let headers = self.headers_with_betas(&all_betas);
+        let headers = self.checked_beta_headers(&all_betas, start)?;
         let query = params.to_query();
 
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::GET, || async {
                 let url = format!("{}?{query}", self.build_url("organizations/cost_report"));
                 self.execute_get_request(&url, None, headers.clone()).await
             })
@@ -1593,7 +1634,7 @@ impl Anthropic {
     pub async fn get_model(&self, model_id: &str) -> Result<ModelInfo> {
         let start = Instant::now();
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::GET, || async {
                 let url = self.build_url(&format!("models/{}", model_id));
                 self.execute_get_request(&url, None, None).await
             })
@@ -1654,7 +1695,7 @@ impl Anthropic {
             expires_in_seconds,
         ));
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::POST, || async {
                 let url = self.build_url("files");
                 self.execute_post_body_request(&url, body.clone(), &content_type, None)
                     .await
@@ -1676,7 +1717,7 @@ impl Anthropic {
         let start = Instant::now();
 
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::GET, || async {
                 let url = self.build_url("files");
                 let query_params = params.as_ref().map(FileListParams::query_pairs);
                 self.execute_get_request(&url, query_params.as_deref(), None)
@@ -1698,7 +1739,7 @@ impl Anthropic {
     pub async fn get_file(&self, file_id: &str) -> Result<FileInfo> {
         let start = Instant::now();
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::GET, || async {
                 let url = self.build_url(&format!("files/{file_id}"));
                 self.execute_get_request(&url, None, None).await
             })
@@ -1720,12 +1761,13 @@ impl Anthropic {
     pub async fn download_file(&self, file_id: &str) -> Result<Bytes> {
         let start = Instant::now();
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::GET, || async {
                 let url = self.build_url(&format!("files/{file_id}/content"));
                 let response = self.execute_get_stream_request(&url, None).await?;
                 let metadata = response_metadata(&response);
                 response.bytes().await.map_err(|error| {
-                    map_reqwest_error(error, RequestPhase::Body).with_http_metadata(metadata)
+                    map_reqwest_error(error, RequestPhase::Body)
+                        .with_request_id(metadata.request_id)
                 })
             })
             .await;
@@ -1744,7 +1786,7 @@ impl Anthropic {
     pub async fn delete_file(&self, file_id: &str) -> Result<DeletedFile> {
         let start = Instant::now();
         let result = self
-            .retry_with_backoff(|| async {
+            .retry_with_backoff(Method::DELETE, || async {
                 let url = self.build_url(&format!("files/{file_id}"));
                 self.execute_delete_request(&url, None).await
             })
@@ -1897,12 +1939,15 @@ Connection: close\r\n\r\n{}",
         let counter_clone = attempt_counter.clone();
 
         let result = client
-            .retry_with_backoff(|| {
+            .retry_with_backoff(Method::POST, || {
                 let counter = counter_clone.clone();
                 async move {
                     let attempt = counter.fetch_add(1, Ordering::SeqCst);
                     match attempt {
-                        0 | 1 => Err(Error::rate_limit(
+                        0 | 1 => Err(Error::api(
+                            Service::Anthropic,
+                            Some(429),
+                            None,
                             "Rate limited",
                             Some(Duration::from_secs(1)),
                         )),
@@ -1935,17 +1980,23 @@ Connection: close\r\n\r\n{}",
         let counter_clone = attempt_counter.clone();
 
         let result: Result<String> = client
-            .retry_with_backoff(|| {
+            .retry_with_backoff(Method::POST, || {
                 let counter = counter_clone.clone();
                 async move {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::authentication("Invalid API key"))
+                    Err(Error::api(
+                        Service::Anthropic,
+                        Some(401),
+                        None,
+                        "Invalid API key",
+                        None,
+                    ))
                 }
             })
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().is_authentication());
+        assert_eq!(result.unwrap_err().status(), Some(401));
         // Should only attempt once since authentication errors are not retryable
         assert_eq!(attempt_counter.load(Ordering::SeqCst), 1);
     }
@@ -1968,11 +2019,14 @@ Connection: close\r\n\r\n{}",
         let counter_clone = attempt_counter.clone();
 
         let result: Result<String> = client
-            .retry_with_backoff(|| {
+            .retry_with_backoff(Method::POST, || {
                 let counter = counter_clone.clone();
                 async move {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::rate_limit(
+                    Err(Error::api(
+                        Service::Anthropic,
+                        Some(429),
+                        None,
                         "Always rate limited",
                         Some(Duration::from_secs(1)),
                     ))
@@ -1981,7 +2035,7 @@ Connection: close\r\n\r\n{}",
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().is_rate_limit());
+        assert_eq!(result.unwrap_err().status(), Some(429));
         // Should attempt max_retries + 1 times (3 total: initial + 2 retries)
         assert_eq!(attempt_counter.load(Ordering::SeqCst), 3);
     }
@@ -2005,7 +2059,7 @@ Connection: close\r\n\r\n{}",
         let counter_clone = attempt_counter.clone();
 
         let result = client
-            .retry_with_backoff(|| {
+            .retry_with_backoff(Method::POST, || {
                 let counter = counter_clone.clone();
                 async move {
                     let attempt = counter.fetch_add(1, Ordering::SeqCst);
@@ -2013,8 +2067,9 @@ Connection: close\r\n\r\n{}",
                         0 | 1 => {
                             // Simulate a 529 overloaded error
                             Err(Error::api(
-                                529,
-                                Some(ErrorCode::Anthropic(ErrorType::OverloadedError)),
+                                Service::Anthropic,
+                                Some(529),
+                                Some(ErrorType::OverloadedError),
                                 "Overloaded",
                                 None,
                             ))
@@ -2035,15 +2090,22 @@ Connection: close\r\n\r\n{}",
     fn error_529_mapped_correctly() {
         // Test that a 529 API error is correctly identified as retryable
         let error = Error::api(
-            529,
-            Some(ErrorCode::Anthropic(ErrorType::OverloadedError)),
+            Service::Anthropic,
+            Some(529),
+            Some(ErrorType::OverloadedError),
             "Overloaded",
             None,
         );
         assert!(error.is_retryable());
 
         // Test that rate_limit error (which 529 now maps to) is also retryable
-        let rate_limit_error = Error::rate_limit("Overloaded", Some(Duration::from_secs(5)));
+        let rate_limit_error = Error::api(
+            Service::Anthropic,
+            Some(429),
+            None,
+            "Overloaded",
+            Some(Duration::from_secs(5)),
+        );
         assert!(rate_limit_error.is_retryable());
     }
 
@@ -2090,7 +2152,7 @@ Connection: close\r\n\r\n{}",
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert!(matches!(error, Error::Io { .. }));
+        assert!(matches!(error.kind(), ErrorKind::Io { .. }));
         assert!(std::error::Error::source(&error).is_some());
         assert!(format!("{}", error).contains("Failed to read API key file"));
     }
@@ -2314,7 +2376,7 @@ Connection: close\r\n\r\n{}",
 
             let handle = spawn(async move {
                 client_clone
-                    .retry_with_backoff(|| {
+                    .retry_with_backoff(Method::POST, || {
                         let counter = counter_clone.clone();
                         async move {
                             counter.fetch_add(1, Ordering::SeqCst);
@@ -2483,14 +2545,14 @@ Connection: close\r\n\r\n{}",
     #[test]
     fn headers_with_betas_none_when_empty() {
         let client = test_client();
-        assert!(client.headers_with_betas(&[]).is_none());
+        assert!(client.headers_with_betas(&[]).unwrap().is_none());
     }
 
     #[test]
     fn headers_with_betas_joins_with_comma() {
         let client = test_client();
         let betas = vec!["alpha".to_string(), "bravo".to_string()];
-        let headers = client.headers_with_betas(&betas).unwrap();
+        let headers = client.headers_with_betas(&betas).unwrap().unwrap();
         assert_eq!(
             headers.get("anthropic-beta").unwrap().to_str().unwrap(),
             "alpha, bravo"
@@ -2824,6 +2886,24 @@ Connection: close\r\n\r\n{}",
     }
 
     #[tokio::test]
+    async fn batch_result_errors_say_how_many_results_were_delivered() {
+        let good = r#"{"custom_id":"a","result":{"type":"expired"}}"#;
+        let body = format!("not json\n{good}\n{good}\n{{\"custom_id\":5}}\n{good}\n");
+        let bytes = futures::stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(body))]);
+        let items: Vec<_> = process_message_batch_result_jsonl(bytes).collect().await;
+        let delivered: Vec<_> = items
+            .iter()
+            .map(|item| item.as_ref().map_err(Error::events_delivered))
+            .map(|item| item.map(|_| ()))
+            .collect();
+        assert_eq!(
+            delivered,
+            [Err(Some(0)), Ok(()), Ok(()), Err(Some(2)), Ok(())],
+            "{items:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn stream_message_batch_results_preserves_jsonl_order_without_trailing_newline() {
         let results_body = concat!(
             r#"{"custom_id":"second","result":{"type":"expired"}}"#,
@@ -2964,8 +3044,8 @@ event: ping\n",
 
         let mut stream = std::pin::pin!(client.stream(&params).await.unwrap());
         let err = stream.next().await.unwrap().unwrap_err();
-        assert!(matches!(err, Error::Timeout { .. }));
-        assert!(err.to_string().contains("operation timed out"));
+        assert!(matches!(err.kind(), ErrorKind::Timeout));
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     #[tokio::test]
@@ -3008,7 +3088,7 @@ Connection: close\r\n\r\n",
         );
 
         let err = client.send(&params).await.unwrap_err();
-        assert!(matches!(err, Error::Timeout { .. }), "{err:?}");
+        assert!(matches!(err.kind(), ErrorKind::Timeout), "{err:?}");
     }
 
     fn file_info_json() -> &'static str {
@@ -3087,17 +3167,17 @@ Connection: close\r\n\r\n",
             .upload_file("a.txt", "text/plain", &[], Some(60))
             .await
             .unwrap_err();
-        assert!(too_short.is_validation());
+        assert!(matches!(too_short.kind(), ErrorKind::Validation { .. }));
         let too_long = client
             .upload_file("a.txt", "text/plain", &[], Some(7_776_001))
             .await
             .unwrap_err();
-        assert!(too_long.is_validation());
+        assert!(matches!(too_long.kind(), ErrorKind::Validation { .. }));
         let bad_name = client
             .upload_file("a\r\nb.txt", "text/plain", &[], None)
             .await
             .unwrap_err();
-        assert!(bad_name.is_validation());
+        assert!(matches!(bad_name.kind(), ErrorKind::Validation { .. }));
     }
 
     #[tokio::test]
@@ -3261,7 +3341,7 @@ Connection: close\r\n\r\n",
         ] {
             let error = client().with_base_url(url.to_string()).unwrap_err();
             assert!(
-                matches!(&error, Error::Validation { param, .. } if param.as_deref() == Some("base_url")),
+                matches!(error.kind(), ErrorKind::Validation { param, .. } if param.as_deref() == Some("base_url")),
                 "{url}: {error}"
             );
         }
@@ -3303,13 +3383,13 @@ Connection: close\r\n\r\n",
         )
         .unwrap_err();
         assert!(
-            matches!(&error, Error::Validation { param, .. } if param.as_deref() == Some("ANTHROPIC_BASE_URL")),
+            matches!(error.kind(), ErrorKind::Validation { param, .. } if param.as_deref() == Some("ANTHROPIC_BASE_URL")),
             "{error}"
         );
         let error = Anthropic::try_new_with(key(), env(&[("TOPCOAT_SI_BASE_URL", "http://v1")]))
             .unwrap_err();
         assert!(
-            matches!(&error, Error::Validation { param, .. } if param.as_deref() == Some("TOPCOAT_SI_BASE_URL")),
+            matches!(error.kind(), ErrorKind::Validation { param, .. } if param.as_deref() == Some("TOPCOAT_SI_BASE_URL")),
             "{error}"
         );
     }
@@ -3348,7 +3428,7 @@ Connection: close\r\n\r\n",
     }
 
     #[test]
-    fn error_body_type_becomes_an_anthropic_error_code() {
+    fn error_body_type_becomes_a_typed_error_type() {
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
         let bodies = [
             r#"{"type":"error","error":{"type":"request_too_large","message":"big"}}"#,
@@ -3365,17 +3445,18 @@ Connection: close\r\n\r\n",
         let send = || {
             crate::test_support::unknown_warnings(|| {
                 let error = runtime.block_on(client.send(&send_params())).unwrap_err();
-                error
-                    .metadata()
-                    .and_then(|metadata| metadata.error_code.clone())
+                match error.kind() {
+                    ErrorKind::Api { error_type, .. } => *error_type,
+                    other => panic!("expected an Api error, got {other:?}"),
+                }
             })
         };
 
         let (code, warnings) = send();
-        assert_eq!(code, Some(ErrorCode::Anthropic(ErrorType::RequestTooLarge)));
+        assert_eq!(code, Some(ErrorType::RequestTooLarge));
         assert_eq!(warnings, Vec::<String>::new());
         let (code, warnings) = send();
-        assert_eq!(code, Some(ErrorCode::Anthropic(ErrorType::Unknown)));
+        assert_eq!(code, Some(ErrorType::Unknown));
         assert_eq!(warnings, ["rust_type=ErrorType tag=saucepan_error"]);
         for _ in 0..2 {
             let (code, warnings) = send();
@@ -3400,7 +3481,7 @@ Connection: close\r\n\r\n",
         let error = client.send(&send_params()).await.unwrap_err();
         drop(guard);
 
-        assert_eq!(error.status_code(), Some(400));
+        assert_eq!(error.status(), Some(400));
         let targets = targets.lock().unwrap();
         assert!(
             targets.contains(&"span topcoat_si.request topcoat_si::client".to_string()),
@@ -3419,9 +3500,9 @@ Connection: close\r\n\r\n",
             .unwrap()
             .with_base_url(base_url)
             .unwrap();
-        let validation_param = |error: Error| match error {
-            Error::Validation { param, .. } => param,
-            other => panic!("expected a validation error, got {other}"),
+        let validation_param = |error: Error| match error.kind() {
+            ErrorKind::Validation { param, .. } => param.clone(),
+            _ => panic!("expected a validation error, got {error}"),
         };
 
         let mut count = MessageCountTokensParams::new(
@@ -3445,5 +3526,316 @@ Connection: close\r\n\r\n",
         assert_eq!(validation_param(error).as_deref(), Some("lifecycle[1]"));
 
         assert!(recorded.lock().unwrap().is_empty());
+    }
+
+    fn quiet_client(base_url: String) -> Anthropic {
+        files_client(base_url).with_max_retries(0)
+    }
+
+    fn streaming_params() -> MessageCreateParams {
+        MessageCreateParams::new_streaming(
+            16,
+            vec![MessageParam::user("hi")],
+            Model::Known(KnownModel::ClaudeHaiku55),
+        )
+    }
+
+    /// Serves one raw HTTP response per connection, in order, and counts the connections.
+    async fn serve_raw(responses: Vec<String>) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                read_http_request(&mut socket).await;
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        (format!("http://{address}"), connections)
+    }
+
+    /// A response that promises 100 bytes of JSON and closes after 7.
+    fn cut_off_response(extra_headers: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{extra_headers}\
+             Content-Length: 100\r\nConnection: close\r\n\r\npartial"
+        )
+    }
+
+    fn ok_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn stream_items_keep_their_kind_with_or_without_a_request_id() {
+        let bad_event = "event: message_start\ndata: nope\n\n";
+        let mut kinds = Vec::new();
+        for request_id in [Some("req_stream"), None] {
+            let mut canned = Canned::json(200, bad_event).with_content_type("text/event-stream");
+            if let Some(id) = request_id {
+                canned = canned.with_header("request-id", id);
+            }
+            let (base_url, _) = serve(vec![canned]).await;
+            let client = quiet_client(base_url);
+            let mut stream = std::pin::pin!(client.stream(&streaming_params()).await.unwrap());
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert_eq!(error.request_id(), request_id);
+            assert_eq!(error.events_delivered(), Some(0));
+            kinds.push(error.kind().clone());
+        }
+        assert_eq!(kinds[0], ErrorKind::Decode);
+        assert_eq!(kinds[0], kinds[1]);
+    }
+
+    #[tokio::test]
+    async fn batch_result_items_keep_their_kind_with_or_without_a_request_id() {
+        let mut kinds = Vec::new();
+        for request_id in [Some("req_batch"), None] {
+            let mut canned =
+                Canned::json(200, "SECRET-LINE\n").with_content_type("application/x-jsonl");
+            if let Some(id) = request_id {
+                canned = canned.with_header("request-id", id);
+            }
+            let (base_url, _) = serve(vec![canned]).await;
+            let client = quiet_client(base_url);
+            let mut results = std::pin::pin!(
+                client
+                    .stream_message_batch_results("msgbatch_1")
+                    .await
+                    .unwrap()
+            );
+            let error = results.next().await.unwrap().unwrap_err();
+            assert_eq!(error.request_id(), request_id);
+            assert!(!error.to_string().contains("SECRET-LINE"), "{error}");
+            assert!(std::error::Error::source(&error).is_none());
+            kinds.push(error.kind().clone());
+        }
+        assert_eq!(kinds[0], ErrorKind::Decode);
+        assert_eq!(kinds[0], kinds[1]);
+    }
+
+    /// Tests at the retry-loop seam, not through `send`: a full `send` would wait out the real
+    /// backoff delay, and a base URL that never answers must be https to pass the base URL rule.
+    #[tokio::test(start_paused = true)]
+    async fn connect_timeout_is_retried() {
+        let client = Anthropic {
+            client: ReqwestClient::builder()
+                .connect_timeout(Duration::from_millis(100))
+                .no_proxy()
+                .build()
+                .unwrap(),
+            base_url: "https://192.0.2.1".to_string(),
+            max_retries: 1,
+            ..test_client()
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let url = client.build_url("models/m");
+
+        let result: Result<ModelInfo> = client
+            .retry_with_backoff(Method::GET, || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                client.execute_get_request(&url, None, None)
+            })
+            .await;
+
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Connection, "{error}");
+        assert!(error.is_retryable());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn api_error_display_names_service_status_type_and_request() {
+        let body = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let (base_url, _) = serve(vec![
+            Canned::json(529, body).with_header("request-id", "req_123"),
+        ])
+        .await;
+        let error = quiet_client(base_url)
+            .send(&send_params())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Anthropic API error: Overloaded (HTTP 529 overloaded_error, request req_123)"
+        );
+        assert_eq!(error.status(), Some(529));
+        assert!(error.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn error_body_without_a_message_says_so() {
+        let (base_url, _) = serve(vec![Canned::json(503, "<html>bad gateway</html>")]).await;
+        let error = quiet_client(base_url)
+            .send(&send_params())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Anthropic API error: HTTP 503 with no error message (HTTP 503)"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_beta_value_is_rejected_before_sending() {
+        let (base_url, recorded) = serve(Vec::new()).await;
+        let client = quiet_client(base_url);
+        let params = send_params().with_beta("bad\nbeta");
+
+        let error = client.send(&params).await.unwrap_err();
+
+        match error.kind() {
+            ErrorKind::Validation { param } => assert_eq!(param.as_deref(), Some("betas")),
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+        assert!(std::error::Error::source(&error).is_some());
+        let error = client
+            .with_default_betas(["bad\nbeta"])
+            .list_models(None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error.kind(), ErrorKind::Validation { .. }),
+            "{error}"
+        );
+        assert!(recorded.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "rate-limit lock poisoned")]
+    fn poisoned_rate_limit_lock_panics() {
+        let client = test_client();
+        let slot = client.last_rate_limits.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = slot.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        let _ = client.last_rate_limits();
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "rate-limit lock poisoned")]
+    async fn recording_rate_limits_under_a_poisoned_lock_panics() {
+        let canned =
+            Canned::json(200, "{}").with_header("anthropic-ratelimit-requests-remaining", "49");
+        let (base_url, _) = serve(vec![canned]).await;
+        let response = ReqwestClient::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(base_url)
+            .send()
+            .await
+            .unwrap();
+        let client = test_client();
+        let slot = client.last_rate_limits.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = slot.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        client.record_rate_limits(&response);
+    }
+
+    #[tokio::test]
+    async fn success_body_that_is_not_json_is_decode_with_the_request_id() {
+        for request_id in [Some("req_ok"), None] {
+            let mut canned = Canned::json(200, r#"{"id": "SECRET-BODY", "type": 7"#);
+            if let Some(id) = request_id {
+                canned = canned.with_header("request-id", id);
+            }
+            let (base_url, _) = serve(vec![canned]).await;
+            let error = quiet_client(base_url)
+                .send(&send_params())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), &ErrorKind::Decode, "{error}");
+            assert_eq!(error.request_id(), request_id);
+            assert!(!error.is_retryable());
+            assert!(!error.to_string().contains("SECRET-BODY"), "{error}");
+            assert!(std::error::Error::source(&error).is_none(), "{error:?}");
+            assert!(error.to_string().contains("31 bytes"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn download_body_failure_carries_the_request_id() {
+        let (base_url, _) = serve_raw(vec![cut_off_response("request-id: req_dl\r\n")]).await;
+        let error = quiet_client(base_url)
+            .download_file("file_01")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Interrupted, "{error}");
+        assert_eq!(error.request_id(), Some("req_dl"));
+    }
+
+    #[tokio::test]
+    async fn a_get_whose_body_read_fails_is_resent() {
+        let (base_url, connections) =
+            serve_raw(vec![cut_off_response(""), ok_response(file_info_json())]).await;
+        let info = files_client(base_url).get_file("file_01").await.unwrap();
+        assert_eq!(info.id, "file_01");
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_post_whose_body_read_fails_is_not_resent() {
+        let (base_url, connections) =
+            serve_raw(vec![cut_off_response(""), ok_response("{}")]).await;
+        let error = files_client(base_url)
+            .cancel_message_batch("msgbatch_1")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Interrupted, "{error}");
+        assert!(error.is_retryable());
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn spend_limit_429_is_not_resent_but_a_plain_429_is() {
+        let spend_cap = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Spend limit reached","details":{"error_code":"enforced_spend_limit_reached"}}}"#;
+        let (base_url, recorded) = serve(vec![
+            Canned::json(429, spend_cap),
+            Canned::json(200, reply_json()),
+        ])
+        .await;
+        let error = files_client(base_url)
+            .send(&send_params())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), Some(429));
+        assert!(!error.is_retryable());
+        match error.kind() {
+            ErrorKind::Api { error_code, .. } => {
+                assert_eq!(
+                    error_code,
+                    &Some(ErrorCode::Anthropic(
+                        "enforced_spend_limit_reached".to_string()
+                    ))
+                );
+            }
+            other => panic!("expected an Api error, got {other:?}"),
+        }
+        assert_eq!(recorded.lock().unwrap().len(), 1);
+
+        let plain = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Slow down"}}"#;
+        let (base_url, recorded) = serve(vec![
+            Canned::json(429, plain).with_header("retry-after", "0"),
+            Canned::json(200, reply_json()),
+        ])
+        .await;
+        let message = files_client(base_url).send(&send_params()).await.unwrap();
+        assert_eq!(message.id, "msg_1");
+        assert_eq!(recorded.lock().unwrap().len(), 2);
     }
 }

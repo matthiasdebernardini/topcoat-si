@@ -11,7 +11,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::subscriber::DefaultGuard;
 use tracing::{field, span};
 
-/// One canned response: status, extra headers, body, content type and an optional stall.
+/// One canned response: status, extra headers, body, content type, an optional stall and whether
+/// the body is cut short.
 #[derive(Debug, Clone)]
 pub(crate) struct Canned {
     status: u16,
@@ -19,6 +20,7 @@ pub(crate) struct Canned {
     body: String,
     content_type: String,
     stall: Option<Duration>,
+    cut: bool,
 }
 
 impl Canned {
@@ -30,6 +32,7 @@ impl Canned {
             body: body.into(),
             content_type: "application/json".to_string(),
             stall: None,
+            cut: false,
         }
     }
 
@@ -49,6 +52,12 @@ impl Canned {
     /// timeout must cover the body read to fire.
     pub(crate) fn with_stall(mut self, stall: Duration) -> Self {
         self.stall = Some(stall);
+        self
+    }
+
+    /// Announces a longer body than it sends, then closes, so the client's body read fails.
+    pub(crate) fn with_cut_body(mut self) -> Self {
+        self.cut = true;
         self
     }
 }
@@ -112,7 +121,7 @@ pub(crate) async fn serve(responses: Vec<Canned>) -> (String, Arc<Mutex<Vec<Reco
                 "HTTP/1.1 {} X\r\nContent-Type: {}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
                 canned.status,
                 canned.content_type,
-                canned.body.len()
+                canned.body.len() + if canned.cut { 100 } else { 0 }
             );
             socket.write_all(head.as_bytes()).await.unwrap();
             if let Some(stall) = canned.stall {
@@ -130,10 +139,10 @@ pub(crate) async fn serve(responses: Vec<Canned>) -> (String, Arc<Mutex<Vec<Reco
     (format!("http://{address}"), recorded)
 }
 
-/// Records the warnings logged on the `topcoat_si::unknown` target, one `field=value` line each.
-struct UnknownWarnings(Arc<Mutex<Vec<String>>>);
+/// Records the warnings logged on one target, one `field=value` line each.
+struct Warnings(&'static str, Arc<Mutex<Vec<String>>>);
 
-impl tracing::Subscriber for UnknownWarnings {
+impl tracing::Subscriber for Warnings {
     fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
         true
     }
@@ -148,7 +157,7 @@ impl tracing::Subscriber for UnknownWarnings {
 
     fn event(&self, event: &tracing::Event<'_>) {
         let metadata = event.metadata();
-        if metadata.target() != "topcoat_si::unknown" || *metadata.level() != tracing::Level::WARN {
+        if metadata.target() != self.0 || *metadata.level() != tracing::Level::WARN {
             return;
         }
         struct Fields(Vec<String>);
@@ -164,7 +173,7 @@ impl tracing::Subscriber for UnknownWarnings {
         }
         let mut fields = Fields(Vec::new());
         event.record(&mut fields);
-        self.0.lock().unwrap().push(fields.0.join(" "));
+        self.1.lock().unwrap().push(fields.0.join(" "));
     }
 
     fn enter(&self, _span: &span::Id) {}
@@ -175,8 +184,14 @@ impl tracing::Subscriber for UnknownWarnings {
 /// Runs `f` and returns its result with every unknown-value warning it logged on this thread,
 /// each as `rust_type=... tag=...`.
 pub(crate) fn unknown_warnings<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    warnings_on("topcoat_si::unknown", f)
+}
+
+/// Runs `f` and returns its result with every warning it logged on `target` on this thread,
+/// each as `field=value` pairs.
+pub(crate) fn warnings_on<R>(target: &'static str, f: impl FnOnce() -> R) -> (R, Vec<String>) {
     let warnings = Arc::new(Mutex::new(Vec::new()));
-    let result = tracing::subscriber::with_default(UnknownWarnings(warnings.clone()), f);
+    let result = tracing::subscriber::with_default(Warnings(target, warnings.clone()), f);
     let warnings = warnings.lock().unwrap().clone();
     (result, warnings)
 }
