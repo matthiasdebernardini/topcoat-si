@@ -1,7 +1,9 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::types::open_union;
-use crate::types::{ContentBlock, Message};
+use crate::types::{
+    Content, ContentBlock, Message, SearchResultBlock, TextBlock, ToolResultBlockContent,
+};
 
 /// The content of a message, which can be either a string or an array of content blocks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -25,14 +27,66 @@ pub struct MessageParam {
     pub role: MessageRole,
 }
 
-/// Rejects a message whose role is [`MessageRole::Unknown`], which has no API value to send.
-pub(crate) fn check_roles(messages: &[MessageParam]) -> crate::Result<()> {
+/// Rejects the message shapes the API refuses with a 400, before the request leaves.
+///
+/// A message whose role is [`MessageRole::Unknown`] has no API value to send. A top-level
+/// `document` block does not belong in an `assistant` message. A `text` block with
+/// citations does not belong in a `user` message, directly or inside a `search_result`
+/// block (top level or in a `tool_result`).
+pub(crate) fn check_turns(messages: &[MessageParam]) -> crate::Result<()> {
     for (index, message) in messages.iter().enumerate() {
         if message.role == MessageRole::Unknown {
             return Err(open_union::unknown_in_request(format!(
                 "messages[{index}].role"
             )));
         }
+        let MessageParamContent::Array(blocks) = &message.content else {
+            continue;
+        };
+        for (j, block) in blocks.iter().enumerate() {
+            let path = format!("messages[{index}].content[{j}]");
+            match (message.role, block) {
+                (MessageRole::Assistant, ContentBlock::Document(_)) => {
+                    return Err(crate::Error::validation(
+                        format!("{path} is a document block; documents belong in user messages"),
+                        Some(path),
+                    ));
+                }
+                (MessageRole::User, ContentBlock::Text(text)) => {
+                    check_no_citations(text, &format!("{path}.citations"))?;
+                }
+                (MessageRole::User, ContentBlock::SearchResult(result)) => {
+                    check_search_result(result, &path)?;
+                }
+                (MessageRole::User, ContentBlock::ToolResult(tool_result)) => {
+                    if let Some(ToolResultBlockContent::Array(items)) = &tool_result.content {
+                        for (k, item) in items.iter().enumerate() {
+                            if let Content::SearchResult(result) = item {
+                                check_search_result(result, &format!("{path}.content[{k}]"))?;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_search_result(result: &SearchResultBlock, path: &str) -> crate::Result<()> {
+    for (k, text) in result.content.iter().enumerate() {
+        check_no_citations(text, &format!("{path}.content[{k}].citations"))?;
+    }
+    Ok(())
+}
+
+fn check_no_citations(text: &TextBlock, path: &str) -> crate::Result<()> {
+    if text.has_citations() {
+        return Err(crate::Error::validation(
+            format!("{path} has citations; text blocks in user messages cannot carry citations"),
+            Some(path.to_string()),
+        ));
     }
     Ok(())
 }
@@ -399,5 +453,106 @@ mod tests {
                 ]
             })
         );
+    }
+
+    mod check_turns {
+        use super::*;
+        use crate::ErrorKind;
+        use crate::types::{
+            CitationCharLocation, DocumentBlock, PlainTextSource, TextCitation,
+            WebFetchToolResultBlock, WebFetchToolResultContent,
+        };
+
+        fn cited() -> TextBlock {
+            TextBlock::new_with_citations(
+                "claim",
+                vec![TextCitation::CharLocation(CitationCharLocation::new(
+                    "quote", 0, 0, 5, None,
+                ))],
+            )
+        }
+
+        fn document() -> DocumentBlock {
+            DocumentBlock::new(PlainTextSource::new("body").into())
+        }
+
+        fn turn(role: MessageRole, block: ContentBlock) -> Vec<MessageParam> {
+            vec![MessageParam::new_with_blocks(vec![block], role)]
+        }
+
+        fn field(messages: &[MessageParam]) -> String {
+            match check_turns(messages).unwrap_err().kind() {
+                ErrorKind::Validation { param, .. } => param.clone().unwrap(),
+                other => panic!("expected a validation error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn rejects_assistant_top_level_document() {
+            let messages = turn(MessageRole::Assistant, ContentBlock::Document(document()));
+            assert_eq!(field(&messages), "messages[0].content[0]");
+        }
+
+        #[test]
+        fn accepts_assistant_document_nested_in_web_fetch_result() {
+            let fetched = WebFetchToolResultBlock {
+                tool_use_id: "srvtoolu_1".to_string(),
+                content: WebFetchToolResultContent::Result {
+                    url: "https://example.com".to_string(),
+                    retrieved_at: None,
+                    content: document(),
+                },
+                cache_control: None,
+            };
+            let messages = turn(
+                MessageRole::Assistant,
+                ContentBlock::WebFetchToolResult(fetched),
+            );
+            assert!(check_turns(&messages).is_ok());
+        }
+
+        #[test]
+        fn rejects_user_text_with_citations() {
+            let messages = turn(MessageRole::User, ContentBlock::Text(cited()));
+            assert_eq!(field(&messages), "messages[0].content[0].citations");
+        }
+
+        #[test]
+        fn rejects_user_search_result_text_with_citations() {
+            let result = SearchResultBlock::new("src", "title", vec![cited()]);
+            let messages = turn(MessageRole::User, ContentBlock::SearchResult(result));
+            assert_eq!(
+                field(&messages),
+                "messages[0].content[0].content[0].citations"
+            );
+        }
+
+        #[test]
+        fn rejects_user_tool_result_search_result_with_citations() {
+            let result = SearchResultBlock::new("src", "title", vec![cited()]);
+            let mut tool_result = ToolResultBlock::new("toolu_1");
+            tool_result.content = Some(ToolResultBlockContent::Array(vec![Content::SearchResult(
+                result,
+            )]));
+            let messages = turn(MessageRole::User, ContentBlock::ToolResult(tool_result));
+            assert_eq!(
+                field(&messages),
+                "messages[0].content[0].content[0].content[0].citations"
+            );
+        }
+
+        #[test]
+        fn accepts_assistant_text_with_citations() {
+            let messages = turn(MessageRole::Assistant, ContentBlock::Text(cited()));
+            assert!(check_turns(&messages).is_ok());
+        }
+
+        #[test]
+        fn accepts_empty_citations() {
+            let mut text = TextBlock::new("plain");
+            text.citations = Some(vec![]);
+            let messages = turn(MessageRole::User, ContentBlock::Text(text));
+            assert!(check_turns(&messages).is_ok());
+        }
     }
 }

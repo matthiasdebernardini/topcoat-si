@@ -185,12 +185,9 @@ impl Serialize for MessageBatchRequestParams<'_> {
         len += usize::from(params.output_config.is_some());
         len += usize::from(params.stop_sequences.is_some());
         len += usize::from(params.system.is_some());
-        len += usize::from(params.temperature.is_some());
         len += usize::from(params.thinking.is_some());
         len += usize::from(params.tool_choice.is_some());
         len += usize::from(params.tools.is_some());
-        len += usize::from(params.top_k.is_some());
-        len += usize::from(params.top_p.is_some());
         len += usize::from(params.service_tier.is_some());
         len += usize::from(params.inference_geo.is_some());
         len += usize::from(params.container.is_some());
@@ -218,9 +215,6 @@ impl Serialize for MessageBatchRequestParams<'_> {
         if let Some(system) = &params.system {
             state.serialize_field("system", system)?;
         }
-        if let Some(temperature) = &params.temperature {
-            state.serialize_field("temperature", temperature)?;
-        }
         if let Some(thinking) = &params.thinking {
             state.serialize_field("thinking", thinking)?;
         }
@@ -229,12 +223,6 @@ impl Serialize for MessageBatchRequestParams<'_> {
         }
         if let Some(tools) = &params.tools {
             state.serialize_field("tools", tools)?;
-        }
-        if let Some(top_k) = &params.top_k {
-            state.serialize_field("top_k", top_k)?;
-        }
-        if let Some(top_p) = &params.top_p {
-            state.serialize_field("top_p", top_p)?;
         }
         if let Some(service_tier) = &params.service_tier {
             state.serialize_field("service_tier", service_tier)?;
