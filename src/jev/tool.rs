@@ -42,34 +42,7 @@ impl JevTool {
                 ));
             }
         };
-        let mut questions = Questions::new();
-        for question in &input.questions {
-            questions = match question {
-                ToolQuestion::Noul { name, instructions } => {
-                    questions.noul(name.as_str(), instructions.as_str())
-                }
-                ToolQuestion::Choice {
-                    name,
-                    instructions,
-                    options,
-                } => questions.choice(
-                    name.as_str(),
-                    instructions.as_str(),
-                    options
-                        .iter()
-                        .map(|o| (o.label.as_str(), o.description.as_deref())),
-                ),
-                ToolQuestion::Score {
-                    name,
-                    instructions,
-                    levels,
-                } => questions.score(
-                    name.as_str(),
-                    instructions.as_str(),
-                    levels.iter().map(String::as_str),
-                ),
-            };
-        }
+        let questions = questions(&input.questions);
         match self.client.ask(input.state, &questions).await {
             Ok(response) => Ok(ToolResultBlock::new(id)
                 .with_text_content(TextBlock::new(render(&response, &input.questions)))),
@@ -190,9 +163,10 @@ struct ToolInput {
     questions: Vec<ToolQuestion>,
 }
 
+/// One question as the model writes it, in the `jev` tool's input.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
-enum ToolQuestion {
+pub(crate) enum ToolQuestion {
     Noul {
         name: String,
         instructions: String,
@@ -209,9 +183,10 @@ enum ToolQuestion {
     },
 }
 
+/// One choice option as the model writes it.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ToolOption {
+pub(crate) struct ToolOption {
     label: String,
     #[serde(default)]
     description: Option<String>,
@@ -220,7 +195,7 @@ struct ToolOption {
 // Only these failures are the developer's to fix; everything else goes back to the model.
 // Timeouts and connection failures are checked first: a body-phase timeout carries the status
 // its headers arrived with, often 200.
-fn is_fatal(error: &Error) -> bool {
+pub(crate) fn is_fatal(error: &Error) -> bool {
     if matches!(error, Error::Timeout { .. } | Error::Connection { .. }) {
         return false;
     }
@@ -239,7 +214,49 @@ fn error_result(id: String, message: String) -> ToolResultBlock {
         .with_error(true)
 }
 
+/// The model's questions as [`Questions`], in order.
+pub(crate) fn questions(items: &[ToolQuestion]) -> Questions {
+    let mut questions = Questions::new();
+    for question in items {
+        questions = match question {
+            ToolQuestion::Noul { name, instructions } => {
+                questions.noul(name.as_str(), instructions.as_str())
+            }
+            ToolQuestion::Choice {
+                name,
+                instructions,
+                options,
+            } => questions.choice(
+                name.as_str(),
+                instructions.as_str(),
+                options
+                    .iter()
+                    .map(|o| (o.label.as_str(), o.description.as_deref())),
+            ),
+            ToolQuestion::Score {
+                name,
+                instructions,
+                levels,
+            } => questions.score(
+                name.as_str(),
+                instructions.as_str(),
+                levels.iter().map(String::as_str),
+            ),
+        };
+    }
+    questions
+}
+
 fn render(response: &JevResponse, questions: &[ToolQuestion]) -> String {
+    json!({"model": response.model, "answers": answers(response, questions)}).to_string()
+}
+
+/// Every answer by question name, with its probabilities; a score also names its most likely
+/// level.
+pub(crate) fn answers(
+    response: &JevResponse,
+    questions: &[ToolQuestion],
+) -> serde_json::Map<String, Value> {
     let levels = |name: &str| {
         questions.iter().find_map(|question| match question {
             ToolQuestion::Score {
@@ -286,5 +303,5 @@ fn render(response: &JevResponse, questions: &[ToolQuestion]) -> String {
         };
         answers.insert(name.clone(), value);
     }
-    json!({"model": response.model, "answers": answers}).to_string()
+    answers
 }

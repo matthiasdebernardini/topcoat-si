@@ -16,6 +16,8 @@ mod accumulating_stream;
 mod backoff;
 mod batch_wait;
 mod client;
+#[cfg(feature = "code-mode")]
+pub mod code_mode;
 mod error;
 pub mod firecrawl;
 pub mod jev;

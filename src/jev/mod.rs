@@ -52,6 +52,8 @@ mod tool;
 mod tests;
 
 pub use tool::JevTool;
+#[cfg(feature = "code-mode")]
+pub(crate) use tool::{ToolQuestion, answers, is_fatal, questions};
 
 const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 const PATH: &str = "/v1/systemone";

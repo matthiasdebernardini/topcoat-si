@@ -35,3 +35,21 @@ jobs:
         run: cargo test --doc --locked --no-default-features --features rustls-tls
       - name: review harness
         run: cargo nextest run --manifest-path review-harness/Cargo.toml --locked --no-fail-fast
+
+  code-mode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: install the monty worker
+        run: cargo install monty-runtime --version 1.2.0 --locked
+      - name: clippy with code-mode
+        run: cargo clippy --all-targets --no-default-features --features rustls-tls,code-mode --locked -- -D warnings
+      - name: code-mode tests
+        run: MONTY_BIN="$HOME/.cargo/bin/monty" cargo nextest run --lib --locked --no-default-features --features rustls-tls,code-mode code_mode
+      - name: code-mode doc test
+        run: cargo test --doc --locked --no-default-features --features rustls-tls,code-mode code_mode

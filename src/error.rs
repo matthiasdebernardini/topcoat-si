@@ -179,6 +179,14 @@ pub enum Error {
         source: Option<Arc<dyn error::Error + Send + Sync>>,
     },
 
+    /// The Python sandbox failed in a way the model cannot fix: a pool that would not start, a
+    /// worker that would not spawn, a pack whose source fails to run, or a session that would
+    /// not finish. Never retryable.
+    Sandbox {
+        /// Human-readable error message.
+        message: String,
+    },
+
     /// Unknown error.
     Unknown {
         /// Human-readable error message.
@@ -445,6 +453,13 @@ impl Error {
         }
     }
 
+    /// Creates a new sandbox error.
+    pub fn sandbox(message: impl Into<String>) -> Self {
+        Error::Sandbox {
+            message: message.into(),
+        }
+    }
+
     /// Creates a new unknown error.
     pub fn unknown(message: impl Into<String>) -> Self {
         Error::Unknown {
@@ -619,6 +634,7 @@ impl fmt::Display for Error {
             Self::Url { message, .. } => write!(f, "Url: {message}")?,
             Self::Streaming { message, .. } => write!(f, "Streaming: {message}")?,
             Self::Encoding { message, .. } => write!(f, "Encoding: {message}")?,
+            Self::Sandbox { message, .. } => write!(f, "Sandbox: {message}")?,
             Self::Unknown { message, .. } => write!(f, "Unknown: {message}")?,
             Self::ToDo { message, .. } => write!(f, "ToDo: {message}")?,
         }

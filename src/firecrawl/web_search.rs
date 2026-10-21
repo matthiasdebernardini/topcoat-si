@@ -197,24 +197,97 @@ impl FirecrawlWebSearch {
                 ));
             }
         };
+        Ok(
+            match self
+                .search(&input, filter, self.scrape_options.as_ref())
+                .await?
+            {
+                Ok((response, filter, total)) => {
+                    self.result(id, &input.query, response, &filter, total)
+                }
+                Err(message) => error_result(id, message),
+            },
+        )
+    }
+
+    /// Search for the sandbox's `search(...)`: the same checks and error mapping as
+    /// [`FirecrawlWebSearch::execute`], returning web results as data; `markdown` is only set
+    /// when `scrape`. A `limit` over 10 is
+    /// capped at 10. The inner `Err` is a message the model can act on; `Err` is fatal.
+    #[cfg(feature = "code-mode")]
+    pub(crate) async fn search_values(
+        &self,
+        query: String,
+        limit: Option<u32>,
+        scrape: bool,
+        include_domains: Option<Vec<String>>,
+        exclude_domains: Option<Vec<String>>,
+    ) -> Result<std::result::Result<(Vec<SearchHit>, Option<u64>), String>> {
+        let filter = self.checked_config()?;
+        if scrape && self.scrape_options.is_none() {
+            return Ok(Err(
+                "scrape=True is not available: this search does not scrape pages.".to_string(),
+            ));
+        }
+        let input = ModelInput {
+            query,
+            limit: limit.map(|limit| limit.min(MAX_MODEL_LIMIT)),
+            recency: None,
+            sources: None,
+            include_domains,
+            exclude_domains,
+            country: None,
+        };
+        let scrape_options = self.scrape_options.as_ref().filter(|_| scrape);
+        let (response, filter, total) = match self.search(&input, filter, scrape_options).await? {
+            Ok(searched) => searched,
+            Err(message) => return Ok(Err(message)),
+        };
+        let results = response
+            .data
+            .and_then(|data| data.web)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|web| {
+                Some(SearchHit {
+                    url: web.url.filter(|u| filter.permits(u))?,
+                    title: web.title,
+                    description: web.description,
+                    markdown: web.markdown.map(|m| truncate(&m, self.max_content_chars)),
+                    status: web.metadata.and_then(|m| m.status_code),
+                })
+            })
+            .take(usize::try_from(total).unwrap_or(usize::MAX))
+            .collect();
+        Ok(Ok((results, response.credits_used)))
+    }
+
+    /// Runs one search. The inner `Err` is a message the model can act on; `Err` is fatal
+    /// (401, 402).
+    async fn search(
+        &self,
+        input: &ModelInput,
+        filter: Filter,
+        scrape_options: Option<&ScrapeOptions>,
+    ) -> Result<std::result::Result<(SearchResponse, Filter, u32), String>> {
         if input
             .limit
             .is_some_and(|limit| !(1..=MAX_MODEL_LIMIT).contains(&limit))
         {
-            return Ok(error_result(
-                id,
-                format!("limit must be between 1 and {MAX_MODEL_LIMIT}."),
-            ));
+            return Ok(Err(format!(
+                "limit must be between 1 and {MAX_MODEL_LIMIT}."
+            )));
         }
-        let (request, filter, total) = match self.request(&input, filter) {
+        let (mut request, filter, total) = match self.request(input, filter) {
             Ok(planned) => planned,
-            Err(message) => return Ok(error_result(id, message)),
+            Err(message) => return Ok(Err(message)),
         };
+        request.scrape_options = scrape_options.cloned();
         match self.client.search(&request).await {
-            Ok(response) => Ok(self.result(id, &input.query, response, &filter, total)),
+            Ok(response) => Ok(Ok((response, filter, total))),
             Err(error) if matches!(error.status_code(), Some(401 | 402)) => Err(error),
-            Err(Error::Validation { message, .. }) => Ok(error_result(id, message)),
-            Err(error) => Ok(error_result(id, format!("Web search failed: {error}"))),
+            Err(Error::Validation { message, .. }) => Ok(Err(message)),
+            Err(error) => Ok(Err(format!("Web search failed: {error}"))),
         }
     }
 
@@ -343,9 +416,6 @@ impl FirecrawlWebSearch {
         if let Some(location) = &self.location {
             request = request.with_location(location.clone());
         }
-        if let Some(scrape) = &self.scrape_options {
-            request = request.with_scrape_options(scrape.clone());
-        }
         Ok((request, filter, total))
     }
 
@@ -415,6 +485,18 @@ impl ClientTool for FirecrawlWebSearch {
     fn call<'a>(&'a self, tool_use: &'a ToolUseBlock) -> BoxFuture<'a, Result<ToolResultBlock>> {
         Box::pin(self.execute(tool_use))
     }
+}
+
+/// One web result as the sandbox's `search(...)` returns it.
+#[cfg(feature = "code-mode")]
+#[derive(serde::Serialize)]
+pub(crate) struct SearchHit {
+    url: String,
+    title: Option<String>,
+    description: Option<String>,
+    /// The page as markdown, cut to the tool's limit; only when scraped.
+    markdown: Option<String>,
+    status: Option<u16>,
 }
 
 /// Normalized domain lists applied to one call.

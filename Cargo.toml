@@ -12,6 +12,7 @@ default = ["native-tls"]
 
 rustls-tls = ["reqwest/rustls"]
 native-tls = ["reqwest/native-tls"]
+code-mode = ["dep:monty-pool", "dep:monty-types"]
 
 [dependencies]
 tracing = "0.1"
@@ -25,6 +26,8 @@ schemars = { version = "1.2.3", features = ["preserve_order"] }
 time = { version = "0.3.47", features = ["serde", "macros", "formatting", "parsing"] }
 tokio = { version = "1.52.3", features = ["sync", "time"] }
 url = "2.5.8"
+monty-pool = { version = "1.2", optional = true }
+monty-types = { version = "1.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["test-util", "macros", "rt-multi-thread", "net", "io-util"] }

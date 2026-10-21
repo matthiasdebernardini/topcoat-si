@@ -1,0 +1,1051 @@
+#![cfg(test)]
+
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::time::Instant;
+
+use serde_json::{Value, json};
+
+use super::*;
+use crate::firecrawl::FirecrawlClient;
+use crate::jev::JevClient;
+use crate::test_support::{Canned, serve};
+use crate::types::{KnownModel, MessageCreateParams, MessageParam, Model, ToolResultBlockContent};
+use crate::{Anthropic, FirecrawlFetchPage, FirecrawlWebSearch};
+
+async fn test_pool() -> Arc<Pool> {
+    let monty = std::env::var("MONTY_BIN").unwrap_or_else(|_| {
+        panic!(
+            "set MONTY_BIN to the monty binary from \
+             `cargo install monty-runtime --version 1.2.0 --locked`"
+        )
+    });
+    pool(monty, 2).await.unwrap()
+}
+
+/// Runs one snippet and returns the tool result text and its `is_error` flag.
+async fn run(code: &CodeMode, snippet: &str) -> (String, bool) {
+    let tool_use = ToolUseBlock::new("toolu_1", TOOL_NAME, json!({"code": snippet}));
+    let result = code.call(&tool_use).await.unwrap();
+    (text(&result), result.is_error == Some(true))
+}
+
+fn text(result: &ToolResultBlock) -> String {
+    match &result.content {
+        Some(ToolResultBlockContent::String(text)) => text.clone(),
+        other => panic!("expected string content, got {other:?}"),
+    }
+}
+
+fn used(code: &CodeMode) -> usize {
+    code.host_calls.load(Ordering::SeqCst)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// A `search` fake answering one hit per query and counting its calls.
+fn counted_search(calls: Arc<AtomicUsize>) -> impl HostFunction {
+    host_fn(
+        "search",
+        "search(*, query: str, limit: int = 5) -> list[dict]",
+        "fake search",
+        move |args: SearchArgs| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(
+                    json!([{"url": format!("https://example.com/{}", args.query), "limit": args.limit}]),
+                )
+            }
+        },
+    )
+}
+
+fn host(
+    name: &'static str,
+    function: impl Fn(Value) -> std::result::Result<Value, HostError> + Send + Sync + 'static,
+) -> impl HostFunction {
+    let function = Arc::new(function);
+    host_fn(
+        name,
+        format!("{name}(**kwargs) -> object"),
+        "test function",
+        move |args: Value| {
+            let function = function.clone();
+            async move { function(args) }
+        },
+    )
+}
+
+fn fake_firecrawl() -> Pack {
+    Pack::new("firecrawl", "fake")
+        .with_host(host("search", |_| {
+            Ok(json!([
+                {"url": "https://example.com/a", "title": "A", "markdown": "about async"},
+                {"url": "https://example.com/b", "title": "B", "markdown": "about cooking"},
+                {"url": "https://example.com/c", "title": "C", "markdown": "unratable"}
+            ]))
+        }))
+        .with_host(host("scrape", |args| {
+            let url = args["url"].as_str().unwrap_or_default();
+            if url.ends_with("missing") {
+                return Err(HostError::Raise {
+                    kind: PyError::RuntimeError,
+                    message: "not found".to_string(),
+                });
+            }
+            Ok(json!({"url": url, "title": "Page A"}))
+        }))
+}
+
+/// Jev fakes: the last option or level at 0.9 confidence, unsure for example.com/b, and a
+/// `RuntimeError` for example.com/c or the text "broken".
+fn fake_jev() -> Pack {
+    let broken = |args: &Value| {
+        let state = &args["state"];
+        (state["url"] == "https://example.com/c" || state["text"] == "broken").then(|| {
+            HostError::Raise {
+                kind: PyError::RuntimeError,
+                message: "jev failed".to_string(),
+            }
+        })
+    };
+    Pack::new("jev", "fake")
+        .with_host(host("choose", move |args| {
+            if let Some(error) = broken(&args) {
+                return Err(error);
+            }
+            let options = args["options"].as_array().cloned().unwrap_or_default();
+            Ok(json!({"answer": options.last(), "confidence": 0.9}))
+        }))
+        .with_host(host("rate", move |args| {
+            if let Some(error) = broken(&args) {
+                return Err(error);
+            }
+            let levels = args["levels"].as_array().cloned().unwrap_or_default();
+            if args["state"]["url"] == "https://example.com/b" {
+                return Ok(json!({"answer": null, "confidence": 0.4}));
+            }
+            Ok(json!({"answer": levels.last(), "confidence": 0.9}))
+        }))
+}
+
+fn firecrawl_client(url: &str) -> FirecrawlClient {
+    FirecrawlClient::new("fc-test-key")
+        .unwrap()
+        .with_base_url(url)
+        .with_max_retries(0)
+}
+
+fn slow() -> impl HostFunction {
+    host_fn("slow", "slow() -> None", "sleeps", |_: Value| async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(Value::Null)
+    })
+}
+
+fn firecrawl_pack(url: &str, search: FirecrawlWebSearch, max_credits: u32) -> Pack {
+    packs::firecrawl(
+        search,
+        FirecrawlFetchPage::new(firecrawl_client(url)),
+        max_credits,
+    )
+}
+
+fn ok(body: Value) -> Canned {
+    Canned::json(200, body.to_string())
+}
+
+fn search_response() -> Canned {
+    ok(json!({
+        "success": true,
+        "creditsUsed": 2,
+        "data": {"web": [
+            {"url": "https://example.com/a", "title": "A", "description": "first"},
+            {"url": "https://example.com/b", "title": "B", "description": "second"}
+        ]}
+    }))
+}
+
+// 1. Every built-in pack passes check_pack.
+
+#[tokio::test]
+async fn reports_pack_examples_pass() {
+    testing::check_pack(test_pool().await, packs::reports(), vec![])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn research_pack_examples_pass() {
+    testing::check_pack(
+        test_pool().await,
+        packs::research(),
+        vec![fake_firecrawl(), fake_jev()],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn triage_pack_examples_pass() {
+    testing::check_pack(test_pool().await, packs::triage(), vec![fake_jev()])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn firecrawl_pack_examples_pass() {
+    let (url, _) = serve(vec![
+        search_response(),
+        ok(json!({
+            "success": true,
+            "data": {"markdown": "# A", "metadata": {
+                "title": "Page A", "url": "https://example.com/a", "statusCode": 200
+            }}
+        })),
+    ])
+    .await;
+    let search = FirecrawlWebSearch::new(firecrawl_client(&url));
+    testing::check_pack(test_pool().await, firecrawl_pack(&url, search, 100), vec![])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn jev_pack_examples_pass() {
+    let answer = |value: Value| ok(json!({"model": "jev-1.13.0", "answers": {"answer": value}}));
+    let (url, _) = serve(vec![
+        answer(json!({"type": "noul", "noul": 0.99})),
+        answer(json!({
+            "type": "choice", "choice": "technical", "confidence": 0.95,
+            "probabilities": {"billing": 0.05, "technical": 0.95}
+        })),
+        answer(json!({
+            "type": "score", "score": 1.0, "confidence": 0.9,
+            "probabilities": {"0": 0.05, "1": 0.95}
+        })),
+        ok(json!({"model": "jev-1.13.0", "answers": {"refund": {"type": "noul", "noul": 0.99}}})),
+    ])
+    .await;
+    let client = JevClient::new("ts-key", "jev-1.13.0")
+        .unwrap()
+        .with_base_url(&url)
+        .unwrap();
+    testing::check_pack(test_pool().await, packs::jev(client), vec![])
+        .await
+        .unwrap();
+}
+
+// 2. A run_tools run whose script gathers search and rate.
+
+fn reply(stop_reason: &str, content: Value) -> Canned {
+    ok(json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-5-5",
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": null,
+        "usage": {"input_tokens": 3, "output_tokens": 2}
+    }))
+}
+
+/// A host function that sleeps, recording when it started and ended.
+fn timed(name: &'static str, spans: Arc<Mutex<Vec<(Instant, Instant)>>>) -> impl HostFunction {
+    host_fn(
+        name,
+        format!("{name}(**kwargs) -> str"),
+        "timed fake",
+        move |_: Value| {
+            let spans = spans.clone();
+            async move {
+                let start = Instant::now();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                spans.lock().unwrap().push((start, Instant::now()));
+                Ok(json!(name))
+            }
+        },
+    )
+}
+
+#[tokio::test]
+async fn run_tools_gathers_host_calls_concurrently() {
+    let script = "hits, level = await asyncio.gather(search(query=\"x\"), \
+                  rate(state=\"s\", question=\"q\", levels=[\"a\", \"b\"]))\n[hits, level]";
+    let (base_url, recorded) = serve(vec![
+        reply(
+            "tool_use",
+            json!([{"type": "tool_use", "id": "toolu_1", "name": "python", "input": {"code": script}}]),
+        ),
+        reply("end_turn", json!([{"type": "text", "text": "Done."}])),
+    ])
+    .await;
+    let spans = Arc::new(Mutex::new(Vec::new()));
+    let pack = Pack::new("fakes", "timed fakes")
+        .with_host(timed("search", spans.clone()))
+        .with_host(timed("rate", spans.clone()));
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let client = Anthropic::new(Some("test_key".to_string()))
+        .unwrap()
+        .with_base_url(base_url)
+        .unwrap()
+        .with_max_retries(0);
+    let params = MessageCreateParams::new(
+        256,
+        vec![MessageParam::user("question")],
+        Model::Known(KnownModel::ClaudeSonnet55),
+    );
+    let run = client.run_tools(params, &[&code], 5).await.unwrap();
+    assert_eq!(run.responses.len(), 2);
+
+    let spans = spans.lock().unwrap().clone();
+    assert_eq!(spans.len(), 2);
+    let (first, second) = (spans[0], spans[1]);
+    assert!(
+        first.0 < second.1 && second.0 < first.1,
+        "calls did not overlap"
+    );
+
+    let body: Value = serde_json::from_str(&recorded.lock().unwrap()[1].body).unwrap();
+    let result = &body["messages"][2]["content"][0];
+    assert_eq!(result["type"], "tool_result");
+    assert_eq!(result["content"], "=> ['search', 'rate']");
+    assert!(
+        body["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("\n\nfakes: timed fakes\n  search(**kwargs) -> str: timed fake")
+    );
+    code.finish().await.unwrap();
+}
+
+// 3. Errors.
+
+#[tokio::test]
+async fn misspelled_function_raises_name_error_without_host_call() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let pack = Pack::new("fakes", "fakes").with_host(counted_search(calls.clone()));
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let (text, is_error) = run(&code, "await serch(query=\"x\")").await;
+    assert!(is_error);
+    assert!(text.contains("NameError"), "{text}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(used(&code), 0);
+}
+
+#[tokio::test]
+async fn unknown_keyword_raises_type_error_and_costs_nothing() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let pack = Pack::new("fakes", "fakes").with_host(counted_search(calls.clone()));
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let (text, is_error) = run(&code, "await search(query=\"x\", limt=3)").await;
+    assert!(is_error);
+    assert!(
+        text.contains("TypeError: search(): unknown field `limt`"),
+        "{text}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(used(&code), 0);
+
+    let (text, is_error) = run(&code, "await search(\"x\")").await;
+    assert!(is_error);
+    assert!(
+        text.contains("TypeError: search() takes keyword arguments only"),
+        "{text}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn raised_value_error_is_catchable() {
+    let pack = Pack::new("fakes", "fakes").with_host(host("check", |_| {
+        Err(HostError::Raise {
+            kind: PyError::ValueError,
+            message: "bad value".to_string(),
+        })
+    }));
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "try:\n    await check()\nexcept ValueError as e:\n    caught = str(e)\ncaught";
+    assert_eq!(
+        run(&code, snippet).await,
+        ("=> 'bad value'".to_string(), false)
+    );
+}
+
+#[tokio::test]
+async fn slow_host_function_raises_runtime_error_and_keeps_the_session() {
+    let pack = Pack::new("fakes", "fakes").with_host(slow());
+    let mut code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    code.host_timeout = Duration::from_millis(200);
+    let (text, is_error) = run(&code, "kept = 7\nawait slow()").await;
+    assert!(is_error);
+    assert!(
+        text.contains("RuntimeError: slow() timed out after 200ms"),
+        "{text}"
+    );
+    assert!(!text.contains(RESTARTED), "{text}");
+    assert_eq!(run(&code, "kept").await, ("=> 7".to_string(), false));
+}
+
+#[tokio::test]
+async fn fatal_host_error_makes_run_tools_fail() {
+    let (base_url, _) = serve(vec![reply(
+        "tool_use",
+        json!([{"type": "tool_use", "id": "toolu_1", "name": "python", "input": {"code": "await boom()"}}]),
+    )])
+    .await;
+    let pack = Pack::new("fakes", "fakes").with_host(host("boom", |_| {
+        Err(HostError::Fatal(Error::authentication("rejected key")))
+    }));
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let client = Anthropic::new(Some("test_key".to_string()))
+        .unwrap()
+        .with_base_url(base_url)
+        .unwrap()
+        .with_max_retries(0);
+    let params = MessageCreateParams::new(
+        256,
+        vec![MessageParam::user("question")],
+        Model::Known(KnownModel::ClaudeSonnet55),
+    );
+    let error = client.run_tools(params, &[&code], 5).await.unwrap_err();
+    assert!(error.is_authentication(), "{error}");
+    assert!(code.session.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn budget_runs_out_at_call_51_for_sequential_awaits() {
+    let pack = Pack::new("fakes", "fakes").with_host(host("ping", |_| Ok(json!(1))));
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "n = 0\nmessage = None\nfor i in range(51):\n    try:\n        n += await ping()\n    \
+                   except RuntimeError as e:\n        message = str(e)\n(n, message)";
+    assert_eq!(
+        run(&code, snippet).await,
+        (
+            "=> (50, 'host call budget of 50 used up for this conversation; finish with what \
+             you have')"
+                .to_string(),
+            false
+        )
+    );
+}
+
+// Monty 1.2.0 never reports a stale call in `ResolveFutures`: awaiting it stalls its scheduler,
+// which raises its own `RuntimeError`, so the driver's "call it again" answer is not reached.
+#[tokio::test]
+async fn call_from_an_earlier_snippet_raises_and_costs_nothing() {
+    let pack = Pack::new("fakes", "fakes").with_host(host("ping", |_| Ok(json!(1))));
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let (_, is_error) = run(&code, "pending = ping()").await;
+    assert!(!is_error);
+    let (text, is_error) = run(&code, "await pending").await;
+    assert!(is_error);
+    assert!(
+        text.ends_with(
+            "RuntimeError: Internal error in monty: asyncio scheduler stalled: no ready tasks \
+             and no pending external calls"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains(RESTARTED), "{text}");
+    assert_eq!(used(&code), 0);
+    assert_eq!(
+        run(&code, "await ping()").await,
+        ("=> 1".to_string(), false)
+    );
+}
+
+// 4. Session.
+
+#[tokio::test]
+async fn variables_persist_across_calls_and_errors() {
+    let code = CodeMode::new(test_pool().await, vec![], Limits::default()).unwrap();
+    assert_eq!(run(&code, "x = 1").await, ("=> None".to_string(), false));
+    assert_eq!(run(&code, "x + 1").await, ("=> 2".to_string(), false));
+    let (text, is_error) = run(&code, "y = 5\nraise ValueError('boom')").await;
+    assert!(is_error);
+    assert!(text.contains("ValueError: boom"), "{text}");
+    assert_eq!(run(&code, "y").await, ("=> 5".to_string(), false));
+    assert_eq!(
+        run(&code, "x = 'text'\nx.upper()").await,
+        ("=> 'TEXT'".to_string(), false)
+    );
+    code.finish().await.unwrap();
+}
+
+#[tokio::test]
+async fn memory_limit_restarts_the_session() {
+    let limits = Limits {
+        max_memory: 16 * 1024 * 1024,
+        ..Limits::default()
+    };
+    let code = CodeMode::new(test_pool().await, vec![], limits).unwrap();
+    assert_eq!(run(&code, "kept = 1").await, ("=> None".to_string(), false));
+    let (text, is_error) = run(&code, "big = 'a' * (64 * 1024 * 1024)\nlen(big)").await;
+    assert!(is_error);
+    assert!(text.contains("MemoryError"), "{text}");
+    assert!(text.ends_with(RESTARTED), "{text}");
+    let (text, is_error) = run(&code, "kept").await;
+    assert!(is_error);
+    assert!(text.contains("NameError"), "{text}");
+}
+
+#[tokio::test]
+async fn cancelled_call_leaves_a_fresh_working_session() {
+    let pack = Pack::new("fakes", "fakes").with_host(slow());
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    assert_eq!(run(&code, "kept = 1").await, ("=> None".to_string(), false));
+    let tool_use = ToolUseBlock::new("toolu_1", TOOL_NAME, json!({"code": "await slow()"}));
+    let cancelled = tokio::time::timeout(Duration::from_millis(300), code.call(&tool_use)).await;
+    assert!(cancelled.is_err());
+
+    assert_eq!(
+        run(&code, "1 + 1").await,
+        (
+            format!("The last python call was cancelled before it finished. {RESTARTED}\n=> 2"),
+            false
+        )
+    );
+    assert_eq!(run(&code, "2 + 2").await, ("=> 4".to_string(), false));
+    let (text, _) = run(&code, "kept").await;
+    assert!(text.contains("NameError"), "{text}");
+}
+
+// 5. Validation.
+
+#[tokio::test]
+async fn invalid_packs_fail_in_new() {
+    let pool = test_pool().await;
+    let ping = || host("ping", |_| Ok(json!(1)));
+    let duplicate = CodeMode::new(
+        pool.clone(),
+        vec![
+            Pack::new("a", "a").with_host(ping()),
+            Pack::new("b", "b").with_python_fn("ping", "def ping()", "again"),
+        ],
+        Limits::default(),
+    );
+    assert!(
+        duplicate
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("two functions are named ping")
+    );
+
+    let missing = CodeMode::new(
+        pool.clone(),
+        vec![Pack::new("a", "a").requires(&["jev"])],
+        Limits::default(),
+    );
+    assert!(
+        missing
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("requires pack jev")
+    );
+
+    let help = CodeMode::new(
+        pool,
+        vec![Pack::new("a", "a").with_host(host("help", |_| Ok(json!(1))))],
+        Limits::default(),
+    );
+    assert!(help.err().unwrap().to_string().contains("reserved"));
+}
+
+// 6. Values.
+
+#[tokio::test]
+async fn values_cross_both_ways() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let pack = Pack::new("fakes", "fakes").with_host(host("echo", move |args| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Ok(args)
+    }));
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    assert_eq!(
+        run(
+            &code,
+            "await echo(a=None, b=True, c=3, d=1.5, e='s', f=[1, (2, 3)], g={'k': [1]})"
+        )
+        .await,
+        (
+            "=> {'a': None, 'b': True, 'c': 3, 'd': 1.5, 'e': 's', 'f': [1, [2, 3]], 'g': \
+             {'k': [1]}}"
+                .to_string(),
+            false
+        )
+    );
+    for (snippet, expected) in [
+        ("await echo(a=2**70)", "ValueError"),
+        ("await echo(a=float('nan'))", "ValueError"),
+        (
+            "await echo(a={1: 2})",
+            "TypeError: dict keys must be str, got int",
+        ),
+        ("await echo(a={1, 2})", "TypeError: cannot pass a set"),
+    ] {
+        let (text, is_error) = run(&code, snippet).await;
+        assert!(is_error, "{snippet}");
+        assert!(text.contains(expected), "{snippet}: {text}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(run(&code, "{1, 2}").await, ("=> {1, 2}".to_string(), false));
+}
+
+// 7. Firecrawl policy.
+
+#[tokio::test]
+async fn firecrawl_pack_keeps_the_tool_policy() {
+    let (url, recorded) = serve(vec![
+        search_response(),
+        Canned::json(
+            402,
+            json!({"success": false, "error": "no credits"}).to_string(),
+        ),
+    ])
+    .await;
+    let search = FirecrawlWebSearch::new(firecrawl_client(&url))
+        .with_blocked_domains(vec!["blocked.com".to_string()]);
+    let pack = firecrawl_pack(&url, search, 100);
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+
+    let (text, is_error) = run(
+        &code,
+        "await search(query='x', include_domains=['blocked.com'])",
+    )
+    .await;
+    assert!(is_error);
+    assert!(
+        text.contains("RuntimeError: Every requested include_domains entry is blocked."),
+        "{text}"
+    );
+    assert!(recorded.lock().unwrap().is_empty());
+
+    let (text, is_error) = run(&code, "len(await search(query='x', limit=100))").await;
+    assert_eq!((text.as_str(), is_error), ("=> 2", false));
+    let body: Value = serde_json::from_str(&recorded.lock().unwrap()[0].body).unwrap();
+    assert_eq!(body["limit"], 10);
+    assert!(body.get("scrapeOptions").is_none(), "{body}");
+
+    let tool_use = ToolUseBlock::new(
+        "toolu_1",
+        TOOL_NAME,
+        json!({"code": "await search(query='x')"}),
+    );
+    let error = code.call(&tool_use).await.unwrap_err();
+    assert_eq!(error.status_code(), Some(402));
+}
+
+#[tokio::test]
+async fn firecrawl_credit_budget_stops_calls() {
+    let (url, recorded) = serve(vec![search_response()]).await;
+    let search = FirecrawlWebSearch::new(firecrawl_client(&url));
+    let pack = firecrawl_pack(&url, search, 2);
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    assert_eq!(
+        run(&code, "len(await search(query='x'))").await,
+        ("=> 2".to_string(), false)
+    );
+    let (text, is_error) = run(&code, "await scrape(url='https://example.com/a')").await;
+    assert!(is_error);
+    assert!(
+        text.contains(
+            "RuntimeError: Firecrawl credit budget of 2 used up; finish with what you have"
+        ),
+        "{text}"
+    );
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+// 8. Output.
+
+#[tokio::test]
+async fn long_prints_are_capped_and_the_traceback_kept() {
+    let code = CodeMode::new(test_pool().await, vec![], Limits::default()).unwrap();
+    let snippet = "for i in range(300):\n    print('x' * 99)\nraise ValueError('end')";
+    let (text, is_error) = run(&code, snippet).await;
+    assert!(is_error);
+    assert!(text.starts_with(&"x".repeat(99)), "{}", &text[..200]);
+    assert!(
+        text.contains("[print output truncated: 15000 of 30000 chars shown]"),
+        "{text}"
+    );
+    let traceback = text.split("chars shown]\n").nth(1).unwrap();
+    assert!(traceback.contains("line 3"), "{traceback}");
+    assert!(
+        traceback.trim_end().ends_with("ValueError: end"),
+        "{traceback}"
+    );
+}
+
+#[tokio::test]
+async fn help_lists_signature_and_examples() {
+    let pack = packs::reports();
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let (text, _) = run(&code, "help('count_by')").await;
+    assert!(
+        text.starts_with("=> 'def count_by(rows: list[dict], key: str) -> list[dict]\\n"),
+        "{text}"
+    );
+    assert!(text.contains("Example:"), "{text}");
+    let (text, _) = run(&code, "help('nope')").await;
+    assert!(text.contains("table, to_csv, count_by"), "{text}");
+    assert_eq!(used(&code), 0);
+}
+
+#[test]
+fn listing_drops_types_and_keeps_defaults() {
+    assert_eq!(
+        untyped(
+            "search(*, query: str, limit: int = 5, include: list[str] | None = None, \
+             levels: list[str] = [\"a, b\", \"c\"]) -> list[dict]"
+        ),
+        "search(*, query, limit=5, include=None, levels=[\"a, b\", \"c\"]) -> list[dict]"
+    );
+}
+
+#[test]
+fn description_lists_packs_in_order() {
+    let ToolUnionParam::CustomTool(tool) = definition(&[packs::reports()]) else {
+        panic!("expected a custom tool");
+    };
+    let description = tool.description.unwrap();
+    assert!(description.starts_with("Run Python (a sandboxed subset of Python 3.14)"));
+    assert!(description.ends_with(
+        "reports: tables, CSV and counts from lists of dicts\n  table(rows, columns=None) -> \
+         str: markdown table; columns default to the first row's keys, so an \"error\" \
+         column appears only when the first row has one\n  to_csv(rows, columns=None) -> str: \
+         CSV text; columns default to the first row's keys, as for table\n  \
+         count_by(rows, key) -> list[dict]: [{key: value, \"count\": n}] sorted by count, \
+         descending"
+    ));
+}
+
+// Reviewer follow-ups: limits, discards, value sizes and policy.
+
+#[tokio::test]
+async fn sandbox_timeout_discards_the_session() {
+    let limits = Limits {
+        max_feed_duration: Duration::from_millis(200),
+        ..Limits::default()
+    };
+    let code = CodeMode::new(test_pool().await, vec![], limits).unwrap();
+    assert_eq!(run(&code, "kept = 1").await, ("=> None".to_string(), false));
+    let (text, is_error) = run(&code, "while True:\n    pass").await;
+    assert!(is_error);
+    assert!(text.contains("TimeoutError"), "{text}");
+    assert!(text.ends_with(RESTARTED), "{text}");
+    let (text, _) = run(&code, "kept").await;
+    assert!(text.contains("NameError"), "{text}");
+}
+
+#[tokio::test]
+async fn python_call_timeout_discards_the_session() {
+    let pack = Pack::new("fakes", "fakes").with_host(slow());
+    let mut code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    code.call_timeout = Duration::from_millis(300);
+    assert_eq!(run(&code, "kept = 1").await, ("=> None".to_string(), false));
+    let (text, is_error) = run(&code, "await slow()").await;
+    assert!(is_error);
+    assert_eq!(
+        text,
+        format!("The python call ran longer than 300ms and was stopped.\n{RESTARTED}")
+    );
+    let (text, _) = run(&code, "kept").await;
+    assert!(text.contains("NameError"), "{text}");
+}
+
+#[tokio::test]
+async fn suspension_limit_discards_the_session() {
+    let code = CodeMode::new(test_pool().await, vec![], Limits::default()).unwrap();
+    assert_eq!(run(&code, "kept = 1").await, ("=> None".to_string(), false));
+    // help() is free, but every call is a suspension; the pool allows 1,000 per session.
+    let (text, is_error) = run(&code, "for i in range(1100):\n    help('x')").await;
+    assert!(is_error);
+    assert!(text.contains("suspension limit 1000 exceeded"), "{text}");
+    assert!(text.ends_with(RESTARTED), "{text}");
+    let (text, _) = run(&code, "kept").await;
+    assert!(text.contains("NameError"), "{text}");
+}
+
+#[tokio::test]
+async fn bad_args_in_a_gather_are_refunded_and_the_rest_run() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let pack = Pack::new("fakes", "fakes").with_host(counted_search(calls.clone()));
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "await asyncio.gather(search(query='a'), search(query='b', limt=1), \
+                   search(query='c'))";
+    let (text, is_error) = run(&code, snippet).await;
+    assert!(is_error);
+    assert!(
+        text.contains("TypeError: search(): unknown field `limt`"),
+        "{text}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(used(&code), 2);
+}
+
+#[tokio::test]
+async fn first_fatal_error_drops_the_rest_of_its_gather() {
+    let pack = Pack::new("fakes", "fakes")
+        .with_host(slow())
+        .with_host(host("boom", |_| {
+            Err(HostError::Fatal(Error::authentication("rejected key")))
+        }));
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let tool_use = ToolUseBlock::new(
+        "toolu_1",
+        TOOL_NAME,
+        json!({"code": "await asyncio.gather(slow(), boom())"}),
+    );
+    let started = Instant::now();
+    let error = code.call(&tool_use).await.unwrap_err();
+    assert!(error.is_authentication(), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn cancel_notice_survives_a_full_pool() {
+    let monty = std::env::var("MONTY_BIN").unwrap();
+    let mut config = PoolConfig::subprocess(monty);
+    config.max_processes = 1;
+    config.checkout_timeout = Some(Duration::from_millis(200));
+    let full = Arc::new(Pool::new(config).await.unwrap());
+    let holder = CodeMode::new(full.clone(), vec![], Limits::default()).unwrap();
+    assert_eq!(run(&holder, "1").await, ("=> 1".to_string(), false));
+
+    // A session left mid-turn by a cancelled call, on a worker from another pool.
+    let other = CodeMode::new(test_pool().await, vec![], Limits::default()).unwrap();
+    assert_eq!(run(&other, "1").await, ("=> 1".to_string(), false));
+    let mut stale = other.session.lock().await.take().unwrap();
+    stale.mid_turn = true;
+    let code = CodeMode::new(full, vec![], Limits::default()).unwrap();
+    *code.session.lock().await = Some(stale);
+
+    assert_eq!(
+        run(&code, "1").await,
+        (
+            format!("{CANCELLED} {RESTARTED}\nNo sandbox worker free; try again."),
+            true
+        )
+    );
+}
+
+#[tokio::test]
+async fn limits_past_the_python_call_timeout_are_rejected() {
+    let limits = Limits {
+        max_feed_duration: Duration::from_secs(200),
+        max_turn_duration: Duration::from_secs(200),
+        ..Limits::default()
+    };
+    let error = CodeMode::new(test_pool().await, vec![], limits)
+        .err()
+        .unwrap();
+    assert!(error.is_validation(), "{error}");
+}
+
+// A list holding one list twice, 30 deep: tiny in the sandbox, 2^30 items expanded.
+const DOUBLING: &str = "x = [1]\nfor i in range(30):\n    x = [x, x]\n";
+
+#[tokio::test]
+async fn shared_references_stay_bounded() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let pack = Pack::new("fakes", "fakes").with_host(host("echo", move |args| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Ok(args)
+    }));
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let started = Instant::now();
+
+    let (text, is_error) = run(&code, &format!("{DOUBLING}await echo(a=x)")).await;
+    assert!(is_error);
+    assert!(
+        text.contains("ValueError: value too large: more than 100000 items"),
+        "{text}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let (text, is_error) = run(&code, &format!("{DOUBLING}x")).await;
+    assert!(!is_error);
+    assert!(text.starts_with("=> [[[[["), "{}", &text[..50]);
+    assert!(text.ends_with(
+        "\n[result truncated: first 5000 chars shown; return less or summarize in Python]"
+    ));
+    assert!(text.chars().count() < 5_200);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn item_and_depth_limits() {
+    let pack = Pack::new("fakes", "fakes").with_host(host("size", |args| {
+        Ok(json!(args["a"].as_array().map_or(0, Vec::len)))
+    }));
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    assert_eq!(
+        run(&code, "await size(a=list(range(100000)))").await,
+        ("=> 100000".to_string(), false)
+    );
+    let (text, is_error) = run(&code, "await size(a=list(range(100001)))").await;
+    assert!(is_error);
+    assert!(text.contains("more than 100000 items"), "{text}");
+    let (text, is_error) = run(
+        &code,
+        "y = 1\nfor i in range(70):\n    y = [y]\nawait size(a=y)",
+    )
+    .await;
+    assert!(is_error);
+    assert!(
+        text.contains("ValueError: value nested deeper than 64 levels"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn firecrawl_pack_refuses_blocked_results_and_redirects() {
+    let (url, _) = serve(vec![
+        ok(json!({
+            "success": true,
+            "data": {"web": [
+                {"url": "https://example.com/a", "title": "A"},
+                {"url": "https://blocked.com/x", "title": "X"}
+            ]}
+        })),
+        ok(json!({
+            "success": true,
+            "data": {"markdown": "# X", "metadata": {
+                "title": "X", "url": "https://blocked.com/x", "statusCode": 200
+            }}
+        })),
+    ])
+    .await;
+    let blocked = vec!["blocked.com".to_string()];
+    let pack = packs::firecrawl(
+        FirecrawlWebSearch::new(firecrawl_client(&url)).with_blocked_domains(blocked.clone()),
+        FirecrawlFetchPage::new(firecrawl_client(&url)).with_blocked_domains(blocked),
+        100,
+    );
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    assert_eq!(
+        run(&code, "[hit['url'] for hit in await search(query='x')]").await,
+        ("=> ['https://example.com/a']".to_string(), false)
+    );
+    let (text, is_error) = run(&code, "await scrape(url='https://example.com/x')").await;
+    assert!(is_error);
+    assert!(
+        text.contains("it redirected to https://blocked.com/x"),
+        "{text}"
+    );
+}
+
+// Final round: scrape options, broken packs, bad input and pack validation.
+
+#[tokio::test]
+async fn search_with_scrape_sends_options_and_cuts_markdown() {
+    let (url, recorded) = serve(vec![ok(json!({
+        "success": true,
+        "data": {"web": [{"url": "https://example.com/a", "title": "A", "markdown": "abcdefghij"}]}
+    }))])
+    .await;
+    let search = FirecrawlWebSearch::new(firecrawl_client(&url)).with_max_content_chars(5);
+    let code = CodeMode::new(
+        test_pool().await,
+        vec![firecrawl_pack(&url, search, 100)],
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        run(
+            &code,
+            "(await search(query='x', scrape=True))[0]['markdown']"
+        )
+        .await,
+        ("=> 'abcde [truncated]'".to_string(), false)
+    );
+    let body: Value = serde_json::from_str(&recorded.lock().unwrap()[0].body).unwrap();
+    assert_eq!(body["scrapeOptions"]["onlyMainContent"], true, "{body}");
+}
+
+#[tokio::test]
+async fn broken_pack_source_is_an_error() {
+    let pack = Pack::new("broken", "broken").with_source("raise ValueError('bad pack')");
+    let code = CodeMode::new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let tool_use = ToolUseBlock::new("toolu_1", TOOL_NAME, json!({"code": "1"}));
+    let error = code.call(&tool_use).await.unwrap_err();
+    assert!(matches!(error, Error::Sandbox { .. }), "{error}");
+    assert!(
+        error.to_string().contains("ValueError: bad pack"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn input_without_code_is_an_error_result() {
+    let code = CodeMode::new(test_pool().await, vec![], Limits::default()).unwrap();
+    for input in [
+        json!({"cod": "1"}),
+        json!({"code": 1}),
+        json!({"code": "1", "x": 2}),
+    ] {
+        let tool_use = ToolUseBlock::new("toolu_1", TOOL_NAME, input.clone());
+        let result = code.call(&tool_use).await.unwrap();
+        assert_eq!(result.is_error, Some(true), "{input}");
+        assert!(
+            text(&result).starts_with("Invalid python input:"),
+            "{input}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn duplicate_packs_and_stray_examples_fail_in_new() {
+    let pool = test_pool().await;
+    let twice = CodeMode::new(
+        pool.clone(),
+        vec![packs::reports(), Pack::new("reports", "again")],
+        Limits::default(),
+    );
+    assert!(
+        twice
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("two packs are named reports")
+    );
+
+    let example = Example {
+        code: "1",
+        expect: "=> 1",
+    };
+    let stray = CodeMode::new(
+        pool,
+        vec![Pack::new("a", "a").with_example("nope", example)],
+        Limits::default(),
+    );
+    assert!(
+        stray
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("pack a has an example for nope, which it does not define")
+    );
+}

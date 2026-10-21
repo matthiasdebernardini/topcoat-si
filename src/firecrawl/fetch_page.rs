@@ -117,92 +117,145 @@ impl FirecrawlFetchPage {
                 ));
             }
         };
-        let request = ScrapeRequest::new(url.clone()).with_options(self.scrape_options.clone());
+        Ok(match self.fetch(&url, &filter).await? {
+            Ok(page) => self.result(id, &url, page),
+            Err(message) => error_result(id, message),
+        })
+    }
+
+    /// Fetch for the sandbox's `scrape(...)`: the same checks and error mapping as the tool,
+    /// returning the page as data. The inner `Err` is a message the model can act on; `Err` is
+    /// fatal.
+    #[cfg(feature = "code-mode")]
+    pub(crate) async fn page_value(
+        &self,
+        url: &str,
+    ) -> Result<std::result::Result<PageData, String>> {
+        let filter = self.checked_config()?;
+        let url = url.trim();
+        Ok(self.fetch(url, &filter).await?.map(|page| PageData {
+            url: page.source,
+            status: page.status,
+            title: page.title,
+            markdown: page.markdown,
+        }))
+    }
+
+    /// Fetches one page and checks where it landed and its status. The inner `Err` is a
+    /// message the model can act on; `Err` is fatal (401, 402).
+    async fn fetch(&self, url: &str, filter: &Filter) -> Result<std::result::Result<Page, String>> {
+        let request = ScrapeRequest::new(url).with_options(self.scrape_options.clone());
         if let Err(Error::Validation { message, .. }) = request.validate() {
-            return Ok(error_result(
-                id,
-                format!("Could not fetch {url}: {message}"),
-            ));
+            return Ok(Err(format!("Could not fetch {url}: {message}")));
         }
-        if !filter.permits(&url) {
-            return Ok(error_result(
-                id,
-                format!("Could not fetch {url}: this tool may not fetch pages on that domain."),
-            ));
+        if !filter.permits(url) {
+            return Ok(Err(format!(
+                "Could not fetch {url}: this tool may not fetch pages on that domain."
+            )));
         }
         match self.client.scrape(&request).await {
-            Ok(response) => Ok(self.result(id, &url, response, &filter)),
+            Ok(response) => Ok(self.page(url, response, filter)),
             Err(error) if matches!(error.status_code(), Some(401 | 402)) => Err(error),
-            Err(Error::Validation { message, .. }) => Ok(error_result(
-                id,
-                format!("Could not fetch {url}: {message}"),
-            )),
-            Err(error) => Ok(error_result(id, format!("Could not fetch {url}: {error}"))),
+            Err(Error::Validation { message, .. }) => {
+                Ok(Err(format!("Could not fetch {url}: {message}")))
+            }
+            Err(error) => Ok(Err(format!("Could not fetch {url}: {error}"))),
         }
     }
 
-    fn result(
+    fn page(
         &self,
-        id: String,
         url: &str,
         response: ScrapeResponse,
         filter: &Filter,
-    ) -> ToolResultBlock {
+    ) -> std::result::Result<Page, String> {
         let data = response.data;
         let metadata = data.metadata.unwrap_or_default();
         // Firecrawl can report an empty or relative URL; only an absolute http(s) one counts.
         let landed = metadata.url.filter(|u| is_absolute_http(u));
         if let Some(landed) = landed.as_deref().filter(|u| !filter.permits(u)) {
-            return error_result(
-                id,
-                format!(
-                    "Could not fetch {url}: it redirected to {landed}, a domain this tool may \
-                     not fetch."
-                ),
-            );
+            return Err(format!(
+                "Could not fetch {url}: it redirected to {landed}, a domain this tool may not \
+                 fetch."
+            ));
         }
-        if let Some(status) = metadata
-            .status_code
-            .filter(|s| !(200..300).contains(s) && *s != 304)
-        {
-            return error_result(
-                id,
-                format!("Could not fetch {url}: the page returned HTTP {status}."),
-            );
+        if let Some(status) = metadata.status_code.filter(|s| !is_success(*s)) {
+            return Err(format!(
+                "Could not fetch {url}: the page returned HTTP {status}."
+            ));
         }
-        let warning = data
-            .warning
-            .filter(|w| !w.trim().is_empty())
-            .map(|w| format!("Firecrawl warning: {w}"));
-        let Some(markdown) = data.markdown.filter(|m| !m.trim().is_empty()) else {
-            let text = match warning {
-                Some(warning) => format!("{url} has no readable text. {warning}"),
-                None => format!("{url} has no readable text."),
-            };
-            return ToolResultBlock::new(id).with_string_content(text);
-        };
-        let mut content: Vec<TextBlock> = chunks(&truncate(&markdown, self.max_content_chars))
-            .into_iter()
-            .map(TextBlock::new)
-            .collect();
         let pdf_note = match (metadata.num_pages, metadata.total_pages) {
             (Some(read), Some(total)) if read < total => {
                 Some(format!("Only pages 1 to {read} of {total} were read."))
             }
             _ => None,
         };
-        push_text(&mut content, pdf_note);
-        push_text(&mut content, warning);
-        let source = landed
-            .or(metadata.source_url.filter(|u| is_absolute_http(u)))
-            .unwrap_or_else(|| url.to_string());
+        Ok(Page {
+            source: landed
+                .or(metadata.source_url.filter(|u| is_absolute_http(u)))
+                .unwrap_or_else(|| url.to_string()),
+            #[cfg(feature = "code-mode")]
+            status: metadata.status_code,
+            title: metadata.title,
+            markdown: data
+                .markdown
+                .filter(|m| !m.trim().is_empty())
+                .map(|m| truncate(&m, self.max_content_chars)),
+            pdf_note,
+            warning: data
+                .warning
+                .filter(|w| !w.trim().is_empty())
+                .map(|w| format!("Firecrawl warning: {w}")),
+        })
+    }
+
+    fn result(&self, id: String, url: &str, page: Page) -> ToolResultBlock {
+        let Some(markdown) = page.markdown else {
+            let text = page.warning.map_or_else(
+                || format!("{url} has no readable text."),
+                |warning| format!("{url} has no readable text. {warning}"),
+            );
+            return ToolResultBlock::new(id).with_string_content(text);
+        };
+        let mut content: Vec<TextBlock> =
+            chunks(&markdown).into_iter().map(TextBlock::new).collect();
+        push_text(&mut content, page.pdf_note);
+        push_text(&mut content, page.warning);
         // A tool result holding a search result may hold nothing else.
         ToolResultBlock::new(id).with_array_content(vec![search_result(
-            source,
-            metadata.title,
+            page.source,
+            page.title,
             content,
         )])
     }
+}
+
+/// One page as the sandbox's `scrape(...)` returns it.
+#[cfg(feature = "code-mode")]
+#[derive(serde::Serialize)]
+pub(crate) struct PageData {
+    /// Where the page ended up after redirects.
+    url: String,
+    status: Option<u16>,
+    title: Option<String>,
+    /// Cut to the tool's limit.
+    markdown: Option<String>,
+}
+
+/// A fetched page that passed every check.
+struct Page {
+    source: String,
+    #[cfg(feature = "code-mode")]
+    status: Option<u16>,
+    title: Option<String>,
+    /// Non-empty markdown, cut to the tool's limit.
+    markdown: Option<String>,
+    pdf_note: Option<String>,
+    warning: Option<String>,
+}
+
+fn is_success(status: u16) -> bool {
+    (200..300).contains(&status) || status == 304
 }
 
 impl ClientTool for FirecrawlFetchPage {
@@ -279,8 +332,9 @@ pub(super) fn chunks(markdown: &str) -> Vec<String> {
     let mut block = String::new();
     for (paragraph, heading) in paragraphs {
         for (index, piece) in split_long(&paragraph).into_iter().enumerate() {
-            let len = block.chars().count() + 2 + piece.chars().count();
-            if !block.is_empty() && ((index == 0 && heading) || len > CHUNK_CHARS) {
+            let starts_section = index == 0 && heading;
+            let overflows = block.chars().count() + 2 + piece.chars().count() > CHUNK_CHARS;
+            if !block.is_empty() && (starts_section || overflows) {
                 blocks.push(std::mem::take(&mut block));
             }
             if !block.is_empty() {
