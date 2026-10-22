@@ -40,32 +40,11 @@ impl AccumulatingStream {
     where
         S: Stream<Item = Result<MessageStreamEvent, Error>> + Send + 'static,
     {
-        Self::with_seed(stream, None)
-    }
-
-    /// Wraps a `MessageStreamEvent` stream and seeds accumulation with a fallback message.
-    pub fn new_with_message<S>(
-        stream: S,
-        message: Message,
-    ) -> (Self, oneshot::Receiver<Result<Message, Error>>)
-    where
-        S: Stream<Item = Result<MessageStreamEvent, Error>> + Send + 'static,
-    {
-        Self::with_seed(stream, Some(message))
-    }
-
-    fn with_seed<S>(
-        stream: S,
-        message: Option<Message>,
-    ) -> (Self, oneshot::Receiver<Result<Message, Error>>)
-    where
-        S: Stream<Item = Result<MessageStreamEvent, Error>> + Send + 'static,
-    {
         let (tx, rx) = oneshot::channel();
         let this = Self {
             inner: Box::pin(stream),
             message_tx: Some(tx),
-            message,
+            message: None,
             content_blocks: Vec::new(),
             done: false,
             completed: false,
@@ -190,12 +169,7 @@ impl Stream for AccumulatingStream {
             }
             Poll::Ready(Some(Err(error))) => self.fail(error),
             Poll::Ready(None) => {
-                if !self.completed
-                    && !self
-                        .message
-                        .as_ref()
-                        .is_some_and(|message| message.stop_reason.is_some())
-                {
+                if !self.completed {
                     let reason = if self.message.is_none() {
                         "stream ended without a message start event"
                     } else {
@@ -256,7 +230,7 @@ enum ContentBlockBuilder {
         id: String,
         name: String,
         input_json: String,
-        input_value: Option<Value>,
+        input_value: Value,
         saw_delta: bool,
         cache_control: Option<CacheControlEphemeral>,
     },
@@ -280,7 +254,7 @@ impl ContentBlockBuilder {
                 id: tool_use.id,
                 name: tool_use.name,
                 input_json: String::new(),
-                input_value: Some(tool_use.input),
+                input_value: tool_use.input,
                 saw_delta: false,
                 cache_control: tool_use.cache_control,
             },
@@ -289,7 +263,7 @@ impl ContentBlockBuilder {
                 id: server_tool_use.id,
                 name: server_tool_use.name,
                 input_json: String::new(),
-                input_value: Some(server_tool_use.input),
+                input_value: server_tool_use.input,
                 saw_delta: false,
                 cache_control: server_tool_use.cache_control,
             },
@@ -300,7 +274,7 @@ impl ContentBlockBuilder {
                 id: mcp_tool_use.id,
                 name: mcp_tool_use.name,
                 input_json: String::new(),
-                input_value: Some(mcp_tool_use.input),
+                input_value: mcp_tool_use.input,
                 saw_delta: false,
                 cache_control: None,
             },
@@ -389,7 +363,7 @@ impl ContentBlockBuilder {
                 saw_delta,
                 cache_control,
             } => {
-                let input = if saw_delta || input_value.is_none() {
+                let input = if saw_delta {
                     match parse_tool_input(&name, &input_json) {
                         Ok(input) => input,
                         Err(_) if stop_reason == Some(StopReason::MaxTokens) => {
@@ -405,7 +379,7 @@ impl ContentBlockBuilder {
                         Err(error) => return Err(error),
                     }
                 } else {
-                    input_value.unwrap_or_default()
+                    input_value
                 };
                 let block = match kind {
                     ToolKind::Client => ContentBlock::ToolUse(ToolUseBlock {
@@ -490,6 +464,9 @@ mod tests {
             Ok(content_start),
             Ok(content_delta),
             Ok(delta_event),
+            Ok(MessageStreamEvent::MessageStop(
+                crate::MessageStopEvent::new(),
+            )),
         ];
         let event_stream = stream::iter(events);
 
@@ -506,16 +483,6 @@ mod tests {
             .expect("accumulation failed");
 
         // Verify cache tokens were preserved from message_start
-        // DEBUG: Print what we got
-        println!(
-            "cache_creation_input_tokens: {:?}",
-            message.usage.cache_creation_input_tokens
-        );
-        println!(
-            "cache_read_input_tokens: {:?}",
-            message.usage.cache_read_input_tokens
-        );
-
         assert_eq!(
             message.usage.cache_creation_input_tokens,
             Some(50),
@@ -577,6 +544,9 @@ mod tests {
             Ok(content_delta),
             Ok(content_stop),
             Ok(delta_event),
+            Ok(MessageStreamEvent::MessageStop(
+                crate::MessageStopEvent::new(),
+            )),
         ];
         let event_stream = stream::iter(events);
 
@@ -609,7 +579,6 @@ mod tests {
                 .is_empty(),
             "Empty tool input should be an empty object"
         );
-        println!("tool_use.input: {:?}", tool_use.input);
     }
 
     /// Verifies that tool use with no delta events uses initial input_value.
@@ -645,6 +614,9 @@ mod tests {
             Ok(content_start),
             Ok(content_stop),
             Ok(delta_event),
+            Ok(MessageStreamEvent::MessageStop(
+                crate::MessageStopEvent::new(),
+            )),
         ];
         let event_stream = stream::iter(events);
 
@@ -666,7 +638,6 @@ mod tests {
             tool_use.input, input,
             "Tool input should match initial value"
         );
-        println!("tool_use.input: {:?}", tool_use.input);
     }
 
     /// Verifies that container and diagnostics from message_start and
@@ -775,6 +746,9 @@ mod tests {
                 MessageDelta::new().with_stop_reason(StopReason::EndTurn),
                 MessageDeltaUsage::new(1),
             ),
+        )));
+        events.push(Ok(MessageStreamEvent::MessageStop(
+            crate::MessageStopEvent::new(),
         )));
 
         let (mut acc_stream, rx) = AccumulatingStream::new(stream::iter(events));
@@ -944,6 +918,10 @@ mod tests {
         ))
     }
 
+    fn message_stop_event() -> MessageStreamEvent {
+        MessageStreamEvent::MessageStop(crate::MessageStopEvent::new())
+    }
+
     /// Drains a stream over `events`, returning its items and the final message.
     async fn drain(
         events: Vec<Result<MessageStreamEvent, Error>>,
@@ -965,6 +943,7 @@ mod tests {
             Ok(tool_start_event()),
             Ok(json_delta_event(0, r#"{"query": SECRET-INPUT"#)),
             Ok(stop_event(StopReason::ToolUse)),
+            Ok(message_stop_event()),
         ];
         let (items, message) = drain(events).await;
         let error = items.last().unwrap().as_ref().unwrap_err();
@@ -983,6 +962,7 @@ mod tests {
             Ok(tool_start_event()),
             Ok(json_delta_event(0, r#"{"query": "ru"#)),
             Ok(stop_event(StopReason::MaxTokens)),
+            Ok(message_stop_event()),
         ];
         let (items, message) = drain(events).await;
         assert!(items.iter().all(Result::is_ok));
@@ -1038,5 +1018,27 @@ mod tests {
         // A stream that ends early fails with the count too.
         let (items, _) = drain(vec![Ok(start_event())]).await;
         assert_eq!(items[1].as_ref().unwrap_err().events_delivered(), Some(1));
+    }
+
+    /// A stop reason in `message_delta` does not stand in for `message_stop`.
+    #[tokio::test]
+    async fn stop_reason_without_message_stop_is_interrupted() {
+        let events = vec![
+            Ok(start_event()),
+            Ok(MessageStreamEvent::ContentBlockStart(
+                ContentBlockStartEvent::new(ContentBlock::Text(TextBlock::new(String::new())), 0),
+            )),
+            Ok(MessageStreamEvent::ContentBlockDelta(
+                ContentBlockDeltaEvent::new(ContentBlockDelta::TextDelta(TextDelta::new("Hi")), 0),
+            )),
+            Ok(MessageStreamEvent::ContentBlockStop(
+                ContentBlockStopEvent::new(0),
+            )),
+            Ok(stop_event(StopReason::EndTurn)),
+        ];
+        let (items, message) = drain(events).await;
+        let error = items.last().unwrap().as_ref().unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Interrupted, "{error}");
+        assert!(message.is_err());
     }
 }
