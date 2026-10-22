@@ -1,6 +1,10 @@
+def is_marker(row):
+    return isinstance(row, dict) and len(row) == 2 and row.get("_truncated") is True and "_rows_dropped" in row
+
+
 async def rows(*, surql, params={}):
     found = await query(surql=surql, params=params)
-    return [row for row in found if not (isinstance(row, dict) and "_truncated" in row)]
+    return [row for row in found if not is_marker(row)]
 
 
 async def one(*, surql, params={}):

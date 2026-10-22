@@ -4,8 +4,11 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use surrealdb::method::Transaction;
+use surrealdb::types::ToSql;
 use surrealdb::types::Value as SurrealValue;
 use surrealdb::{Connection, Surreal};
+use tokio::runtime::Handle;
 use tokio::time;
 
 use crate::code_mode::{Example, HostError, Pack, PyError, host_fn};
@@ -13,24 +16,40 @@ use crate::surreal::store_error;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-// Words the query text may not contain. The cancel at the end undoes every write, so `CREATE`,
-// `UPDATE` and `DELETE` are harmless. These are not, or would defeat the cancel.
+// The pack is read-only, and the always-cancelled transaction is only the second line of defence:
+// some effects are not rolled back, and a write can fire an event or a field `VALUE` that has
+// one. So the canonical form of the query is checked first, and these are refused.
+//
+// Statements that write or define: changing data or schema is not what a read is for, and
+// transaction control, live queries, `SLEEP`, session changes and schema introspection would
+// keep a write, outlive the call or hold the connection.
 const FORBIDDEN_WORDS: &[&str] = &[
-    // DDL: the build of an index and a sequence's counter act outside the transaction, and
-    // changing the schema is not what a read is for.
-    "define", "remove", "alter", "rebuild",
-    // Ending or leaving the transaction would keep a write or run the rest outside it.
-    "begin", "commit", "cancel", "use",
-    // Live queries and kills outlive the call; sleep holds the connection.
-    "kill", "live", "sleep",
-    // Session and permission changes, and schema introspection that is not `tables()` or
-    // `describe()`.
-    "option", "access", "info",
+    "DEFINE", "REMOVE", "ALTER", "REBUILD", "BEGIN", "COMMIT", "CANCEL", "USE", "KILL", "LIVE",
+    "SLEEP", "OPTION", "ACCESS", "INFO", "CREATE", "UPDATE", "UPSERT", "DELETE", "INSERT",
+    "RELATE",
 ];
 
-// Function families that act outside the transaction: a sequence's counter is not rolled back,
-// and HTTP, API and file calls reach the network and disk.
-const FORBIDDEN_PREFIXES: &[&str] = &["sequence::", "http::", "api::", "file::"];
+// Functions that act outside the transaction (a sequence's counter is not rolled back; HTTP, API
+// and file calls reach the network and disk; `fn::` and `eval::` run arbitrary code), functions
+// that build a table or record reference from a string (they would hide a `topcoat_` name), and
+// `sleep`.
+const FORBIDDEN_FRAGMENTS: &[&str] = &[
+    "sequence::",
+    "http::",
+    "api::",
+    "file::",
+    "fn::",
+    "eval::",
+    "type::table(",
+    "type::thing(",
+    "type::record(",
+    "sleep(",
+    "<record>",
+];
+
+// The crate's own tables (memory, transcripts and the like) hold every user's data, so the pack
+// neither lists, describes nor reads them.
+const OWN_TABLE_PREFIX: &str = "topcoat_";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,11 +71,16 @@ struct NoArgs {}
 
 /// `query`, `tables` and `describe` over `db`, plus the `rows`, `one` and `count` helpers.
 ///
-/// Every query runs in a transaction that is always cancelled, so nothing it writes survives,
-/// and text with DDL, transaction control, `sleep`, live queries or `sequence::`, `http::`,
-/// `api::` or `file::` functions is refused before it runs. A query that takes over 20 s is
-/// cancelled. `query` returns at most `max_rows` rows, and a final `{"_truncated": true,
-/// "_rows_dropped": n}` row when there were more.
+/// A query is parsed by SurrealDB's parser and refused, on its canonical form, if it has a
+/// statement that writes or defines, a function that acts outside the transaction or builds a
+/// table reference from a string, or a name of the crate's own `topcoat_` tables, which
+/// `tables()` and `describe()` hide too. The canonical text is what runs. As a second line of
+/// defence every query runs in a transaction that is always cancelled.
+///
+/// The call returns after 20 s with a timeout error, but the local engine has no way to cancel
+/// a query, so a CPU-bound one may run to completion in the engine. `query` returns at most
+/// `max_rows` rows, and a final `{"_truncated": true, "_rows_dropped": n}` row when there were
+/// more.
 #[must_use]
 pub fn surreal<C: Connection>(db: Surreal<C>, max_rows: usize) -> Pack {
     let (tables_db, describe_db) = (db.clone(), db.clone());
@@ -66,7 +90,7 @@ pub fn surreal<C: Connection>(db: Surreal<C>, max_rows: usize) -> Pack {
             "query(*, surql: str, params: dict = {}) -> list[dict]",
             "run SurrealQL, binding $name values from params; rows of the last statement, at \
              most the row cap, then {\"_truncated\": True, \"_rows_dropped\": n} when cut; \
-             writes are undone",
+             read-only",
             move |args: QueryArgs| {
                 let db = db.clone();
                 async move { query(&db, args, max_rows).await }
@@ -144,7 +168,10 @@ async fn query<C: Connection>(
     args: QueryArgs,
     max_rows: usize,
 ) -> Result<Value, HostError> {
-    if let Some(word) = forbidden(&args.surql) {
+    let ast = surrealdb_core::syn::parse(&args.surql)
+        .map_err(|error| raise(PyError::RuntimeError, error.to_string()))?;
+    let canonical = ast.to_sql();
+    if let Some(word) = forbidden(&canonical) {
         return Err(raise(
             PyError::ValueError,
             format!(
@@ -153,7 +180,7 @@ async fn query<C: Connection>(
             ),
         ));
     }
-    let mut rows = match run(db, &args.surql, args.params).await? {
+    let mut rows = match run(db, &canonical, args.params).await? {
         Value::Array(rows) => rows,
         Value::Null => Vec::new(),
         row => vec![row],
@@ -172,6 +199,7 @@ async fn tables<C: Connection>(db: &Surreal<C>) -> Result<Value, HostError> {
         .as_object()
         .into_iter()
         .flat_map(Map::keys)
+        .filter(|name| !name.starts_with(OWN_TABLE_PREFIX))
         .collect();
     names.sort();
     Ok(json!(names))
@@ -184,22 +212,87 @@ async fn describe<C: Connection>(db: &Surreal<C>, table: &str) -> Result<Value, 
             format!("`{table}` is not a table name: use letters, digits and underscores"),
         ));
     }
+    if table.starts_with(OWN_TABLE_PREFIX) {
+        return Err(raise(
+            PyError::ValueError,
+            format!(
+                "`{table}` is not available: the surreal pack does not expose `topcoat_` tables"
+            ),
+        ));
+    }
     let info = run(db, &format!("INFO FOR TABLE {table}"), Map::new()).await?;
     Ok(json!({"fields": info["fields"], "indexes": info["indexes"]}))
 }
 
-/// The first word or function prefix of `surql` that the pack refuses, as written in the text.
-/// A word is a run of letters, digits, `_` and `:`, so `a::use` and `defined` are fine.
-fn forbidden(surql: &str) -> Option<&str> {
-    surql
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
-        .find(|word| {
-            let lower = word.to_ascii_lowercase();
-            FORBIDDEN_WORDS.contains(&lower.as_str())
-                || FORBIDDEN_PREFIXES
-                    .iter()
-                    .any(|prefix| lower.starts_with(prefix))
+/// The first word or fragment of the canonical query `canonical` that the pack refuses. String
+/// literals and backtick-quoted identifiers are blanked first, so a keyword inside them is fine.
+/// The canonical form upper-cases keywords and escapes identifiers that collide with them, so an
+/// unescaped upper-case word is the keyword.
+fn forbidden(canonical: &str) -> Option<String> {
+    let text = blank_quoted(canonical);
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    if let Some(word) = text
+        .split(|c: char| !is_word(c))
+        .find(|word| FORBIDDEN_WORDS.contains(word))
+    {
+        return Some(word.to_string());
+    }
+    let lower = text.to_ascii_lowercase();
+    if let Some(fragment) = FORBIDDEN_FRAGMENTS
+        .iter()
+        .find(|fragment| lower.contains(*fragment))
+    {
+        return Some((*fragment).to_string());
+    }
+    lower
+        .match_indices(OWN_TABLE_PREFIX)
+        .find_map(|(start, _)| {
+            let on_boundary = !lower[..start].chars().next_back().is_some_and(is_word);
+            on_boundary.then(|| {
+                let end = lower[start..]
+                    .find(|c: char| !is_word(c))
+                    .map_or(lower.len(), |len| start + len);
+                text[start..end].to_string()
+            })
         })
+}
+
+/// `text` with each `'...'`, `"..."` and backtick-quoted run, backslash escapes included,
+/// replaced by one space. A backtick-quoted name is kept (unquoted) when it is followed by `::`
+/// (a function module such as `` `sequence`::nextval ``) or starts with `topcoat_`, since those
+/// are names the checks look for.
+fn blank_quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quote = None;
+    let mut inner = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            None if matches!(c, '\'' | '"' | '`') => {
+                quote = Some(c);
+                inner.clear();
+            }
+            None => out.push(c),
+            Some(_) if c == '\\' => {
+                chars.next();
+            }
+            Some(open) if c == open => {
+                quote = None;
+                out.push(' ');
+                if open == '`' && chars.as_str().starts_with("::") {
+                    out.push_str(&inner);
+                } else if open == '`' && inner.to_ascii_lowercase().starts_with(OWN_TABLE_PREFIX) {
+                    out.push_str(&inner);
+                    out.push(' ');
+                }
+            }
+            Some(_) => inner.push(c),
+        }
+    }
+    if quote.is_some() {
+        out.push(' ');
+    }
+    out
 }
 
 /// Runs `surql` in a transaction that is always cancelled and returns the last statement's
@@ -209,13 +302,10 @@ async fn run<C: Connection>(
     surql: &str,
     params: Map<String, Value>,
 ) -> Result<Value, HostError> {
-    let tx = db
-        .clone()
-        .begin()
-        .await
-        .map_err(|error| fatal("beginning a read-only transaction", error))?;
+    let tx = Guard::begin(db).await?;
     let outcome = time::timeout(TIMEOUT, async {
         let mut response = tx
+            .get()?
             .query(surql)
             .bind(Value::Object(params))
             .await
@@ -235,11 +325,49 @@ async fn run<C: Connection>(
     })
     .await;
     // The query's own error outranks a failed cancel.
-    match (outcome, tx.cancel().await) {
-        (Ok(Ok(value)), Ok(_)) => Ok(value),
+    match (outcome, tx.finish().await) {
+        (Ok(Ok(value)), Ok(())) => Ok(value),
         (Ok(Ok(_)), Err(error)) => Err(fatal("cancelling a read-only transaction", error)),
         (Ok(Err(error)), _) => Err(error),
         (Err(_), _) => Err(raise(PyError::RuntimeError, "query timed out after 20 s")),
+    }
+}
+
+/// A transaction that is cancelled however the call ends. The client `Transaction` has no `Drop`,
+/// so a call future dropped mid-query (the tool loop drops its siblings on a fatal error) would
+/// leave the write transaction open in the engine.
+struct Guard<C: Connection>(Option<Transaction<C>>);
+
+impl<C: Connection> Guard<C> {
+    async fn begin(db: &Surreal<C>) -> Result<Self, HostError> {
+        db.clone()
+            .begin()
+            .await
+            .map(|tx| Self(Some(tx)))
+            .map_err(|error| fatal("beginning a read-only transaction", error))
+    }
+
+    fn get(&self) -> Result<&Transaction<C>, HostError> {
+        self.0
+            .as_ref()
+            .ok_or_else(|| raise(PyError::RuntimeError, "the transaction is already closed"))
+    }
+
+    async fn finish(mut self) -> Result<(), surrealdb::Error> {
+        match self.0.take() {
+            Some(tx) => tx.cancel().await.map(|_| ()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<C: Connection> Drop for Guard<C> {
+    fn drop(&mut self) {
+        if let (Some(tx), Ok(runtime)) = (self.0.take(), Handle::try_current()) {
+            runtime.spawn(async move {
+                let _ = tx.cancel().await;
+            });
+        }
     }
 }
 
@@ -311,33 +439,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_write_succeeds_but_does_not_survive() {
+    async fn a_select_in_the_transaction_sees_committed_rows() {
         let db = seeded(1).await;
-        let created = query(&db, args("CREATE item:99 SET n = 99"), 10)
-            .await
-            .unwrap();
-        assert_eq!(created[0]["n"], json!(99));
-        let mut after = db.query("SELECT * FROM item:99").await.unwrap();
-        assert_eq!(after.take::<Vec<Value>>(0).unwrap(), Vec::<Value>::new());
+        let rows = query(&db, args("SELECT n FROM item:1"), 10).await.unwrap();
+        assert_eq!(rows, json!([{"n": 1}]));
     }
 
     #[tokio::test]
-    async fn text_that_acts_outside_the_transaction_is_refused() {
+    async fn text_that_writes_or_acts_outside_the_transaction_is_refused() {
         let db = seeded(1).await;
-        for (surql, word) in [
-            ("DEFINE TABLE x", "DEFINE"),
-            ("select 1; sleep(1s)", "sleep"),
-            ("RETURN sequence::nextval('a')", "sequence::nextval"),
-            ("RETURN http::get('http://localhost')", "http::get"),
-            ("COMMIT", "COMMIT"),
-            ("INFO FOR DB", "INFO"),
+        for surql in [
+            "RETURN `sequence`::nextval('s')",
+            "RETURN sequence :: nextval('s')",
+            "/* x */ DEFINE TABLE y",
+            "RETURN http::get('http://127.0.0.1:1')",
+            "RETURN fn::anything()",
+            "RETURN eval::surql('RETURN 1')",
+            "SELECT * FROM topcoat_memory",
+            "SELECT * FROM type::table($t)",
+            "SELECT * FROM <record>$r",
+            "CREATE item SET n = 1",
         ] {
             let error = query(&db, args(surql), 10).await.unwrap_err();
             let text = message(&error, PyError::ValueError);
-            assert!(text.contains(word) && text.contains("read-only"), "{text}");
+            assert!(text.contains("read-only"), "{surql}: {text}");
         }
-        // Words inside longer words and paths are fine.
-        assert!(forbidden("SELECT defined, a::use FROM item").is_none());
+    }
+
+    #[tokio::test]
+    async fn quoted_words_and_plain_functions_are_allowed() {
+        let db = seeded(1).await;
+        let rows = query(
+            &db,
+            args("SELECT n FROM item WHERE 'DEFINE http::' != 'x'"),
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows, json!([{"n": 1}]));
+        // The parser drops comments, so a keyword in one is not in the text that runs.
+        let commented = query(&db, args("SELECT n FROM item -- DEFINE"), 10)
+            .await
+            .unwrap();
+        assert_eq!(commented, json!([{"n": 1}]));
+        query(&db, args("SELECT `access` FROM item"), 10)
+            .await
+            .unwrap();
+        let sum = query(&db, args("RETURN math::sum([1,2])"), 10)
+            .await
+            .unwrap();
+        assert_eq!(sum, json!([3]));
+        let var = query(&db, args("LET $x = 1; RETURN $x"), 10).await.unwrap();
+        assert_eq!(var, json!([1]));
     }
 
     #[tokio::test]
@@ -372,6 +525,19 @@ mod tests {
             let error = describe(&db, bad).await.unwrap_err();
             message(&error, PyError::ValueError);
         }
+    }
+
+    #[tokio::test]
+    async fn the_crates_own_tables_are_hidden() {
+        let db = seeded(1).await;
+        db.query("DEFINE TABLE topcoat_x SCHEMALESS")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        assert_eq!(tables(&db).await.unwrap(), json!(["item"]));
+        let error = describe(&db, "topcoat_x").await.unwrap_err();
+        message(&error, PyError::ValueError);
     }
 
     fn fake_surreal() -> Pack {
