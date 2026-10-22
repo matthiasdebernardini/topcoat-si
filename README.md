@@ -1069,6 +1069,8 @@ The tool examples need more keys:
 
 The Jev variables are `TYPESAFE_API_KEY` and `TYPESAFE_DEFAULT_MODEL`.
 
+`cargo test --test live -- --ignored` checks every model and the Firecrawl and Jev tools against the real APIs; it needs all four keys and costs a few cents.
+
 ## License
 
 Apache-2.0.
