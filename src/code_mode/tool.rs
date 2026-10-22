@@ -118,7 +118,8 @@ impl CodeMode {
     /// Fails when two packs or two functions across packs share a name, a pack requires one not
     /// given or has an example for a function it does not define, a function is named `help`,
     /// which is reserved, or the shorter of `max_feed_duration` and
-    /// `max_turn_duration`, plus 5 seconds, passes the 120 second limit on one `python` call.
+    /// `max_turn_duration`, plus 5 seconds, passes the 120 second limit on one `python` call, or
+    /// `max_output_chars` is under the 5,000 characters reserved for the value or traceback.
     pub fn try_new(pool: Arc<Pool>, packs: Vec<Pack>, limits: Limits) -> Result<Self> {
         let invalid = |message: String| Error::validation(message, Some("packs".to_string()));
         let names: Vec<&str> = packs
@@ -173,6 +174,15 @@ impl CodeMode {
                     PYTHON_CALL_TIMEOUT - LIMIT_MARGIN
                 ),
                 Some("limits".to_string()),
+            ));
+        }
+        if limits.max_output_chars < RESULT_CHARS {
+            return Err(Error::validation(
+                format!(
+                    "max_output_chars must be at least {RESULT_CHARS}, the characters reserved \
+                     for the value or traceback"
+                ),
+                Some("max_output_chars".to_string()),
             ));
         }
         let definition = definition(&packs);

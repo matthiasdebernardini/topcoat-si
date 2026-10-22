@@ -693,7 +693,7 @@ async def order_count(*, since: str) -> int:
 }
 ```
 
-To test a pack, call `check_pack` from `code_mode::testing` with the pool, the pack and its fakes. It runs every example in a fresh sandbox and fails naming the first one whose output differs. `fakes` are packs of host functions that return canned JSON in place of real services, such as a fake `firecrawl` pack for testing `research`.
+To test a pack, call `check_pack` from `code_mode::testing` with the pool, a function building the pack and one building its fakes. It runs every example in a fresh sandbox with newly built packs, so no host-call budget or fake state carries over, and fails naming the first one whose output differs. `fakes` are packs of host functions that return canned JSON in place of real services, such as a fake `firecrawl` pack for testing `research`.
 
 ### Limits
 
@@ -705,7 +705,7 @@ To test a pack, call `check_pack` from `code_mode::testing` with the pool, the p
 | `max_feed_duration` | 10 s | run time per snippet, not counting waits on host functions |
 | `max_turn_duration` | 60 s | run time between two host round trips |
 | `max_host_calls` | 50 | host calls for the whole conversation |
-| `max_output_chars` | 20,000 | characters in one tool result |
+| `max_output_chars` | 20,000 | characters in one tool result; at least 5,000, reserved for the value or traceback |
 
 Two time limits are fixed: one host call times out after 45 seconds, and one `python` call after 120 seconds. When every worker is busy, a conversation waits up to 10 seconds, then gets a "no sandbox free" tool result.
 

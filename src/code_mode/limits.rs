@@ -20,7 +20,7 @@ pub struct Limits {
     /// Host calls for the whole conversation, across session restarts. Default 50.
     pub max_host_calls: usize,
     /// Characters of one tool result: print output gets this minus 5,000, the final value or
-    /// traceback 5,000. Default 20,000.
+    /// traceback 5,000. At least 5,000. Default 20,000.
     pub max_output_chars: usize,
 }
 

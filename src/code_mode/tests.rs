@@ -185,25 +185,23 @@ fn search_response() -> Canned {
 
 #[tokio::test]
 async fn reports_pack_examples_pass() {
-    testing::check_pack(test_pool().await, packs::reports(), vec![])
+    testing::check_pack(test_pool().await, packs::reports, Vec::new)
         .await
         .unwrap();
 }
 
 #[tokio::test]
 async fn research_pack_examples_pass() {
-    testing::check_pack(
-        test_pool().await,
-        packs::research(),
-        vec![fake_firecrawl(), fake_jev()],
-    )
+    testing::check_pack(test_pool().await, packs::research, || {
+        vec![fake_firecrawl(), fake_jev()]
+    })
     .await
     .unwrap();
 }
 
 #[tokio::test]
 async fn triage_pack_examples_pass() {
-    testing::check_pack(test_pool().await, packs::triage(), vec![fake_jev()])
+    testing::check_pack(test_pool().await, packs::triage, || vec![fake_jev()])
         .await
         .unwrap();
 }
@@ -221,9 +219,13 @@ async fn firecrawl_pack_examples_pass() {
     ])
     .await;
     let search = FirecrawlWebSearch::new(firecrawl_client(&url));
-    testing::check_pack(test_pool().await, firecrawl_pack(&url, search, 100), vec![])
-        .await
-        .unwrap();
+    testing::check_pack(
+        test_pool().await,
+        || firecrawl_pack(&url, search.clone(), 100),
+        Vec::new,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -246,7 +248,7 @@ async fn jev_pack_examples_pass() {
         .unwrap()
         .with_base_url(&url)
         .unwrap();
-    testing::check_pack(test_pool().await, packs::jev(client), vec![])
+    testing::check_pack(test_pool().await, || packs::jev(client.clone()), Vec::new)
         .await
         .unwrap();
 }
@@ -568,6 +570,25 @@ async fn invalid_packs_fail_in_try_new() {
         Limits::default(),
     );
     assert!(help.err().unwrap().to_string().contains("reserved"));
+}
+
+#[tokio::test]
+async fn max_output_chars_under_the_result_reserve_is_rejected() {
+    let mut config = PoolConfig::subprocess("monty");
+    config.min_processes = 0;
+    let idle = Arc::new(Pool::new(config).await.unwrap());
+    let limits = Limits {
+        max_output_chars: 1000,
+        ..Limits::default()
+    };
+    let error = CodeMode::try_new(idle, vec![], limits).err().unwrap();
+    assert!(
+        matches!(
+            error.kind(),
+            ErrorKind::Validation { param: Some(param) } if param == "max_output_chars"
+        ),
+        "{error}"
+    );
 }
 
 // 6. Values.
