@@ -4,17 +4,16 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use reqwest::Client as ReqwestClient;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
-use reqwest::redirect;
+use reqwest::{Client as ReqwestClient, ClientBuilder};
 use serde::Serialize;
 use serde_json::Value;
 
 use super::questions::WireQuestions;
 use super::{Choices, JevErrorCode, JevResponse, Levels, Outcome, Questions};
 use crate::backoff::{self, RetryPolicy};
-use crate::base_url;
-use crate::error::{Error, ErrorCode, RequestPhase, Result, Service, map_reqwest_error};
+use crate::error::{Error, ErrorCode, Result, Service};
+use crate::http::{self, header_str};
 use crate::types::retry_after_from_headers;
 
 pub(super) const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
@@ -73,19 +72,7 @@ impl JevClient {
     /// whitespace, when the model is empty after trimming, or when the HTTP client cannot be
     /// built.
     pub fn try_new(api_key: &str, model: &str) -> Result<Self> {
-        let api_key = api_key.trim();
-        if api_key.is_empty() {
-            return Err(Error::validation(
-                "Jev API key is empty",
-                Some("api_key".to_string()),
-            ));
-        }
-        if !api_key.chars().all(|c| c.is_ascii_graphic()) {
-            return Err(Error::validation(
-                "Jev API key must be printable ASCII without whitespace",
-                Some("api_key".to_string()),
-            ));
-        }
+        let authorization = http::bearer(Service::Jev, api_key)?;
         let model = model.trim().to_string();
         if model.is_empty() {
             return Err(Error::validation(
@@ -93,17 +80,8 @@ impl JevClient {
                 Some("model".to_string()),
             ));
         }
-        let mut authorization =
-            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                Error::validation(
-                    "Jev API key contains characters not allowed in an HTTP header",
-                    Some("api_key".to_string()),
-                )
-                .with_source(e)
-            })?;
-        authorization.set_sensitive(true);
         Ok(Self {
-            http: http_client(DEFAULT_BASE_URL)?,
+            http: http::client(DEFAULT_BASE_URL, builder())?,
             authorization,
             base_url: DEFAULT_BASE_URL.to_string(),
             model,
@@ -148,9 +126,7 @@ impl JevClient {
     /// [`JevClient::with_base_url`] with `setting` naming where the URL came from in the
     /// validation error.
     fn with_base_url_from(mut self, setting: &str, base_url: &str) -> Result<Self> {
-        self.base_url = base_url::checked_base_url("Jev", setting, base_url)?;
-        // A loopback base URL bypasses proxies, so the HTTP client depends on it too.
-        self.http = http_client(&self.base_url)?;
+        (self.base_url, self.http) = http::rebase(Service::Jev, setting, base_url, builder())?;
         Ok(self)
     }
 
@@ -321,54 +297,22 @@ impl JevClient {
         if attempt > 0 {
             request = request.header("x-typesafe-retry-count", attempt.to_string());
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| map_reqwest_error(e, RequestPhase::Headers))?;
-        let status = response.status().as_u16();
-        let headers = response.headers().clone();
-        let request_id = request_id(&headers);
-        let success = (200..300).contains(&status);
-        // Headers arrived, so a body failure keeps the request id. An error status whose body
-        // failed is still that status, so it stays retryable as one.
-        let bytes = match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(e) if success => {
-                return Err(map_reqwest_error(e, RequestPhase::Body).with_request_id(request_id));
-            }
-            Err(e) => {
-                let error = Error::http_status(
-                    Service::Jev,
-                    status,
-                    None,
-                    None,
-                    None,
-                    request_id,
-                    retry_after_from_headers(&headers),
-                );
-                return Err(error.with_source(e));
-            }
-        };
-        if !success {
-            return Err(http_error(status, &headers, &bytes, request_id));
+        let reply = http::send(request, Service::Jev, request_id).await?;
+        if !reply.is_success() {
+            return Err(http_error(
+                reply.status,
+                &reply.headers,
+                &reply.body,
+                reply.request_id,
+            ));
         }
-        Ok((status, request_id, bytes))
+        Ok((reply.status, reply.request_id, reply.body))
     }
 }
 
-/// Builds the HTTP client for `base_url`, which decides whether proxies are used (see
-/// [`base_url::with_proxy_rule`]).
-fn http_client(base_url: &str) -> Result<ReqwestClient> {
-    let builder = ReqwestClient::builder()
-        .redirect(redirect::Policy::none())
-        .user_agent(USER_AGENT);
-    base_url::with_proxy_rule(builder, base_url)
-        .build()
-        .map_err(|e| Error::validation("Failed to build HTTP client", None).with_source(e))
-}
-
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok())
+/// The Jev settings for [`http::client`].
+fn builder() -> ClientBuilder {
+    ReqwestClient::builder().user_agent(USER_AGENT)
 }
 
 fn request_id(headers: &HeaderMap) -> Option<String> {
@@ -420,7 +364,7 @@ fn http_error(status: u16, headers: &HeaderMap, body: &[u8], request_id: Option<
     Error::http_status(
         Service::Jev,
         status,
-        detail.map(|detail| truncate(&detail, MAX_ERROR_CHARS)),
+        detail.map(|detail| http::truncate_chars(&detail, MAX_ERROR_CHARS, "")),
         None,
         error_code.map(ErrorCode::Jev),
         request_id,
@@ -452,13 +396,6 @@ fn validation_detail(items: &[Value]) -> String {
         }
     }
     details.join("; ")
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    match text.char_indices().nth(max_chars) {
-        Some((end, _)) => text[..end].to_string(),
-        None => text.to_string(),
-    }
 }
 
 /// Serializes the request, keeping the serde error as the source, and enforces the body cap.

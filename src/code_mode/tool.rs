@@ -22,6 +22,7 @@ use super::pack::Function;
 use super::{HostError, HostFunction, Limits, Pack, value};
 use crate::client_tool::ClientTool;
 use crate::error::{Error, ErrorKind, Result};
+use crate::http;
 use crate::types::{ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock};
 
 pub(super) const TOOL_NAME: &str = "python";
@@ -586,7 +587,7 @@ impl CodeMode {
         let prints = if printed.total > print_cap {
             format!(
                 "{}\n[print output truncated: {print_cap} of {} chars shown]\n",
-                take_chars(&printed.text, print_cap),
+                http::truncate_chars(&printed.text, print_cap, ""),
                 printed.total
             )
         } else if printed.text.is_empty() || printed.text.ends_with('\n') {
@@ -694,8 +695,4 @@ pub(super) fn definition(packs: &[Pack]) -> ToolUnionParam {
     ToolUnionParam::CustomTool(
         ToolParam::new(TOOL_NAME.to_string(), schema).with_description(description),
     )
-}
-
-fn take_chars(text: &str, count: usize) -> String {
-    text.chars().take(count).collect()
 }

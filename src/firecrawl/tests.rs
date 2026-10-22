@@ -506,6 +506,19 @@ fn empty_api_key_is_rejected() {
 }
 
 #[test]
+fn api_key_with_inner_whitespace_is_rejected() {
+    for key in ["fc key", "fc\tkey"] {
+        assert!(
+            matches!(
+                FirecrawlClient::try_new(key).unwrap_err().kind(),
+                ErrorKind::Validation { param } if param.as_deref() == Some("api_key")
+            ),
+            "{key:?}"
+        );
+    }
+}
+
+#[test]
 fn api_key_not_allowed_in_a_header_keeps_the_header_error() {
     let error = FirecrawlClient::try_new("fc-key\nInjected: 1").unwrap_err();
     assert!(

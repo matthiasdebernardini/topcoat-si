@@ -4,6 +4,8 @@ use reqwest::header::HeaderMap;
 use time::OffsetDateTime;
 use time::format_description::well_known::{Rfc2822, Rfc3339};
 
+use crate::http::header_str;
+
 /// One rate-limit window reported by `anthropic-ratelimit-*` response headers.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -42,10 +44,6 @@ pub struct RateLimits {
     pub workspace_id: Option<String>,
     /// The request identifier (`request-id`).
     pub request_id: Option<String>,
-}
-
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 fn window(headers: &HeaderMap, prefix: &str) -> Option<RateLimitWindow> {

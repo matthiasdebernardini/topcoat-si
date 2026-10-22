@@ -3,19 +3,15 @@
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::Client as ReqwestClient;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
-use reqwest::redirect;
+use reqwest::{Client as ReqwestClient, ClientBuilder};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::{ScrapeRequest, ScrapeResponse, SearchRequest, SearchResponse};
 use crate::backoff::{self, RetryPolicy};
-use crate::base_url;
-use crate::error::{
-    Error, ErrorCode, ErrorKind, RequestPhase, Result, Service, describe_json_error,
-    map_reqwest_error,
-};
+use crate::error::{Error, ErrorCode, ErrorKind, Result, Service, describe_json_error};
+use crate::http;
 use crate::types::retry_after_from_headers;
 
 const DEFAULT_BASE_URL: &str = "https://api.firecrawl.dev";
@@ -51,28 +47,12 @@ impl fmt::Debug for FirecrawlClient {
 impl FirecrawlClient {
     /// Create a client with the given Firecrawl API key.
     ///
-    /// Fails when the key is empty after trimming, holds characters not allowed in an HTTP
-    /// header, or the HTTP client cannot be built.
+    /// Fails when the key is empty after trimming or is not printable ASCII without
+    /// whitespace, or when the HTTP client cannot be built.
     pub fn try_new(api_key: &str) -> Result<Self> {
-        let api_key = api_key.trim();
-        if api_key.is_empty() {
-            return Err(Error::validation(
-                "Firecrawl API key is empty",
-                Some("api_key".to_string()),
-            ));
-        }
-        let mut authorization =
-            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                Error::validation(
-                    "Firecrawl API key contains characters not allowed in an HTTP header",
-                    Some("api_key".to_string()),
-                )
-                .with_source(e)
-            })?;
-        authorization.set_sensitive(true);
         Ok(Self {
-            http: http_client(DEFAULT_BASE_URL)?,
-            authorization,
+            http: http::client(DEFAULT_BASE_URL, builder())?,
+            authorization: http::bearer(Service::Firecrawl, api_key)?,
             base_url: DEFAULT_BASE_URL.to_string(),
             max_retries: 2,
         })
@@ -95,9 +75,8 @@ impl FirecrawlClient {
     /// travels in clear. Credentials, a query or a fragment in the URL are rejected. A trailing
     /// slash is trimmed.
     pub fn with_base_url(mut self, base_url: &str) -> Result<Self> {
-        self.base_url = base_url::checked_base_url("Firecrawl", "base_url", base_url)?;
-        // A loopback base URL bypasses proxies, so the HTTP client depends on it too.
-        self.http = http_client(&self.base_url)?;
+        (self.base_url, self.http) =
+            http::rebase(Service::Firecrawl, "base_url", base_url, builder())?;
         Ok(self)
     }
 
@@ -181,33 +160,15 @@ impl FirecrawlClient {
         if let Some(timeout) = timeout {
             request = request.timeout(timeout);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| map_reqwest_error(e, RequestPhase::Headers))?;
-        let status = response.status().as_u16();
-        let retry_after = retry_after_from_headers(response.headers());
-        let success = (200..300).contains(&status);
-        // An error status whose body failed is still that status, so it stays retryable as one.
-        let bytes = match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(e) if success => return Err(map_reqwest_error(e, RequestPhase::Body)),
-            Err(e) => {
-                let error = Error::http_status(
-                    Service::Firecrawl,
-                    status,
-                    None,
-                    None,
-                    None,
-                    None,
-                    retry_after,
-                );
-                return Err(error.with_source(e));
-            }
-        };
-        if !success {
-            return Err(http_error(status, &bytes, retry_after));
+        let reply = http::send(request, Service::Firecrawl, |_| None).await?;
+        if !reply.is_success() {
+            return Err(http_error(
+                reply.status,
+                &reply.body,
+                retry_after_from_headers(&reply.headers),
+            ));
         }
+        let bytes = reply.body;
         // The serde error quotes the bad value, which is response content, so only its position
         // is kept.
         let parsed: T = serde_json::from_slice(&bytes).map_err(|e| {
@@ -237,16 +198,11 @@ impl FirecrawlClient {
     }
 }
 
-/// Builds the HTTP client for `base_url`, which decides whether proxies are used (see
-/// [`base_url::with_proxy_rule`]).
-fn http_client(base_url: &str) -> Result<ReqwestClient> {
-    let builder = ReqwestClient::builder()
-        .redirect(redirect::Policy::none())
+/// The Firecrawl settings for [`http::client`].
+fn builder() -> ClientBuilder {
+    ReqwestClient::builder()
         .connect_timeout(Duration::from_secs(30))
-        .timeout(DEFAULT_TIMEOUT);
-    base_url::with_proxy_rule(builder, base_url)
-        .build()
-        .map_err(|e| Error::validation("Failed to build HTTP client", None).with_source(e))
+        .timeout(DEFAULT_TIMEOUT)
 }
 
 /// A response body carrying Firecrawl's `success` flag.

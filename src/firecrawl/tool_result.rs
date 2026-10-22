@@ -1,5 +1,6 @@
 //! Tool result blocks shared by the Firecrawl tools.
 
+use crate::http;
 use crate::types::{CitationsConfig, Content, SearchResultBlock, TextBlock};
 
 pub(super) fn search_result(
@@ -26,8 +27,5 @@ pub(super) fn push_text(content: &mut Vec<TextBlock>, text: Option<String>) {
 }
 
 pub(super) fn truncate(text: &str, max_chars: usize) -> String {
-    match text.char_indices().nth(max_chars) {
-        Some((end, _)) => format!("{} [truncated]", &text[..end]),
-        None => text.to_string(),
-    }
+    http::truncate_chars(text, max_chars, " [truncated]")
 }

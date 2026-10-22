@@ -22,6 +22,7 @@ mod client_tool;
 pub mod code_mode;
 mod error;
 pub mod firecrawl;
+mod http;
 pub mod jev;
 mod observability;
 mod sse;
