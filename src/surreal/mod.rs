@@ -15,6 +15,8 @@ pub(crate) mod time;
 mod transcripts;
 mod usage_ledger;
 
+pub use memory::{Memory, MemoryHit, MemorySearch};
+
 use std::path::Path;
 
 use surrealdb::Surreal;
