@@ -459,14 +459,14 @@ mod tests {
         use super::*;
         use crate::ErrorKind;
         use crate::types::{
-            CitationCharLocation, DocumentBlock, PlainTextSource, TextCitation,
+            Citation, CitationCharLocation, DocumentBlock, PlainTextSource,
             WebFetchToolResultBlock, WebFetchToolResultContent,
         };
 
         fn cited() -> TextBlock {
             TextBlock::new_with_citations(
                 "claim",
-                vec![TextCitation::CharLocation(CitationCharLocation::new(
+                vec![Citation::CharLocation(CitationCharLocation::new(
                     "quote", 0, 0, 5, None,
                 ))],
             )

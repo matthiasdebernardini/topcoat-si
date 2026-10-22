@@ -2,12 +2,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::CacheControlEphemeral;
 
-/// Parameters for the Bash tool type, version 20241022.
+/// Parameters for the Bash tool.
 ///
-/// This tool allows the AI to execute bash commands via the API.
+/// This tool allows the AI to execute bash commands via the API. The version is
+/// chosen by the [`ToolUnionParam`](crate::ToolUnionParam) variant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
-pub struct ToolBash20241022 {
+pub struct BashTool {
     /// Name of the tool. This is how the tool will be called by the model and in `tool_use` blocks.
     ///
     /// Always set to "bash".
@@ -23,7 +24,7 @@ fn default_name() -> String {
     "bash".to_string()
 }
 
-impl ToolBash20241022 {
+impl BashTool {
     /// Creates a new Bash tool parameter object with default settings.
     #[must_use]
     pub fn new() -> Self {
@@ -41,7 +42,7 @@ impl ToolBash20241022 {
     }
 }
 
-impl Default for ToolBash20241022 {
+impl Default for BashTool {
     fn default() -> Self {
         Self::new()
     }
@@ -54,7 +55,7 @@ mod tests {
 
     #[test]
     fn tool_bash_param_minimal() {
-        let param = ToolBash20241022::new();
+        let param = BashTool::new();
         let json = to_value(&param).unwrap();
 
         assert_eq!(
@@ -67,7 +68,7 @@ mod tests {
 
     #[test]
     fn tool_bash_param_with_cache_control() {
-        let param = ToolBash20241022::new().with_ephemeral_cache_control();
+        let param = BashTool::new().with_ephemeral_cache_control();
 
         let json = to_value(&param).unwrap();
         assert_eq!(
@@ -90,7 +91,7 @@ mod tests {
             }
         });
 
-        let param: ToolBash20241022 = serde_json::from_value(json).unwrap();
+        let param: BashTool = serde_json::from_value(json).unwrap();
         assert_eq!(param.name, "bash");
         assert!(param.cache_control.is_some());
     }

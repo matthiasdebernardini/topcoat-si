@@ -11,7 +11,7 @@ use crate::error::describe_json_error;
 use crate::{
     CacheControlEphemeral, Citation, ContentBlock, ContentBlockDelta, Error, ErrorKind,
     McpToolUseBlock, Message, MessageStreamEvent, ServerToolUseBlock, StopReason, TextBlock,
-    TextCitation, ThinkingBlock, ToolUseBlock,
+    ThinkingBlock, ToolUseBlock,
 };
 
 /// A stream wrapper that accumulates `MessageStreamEvent`s into a complete `Message`.
@@ -222,7 +222,7 @@ enum ContentBlockBuilder {
     Empty,
     Text {
         text: String,
-        citations: Option<Vec<TextCitation>>,
+        citations: Option<Vec<Citation>>,
         cache_control: Option<CacheControlEphemeral>,
     },
     ToolUse {
@@ -295,18 +295,9 @@ impl ContentBlockBuilder {
                 ContentBlockBuilder::Text { citations, .. },
                 ContentBlockDelta::CitationsDelta(citations_delta),
             ) => {
-                let citation = match citations_delta.citation {
-                    Citation::CharLocation(location) => TextCitation::CharLocation(location),
-                    Citation::PageLocation(location) => TextCitation::PageLocation(location),
-                    Citation::ContentBlockLocation(location) => {
-                        TextCitation::ContentBlockLocation(location)
-                    }
-                    Citation::SearchResultLocation(location) => {
-                        TextCitation::SearchResultLocation(location)
-                    }
-                    Citation::Unknown(value) => TextCitation::Unknown(value),
-                };
-                citations.get_or_insert_with(Vec::new).push(citation);
+                citations
+                    .get_or_insert_with(Vec::new)
+                    .push(citations_delta.citation);
             }
             (
                 ContentBlockBuilder::ToolUse {

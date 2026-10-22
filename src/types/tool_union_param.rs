@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    CodeExecutionTool, McpToolset, MemoryTool, ToolBash20241022, ToolBash20250124, ToolParam,
-    ToolSearchTool, ToolTextEditor20250124, ToolTextEditor20250429, ToolTextEditor20250728,
-    WebFetchTool,
+    BashTool, CodeExecutionTool, McpToolset, MemoryTool, TextEditorTool, ToolParam, ToolSearchTool,
+    ToolTextEditor20250728, WebFetchTool,
 };
 
 /// Union type for different tool parameter types.
@@ -29,19 +28,19 @@ pub enum ToolUnionParam {
 
     /// A bash tool for executing shell commands (version 20241022)
     #[serde(rename = "bash_20241022")]
-    Bash20241022(ToolBash20241022),
+    Bash20241022(BashTool),
 
     /// A bash tool for executing shell commands (version 20250124)
     #[serde(rename = "bash_20250124")]
-    Bash20250124(ToolBash20250124),
+    Bash20250124(BashTool),
 
     /// A text editor tool for making changes to text
     #[serde(rename = "text_editor_20250124")]
-    TextEditor20250124(ToolTextEditor20250124),
+    TextEditor20250124(TextEditorTool),
 
     /// A text editor tool for making changes to text (version 20250429)
     #[serde(rename = "text_editor_20250429")]
-    TextEditor20250429(ToolTextEditor20250429),
+    TextEditor20250429(TextEditorTool),
 
     /// A text editor tool for making changes to text (version 20250728)
     #[serde(rename = "text_editor_20250728")]
@@ -173,7 +172,7 @@ mod tests {
 
     #[test]
     fn bash_20241022_tool() {
-        let bash_tool = ToolBash20241022::new().with_ephemeral_cache_control();
+        let bash_tool = BashTool::new().with_ephemeral_cache_control();
         let tool = ToolUnionParam::Bash20241022(bash_tool);
 
         let json = to_value(&tool).unwrap();
@@ -191,7 +190,7 @@ mod tests {
 
     #[test]
     fn bash_20250124_tool() {
-        let bash_tool = ToolBash20250124::new().with_ephemeral_cache_control();
+        let bash_tool = BashTool::new().with_ephemeral_cache_control();
         let tool = ToolUnionParam::Bash20250124(bash_tool);
 
         let json = to_value(&tool).unwrap();
@@ -209,7 +208,7 @@ mod tests {
 
     #[test]
     fn text_editor_tool() {
-        let text_editor_tool = ToolTextEditor20250124::new().with_ephemeral_cache_control();
+        let text_editor_tool = TextEditorTool::new_20250124().with_ephemeral_cache_control();
         let tool = ToolUnionParam::TextEditor20250124(text_editor_tool);
 
         let json = to_value(&tool).unwrap();
@@ -227,7 +226,7 @@ mod tests {
 
     #[test]
     fn text_editor_20250429_tool() {
-        let text_editor_tool = ToolTextEditor20250429::new().with_ephemeral_cache_control();
+        let text_editor_tool = TextEditorTool::new_20250429().with_ephemeral_cache_control();
         let tool = ToolUnionParam::TextEditor20250429(text_editor_tool);
 
         let json = to_value(&tool).unwrap();
