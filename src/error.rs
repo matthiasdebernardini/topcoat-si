@@ -127,6 +127,8 @@ pub enum ErrorKind {
     },
     /// Code mode: a sandbox pool, worker or pack failure.
     Sandbox,
+    /// The `surreal` feature: an embedded SurrealDB query, schema or storage failure.
+    Store,
     /// A [`ClientTool`](crate::ClientTool) author's own fatal failure.
     Tool,
 }
@@ -150,6 +152,19 @@ impl Error {
     /// Builds a [`ErrorKind::Validation`] error for a request rejected before sending.
     pub fn validation(message: impl Into<String>, param: Option<String>) -> Self {
         Self::new(ErrorKind::Validation { param }, message)
+    }
+
+    /// Builds a [`ErrorKind::Store`] error: a SurrealDB failure, with the database's own error as
+    /// the source.
+    #[cfg(feature = "surreal")]
+    pub fn store(
+        message: impl Into<String>,
+        source: Option<Box<dyn error::Error + Send + Sync>>,
+    ) -> Self {
+        Self {
+            source: source.map(Arc::from),
+            ..Self::new(ErrorKind::Store, message)
+        }
     }
 
     /// Builds a [`ErrorKind::Tool`] error: a [`ClientTool`](crate::ClientTool) failure the model
@@ -346,6 +361,7 @@ impl Error {
             | ErrorKind::Refusal
             | ErrorKind::Io { .. }
             | ErrorKind::Sandbox
+            | ErrorKind::Store
             | ErrorKind::Tool => false,
         }
     }
@@ -512,6 +528,7 @@ mod tests {
             (ErrorKind::Refusal, false),
             (ErrorKind::Io { path: None }, false),
             (ErrorKind::Sandbox, false),
+            (ErrorKind::Store, false),
             (ErrorKind::Tool, false),
         ];
         for (kind, retryable) in cases {
@@ -717,6 +734,7 @@ mod tests {
             ErrorKind::Interrupted,
             ErrorKind::Decode,
             ErrorKind::Sandbox,
+            ErrorKind::Store,
             ErrorKind::Tool,
         ];
         let mut errors: Vec<Error> = Vec::new();
@@ -735,6 +753,7 @@ mod tests {
                 "Decode",
                 "Interrupted",
                 "Sandbox",
+                "Store",
                 "ErrorKind",
             ] {
                 assert!(!text.contains(name), "{text}");

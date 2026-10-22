@@ -7,6 +7,8 @@ mod firecrawl;
 mod jev;
 mod reports;
 mod research;
+#[cfg(feature = "surreal")]
+mod surreal;
 mod triage;
 
 pub use firecrawl::firecrawl;

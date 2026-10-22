@@ -27,6 +27,8 @@ pub mod jev;
 mod observability;
 mod sse;
 mod structured;
+#[cfg(feature = "surreal")]
+pub mod surreal;
 #[cfg(test)]
 mod test_support;
 mod tool_loop;
@@ -39,6 +41,8 @@ pub use error::{Error, ErrorCode, ErrorKind, Result, Service};
 pub use firecrawl::{FirecrawlClient, FirecrawlFetchPage, FirecrawlWebSearch};
 pub use sse::{SseEvent, parse_message_stream_event, process_message_stream_sse, process_sse};
 pub use structured::Parsed;
+#[cfg(feature = "surreal")]
+pub use surrealdb;
 pub use tool_loop::{ToolRun, ToolRunError};
 pub use types::*;
 
