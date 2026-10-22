@@ -1037,16 +1037,16 @@ async fn cached(db: topcoat_si::surrealdb::Surreal<topcoat_si::surrealdb::engine
 
 ### The `surreal` pack
 
-With both `code-mode` and `surreal` on, `code_mode::packs::surreal(db, max_rows)` lets Claude query your database from Python, read-only:
+With both `code-mode` and `surreal` on, `code_mode::packs::surreal(db.clone(), "myapp", "app", 200).await?` lets Claude read your database from Python. The arguments are the handle, its namespace and database, and `max_rows`:
 
 | Function | Does |
 |---|---|
 | `query(surql, params)` | runs SurrealQL with `$name` bound from `params`; the last statement's rows, at most `max_rows` |
-| `tables()` | the table names |
+| `tables()` | the tables open to the pack |
 | `describe(table)` | the fields and indexes of one table |
 | `rows`, `one`, `count` | Python helpers over `query` |
 
-Read-only is enforced, not promised. The query text is parsed by SurrealDB's own parser, and the refusal runs on its canonical form, so escaped names, spacing and comments cannot hide a word. That canonical text is what runs. These are refused before it runs: the statements `DEFINE`, `REMOVE`, `ALTER`, `REBUILD`, `BEGIN`, `COMMIT`, `CANCEL`, `USE`, `KILL`, `LIVE`, `SLEEP`, `OPTION`, `ACCESS`, `INFO`, `CREATE`, `UPDATE`, `UPSERT`, `DELETE`, `INSERT` and `RELATE`; the `sequence::`, `http::`, `api::`, `file::`, `fn::` and `eval::` functions, which act outside the transaction or run arbitrary code; and `sleep()`, `type::table()`, `type::thing()`, `type::record()` and `<record>`, which hold the connection or build a table from a string. The crate's own `topcoat_` tables (memory, transcripts and the like) are hidden from `tables()`, refused by `describe()` and refused in queries, so one user's memory never reaches another through the pack. As a second line of defence, every call runs in a transaction that is always cancelled. A call returns after 20 seconds, but the local engine cannot cancel a query, so a slow one may run to completion in the engine. Query errors come back to Claude as Python exceptions with SurrealDB's message, so it can fix the query.
+The pack signs in as a record user on a session of its own, so SurrealDB's permission system, not this crate, decides what Claude can read. A table is visible only if its definition grants `select` to record users, for example `DEFINE TABLE orders ... PERMISSIONS FOR select FULL;`, or `FOR select WHERE season = 2026` to show some rows. Everything else does not exist for the pack, including this crate's own tables and other users' memory, and `tables()` lists only what is open. Record users cannot define, remove or alter anything, and cannot write unless a table grants it, which yours should not. Network functions are off because `surreal::open` keeps SurrealDB's default capabilities; an app that opens the database with network access allowed gives it to the pack too. A call returns after 20 seconds, but the local engine cannot cancel a query, so a slow one may run to completion in the engine. Query errors come back to Claude as Python exceptions with SurrealDB's message, so it can fix the query.
 
 The evals binary can also keep its results in SurrealDB; see [evals/README.md](evals/README.md).
 

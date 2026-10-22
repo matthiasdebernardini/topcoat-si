@@ -4604,7 +4604,6 @@ dependencies = [
  "serde",
  "serde_json",
  "surrealdb",
- "surrealdb-core",
  "time",
  "tokio",
  "tokio-test",

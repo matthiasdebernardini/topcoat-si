@@ -12,7 +12,7 @@ members = [".", "evals"]
 
 [features]
 code-mode = ["dep:monty-pool", "dep:monty-types"]
-surreal = ["dep:surrealdb", "dep:surrealdb-core"]
+surreal = ["dep:surrealdb"]
 
 [dependencies]
 tracing = "0.1"
@@ -29,7 +29,6 @@ url = "2.5.8"
 monty-pool = { version = "1.2", optional = true }
 monty-types = { version = "1.2", optional = true }
 surrealdb = { version = "3.2", default-features = false, features = ["kv-surrealkv"], optional = true }
-surrealdb-core = { version = "3.2", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["test-util", "macros", "rt-multi-thread", "net", "io-util"] }
