@@ -15,6 +15,8 @@ pub(crate) mod time;
 mod transcripts;
 mod usage_ledger;
 
+pub use transcripts::{Batches, TrackedBatch, Transcript, Transcripts};
+
 use std::path::Path;
 
 use surrealdb::Surreal;
