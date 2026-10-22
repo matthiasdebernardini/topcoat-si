@@ -135,7 +135,7 @@ impl<C: Connection> Memory<C> {
     /// # Errors
     ///
     /// [`ErrorKind::Store`](crate::ErrorKind::Store) when the schema cannot be applied.
-    pub async fn new(db: Surreal<C>, scope: impl Into<String>) -> Result<Self> {
+    pub async fn try_new(db: Surreal<C>, scope: impl Into<String>) -> Result<Self> {
         db.query(SCHEMA)
             .await
             .and_then(|response| response.check())
@@ -633,7 +633,9 @@ mod tests {
     }
 
     async fn memory(scope: &str) -> Memory<Db> {
-        Memory::new(temp_db().await, scope).await.expect("memory")
+        Memory::try_new(temp_db().await, scope)
+            .await
+            .expect("memory")
     }
 
     async fn ok(memory: &Memory<Db>, input: Value) -> String {
@@ -814,8 +816,8 @@ mod tests {
     #[tokio::test]
     async fn scopes_do_not_see_each_other() {
         let db = temp_db().await;
-        let alice = Memory::new(db.clone(), "alice").await.expect("alice");
-        let bob = Memory::new(db, "bob").await.expect("bob");
+        let alice = Memory::try_new(db.clone(), "alice").await.expect("alice");
+        let bob = Memory::try_new(db, "bob").await.expect("bob");
         create(&alice, "/memories/secret.md", "alice owns this").await;
         let listing = ok(&bob, json!({"command": "view", "path": "/memories"})).await;
         assert_eq!(listing, "Directory: /memories");

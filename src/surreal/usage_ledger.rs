@@ -124,7 +124,7 @@ impl<C: Connection> UsageLedger<C> {
     /// # Errors
     ///
     /// [`ErrorKind::Store`](crate::ErrorKind::Store) when the schema cannot be applied.
-    pub async fn new(db: Surreal<C>) -> Result<Self> {
+    pub async fn try_new(db: Surreal<C>) -> Result<Self> {
         db.query(SCHEMA)
             .await
             .and_then(|response| response.check())
@@ -217,7 +217,7 @@ mod tests {
 
     #[tokio::test]
     async fn sums_per_model_and_counts_a_response_once() {
-        let ledger = UsageLedger::new(temp_db().await).await.expect("schema");
+        let ledger = UsageLedger::try_new(temp_db().await).await.expect("schema");
         let sonnet = message("msg_1", "claude-sonnet-5-5", 100, 10);
         let haiku = message("msg_2", "claude-haiku-5-5", 7, 3);
         ledger.record(&sonnet, Some("test")).await.expect("record");

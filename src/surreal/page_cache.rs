@@ -98,7 +98,7 @@ impl<C: Connection> PageCache<C> {
     /// # Errors
     ///
     /// [`ErrorKind::Store`](crate::ErrorKind::Store) when the schema cannot be defined.
-    pub async fn new(db: Surreal<C>) -> Result<Self> {
+    pub async fn try_new(db: Surreal<C>) -> Result<Self> {
         db.query(SCHEMA)
             .await
             .and_then(|response| response.check())
@@ -273,7 +273,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_then_get_returns_the_body() {
-        let cache = PageCache::new(temp_db().await).await.unwrap();
+        let cache = PageCache::try_new(temp_db().await).await.unwrap();
         let key = scrape_key("https://example.com/a");
         cache.put(&key, scrape_body("hello"), HOUR).await;
         assert_eq!(cache.get(&key).await, Some(scrape_body("hello")));
@@ -282,7 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_zero_ttl_is_not_returned() {
-        let cache = PageCache::new(temp_db().await).await.unwrap();
+        let cache = PageCache::try_new(temp_db().await).await.unwrap();
         let key = scrape_key("https://example.com/a");
         cache.put(&key, scrape_body("hello"), Duration::ZERO).await;
         assert_eq!(cache.get(&key).await, None);
@@ -290,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_finds_the_matching_page() {
-        let cache = PageCache::new(temp_db().await).await.unwrap();
+        let cache = PageCache::try_new(temp_db().await).await.unwrap();
         let boats = scrape_key("https://example.com/boats");
         let rust = scrape_key("https://example.com/rust");
         cache
@@ -307,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_expired_removes_the_expired_row() {
-        let cache = PageCache::new(temp_db().await).await.unwrap();
+        let cache = PageCache::try_new(temp_db().await).await.unwrap();
         cache
             .put(
                 &scrape_key("https://example.com/old"),

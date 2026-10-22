@@ -10,7 +10,9 @@
 //!
 //! [`Anthropic::run_tools`] runs Claude with your [`ClientTool`]s (Firecrawl search and page fetch,
 //! [`jev::JevTool`], or your own) until it answers. [`jev`] is a client for TypeSafe's Jev decision
-//! model, and [`Anthropic::send_parsed`] returns replies as your own Rust types.
+//! model, and [`Anthropic::send_parsed`] returns replies as your own Rust types. The `surreal`
+//! feature adds an embedded SurrealDB for memory, transcripts, a Firecrawl cache and a usage
+//! ledger.
 
 mod accumulating_stream;
 mod anthropic;

@@ -74,7 +74,7 @@ impl<C: Connection> Transcripts<C> {
     /// # Errors
     ///
     /// [`ErrorKind::Store`](crate::ErrorKind::Store) when the schema cannot be defined.
-    pub async fn new(db: Surreal<C>) -> Result<Self> {
+    pub async fn try_new(db: Surreal<C>) -> Result<Self> {
         db.query(
             "DEFINE TABLE IF NOT EXISTS topcoat_transcript TYPE NORMAL SCHEMAFULL;
              DEFINE FIELD IF NOT EXISTS messages ON topcoat_transcript TYPE string;
@@ -271,7 +271,7 @@ impl<C: Connection> Batches<C> {
     /// # Errors
     ///
     /// [`ErrorKind::Store`](crate::ErrorKind::Store) when the schema cannot be defined.
-    pub async fn new(db: Surreal<C>) -> Result<Self> {
+    pub async fn try_new(db: Surreal<C>) -> Result<Self> {
         db.query(
             "DEFINE TABLE IF NOT EXISTS topcoat_batch TYPE NORMAL SCHEMAFULL;
              DEFINE FIELD IF NOT EXISTS label ON topcoat_batch TYPE string;
@@ -399,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_then_load_round_trips() {
-        let store = Transcripts::new(temp_db().await).await.unwrap();
+        let store = Transcripts::try_new(temp_db().await).await.unwrap();
         let saved = run("hi there");
         store.save("a", &saved).await.unwrap();
         let loaded = store.load("a").await.unwrap().unwrap();
@@ -411,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_failed_keeps_the_error_text() {
-        let store = Transcripts::new(temp_db().await).await.unwrap();
+        let store = Transcripts::try_new(temp_db().await).await.unwrap();
         let error = Error::store("boom", None);
         let expected = error.to_string();
         let mut failed = ToolRunError {
@@ -428,13 +428,13 @@ mod tests {
 
     #[tokio::test]
     async fn load_of_an_unknown_id_is_none() {
-        let store = Transcripts::new(temp_db().await).await.unwrap();
+        let store = Transcripts::try_new(temp_db().await).await.unwrap();
         assert_eq!(store.load("missing").await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn delete_removes_the_transcript() {
-        let store = Transcripts::new(temp_db().await).await.unwrap();
+        let store = Transcripts::try_new(temp_db().await).await.unwrap();
         store.save("c", &run("x")).await.unwrap();
         store.delete("c").await.unwrap();
         assert_eq!(store.load("c").await.unwrap(), None);
@@ -442,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_sees_updates_and_ends_on_delete() {
-        let store = Transcripts::new(temp_db().await).await.unwrap();
+        let store = Transcripts::try_new(temp_db().await).await.unwrap();
         store.save("w", &run("first")).await.unwrap();
         let mut stream = store.watch("w").await.unwrap();
         store.save("w", &run("second")).await.unwrap();
@@ -461,7 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_skips_ended_batches() {
-        let batches = Batches::new(temp_db().await).await.unwrap();
+        let batches = Batches::try_new(temp_db().await).await.unwrap();
         batches
             .track(&batch("msgbatch_2", "in_progress", 2, None), "later")
             .await
@@ -487,7 +487,7 @@ mod tests {
 
     #[tokio::test]
     async fn tracking_twice_updates_the_status() {
-        let batches = Batches::new(temp_db().await).await.unwrap();
+        let batches = Batches::try_new(temp_db().await).await.unwrap();
         batches
             .track(&batch("msgbatch_1", "in_progress", 1, None), "job")
             .await
@@ -503,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn forget_removes_the_batch() {
-        let batches = Batches::new(temp_db().await).await.unwrap();
+        let batches = Batches::try_new(temp_db().await).await.unwrap();
         batches
             .track(&batch("msgbatch_1", "in_progress", 1, None), "job")
             .await
