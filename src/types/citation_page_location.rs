@@ -53,18 +53,6 @@ impl CitationPageLocation {
         self.file_id = Some(file_id.into());
         self
     }
-
-    /// Returns the number of pages in the citation span (exclusive end)
-    #[must_use]
-    pub fn page_count(&self) -> i32 {
-        self.end_page_number - self.start_page_number
-    }
-
-    /// Returns true if the citation is only for a single page
-    #[must_use]
-    pub fn is_single_page(&self) -> bool {
-        self.page_count() == 1
-    }
 }
 
 #[cfg(test)]
@@ -115,43 +103,5 @@ mod tests {
         assert_eq!(location.document_title, Some("Document Title".to_string()));
         assert_eq!(location.end_page_number, 5);
         assert_eq!(location.start_page_number, 3);
-    }
-
-    #[test]
-    fn page_count() {
-        let location = CitationPageLocation {
-            cited_text: "example text".to_string(),
-            document_index: 0,
-            document_title: None,
-            end_page_number: 5,
-            start_page_number: 3,
-            file_id: None,
-        };
-
-        assert_eq!(location.page_count(), 2);
-    }
-
-    #[test]
-    fn is_single_page() {
-        let single_page = CitationPageLocation {
-            cited_text: "example text".to_string(),
-            document_index: 0,
-            document_title: None,
-            end_page_number: 4,
-            start_page_number: 3,
-            file_id: None,
-        };
-
-        let multi_page = CitationPageLocation {
-            cited_text: "example text".to_string(),
-            document_index: 0,
-            document_title: None,
-            end_page_number: 5,
-            start_page_number: 3,
-            file_id: None,
-        };
-
-        assert!(single_page.is_single_page());
-        assert!(!multi_page.is_single_page());
     }
 }

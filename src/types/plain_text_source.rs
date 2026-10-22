@@ -1,6 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
-use std::str::FromStr;
 
 /// A plain text source parameter for content blocks.
 ///
@@ -27,14 +25,6 @@ impl PlainTextSource {
     }
 }
 
-impl FromStr for PlainTextSource {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(s))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,13 +47,6 @@ mod tests {
     #[test]
     fn plain_text_source_from_literal() {
         let source = PlainTextSource::new("Sample text content");
-        assert_eq!(source.data, "Sample text content");
-        assert_eq!(source.media_type, "text/plain");
-    }
-
-    #[test]
-    fn from_str() {
-        let source = "Sample text content".parse::<PlainTextSource>().unwrap();
         assert_eq!(source.data, "Sample text content");
         assert_eq!(source.media_type, "text/plain");
     }

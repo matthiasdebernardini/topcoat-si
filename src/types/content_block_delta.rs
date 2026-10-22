@@ -108,7 +108,7 @@ fn is_thinking_like_delta(delta_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::CitationCharLocation;
+    use crate::types::{Citation, CitationCharLocation};
     use serde_json::{from_value, json, to_value};
 
     #[test]
@@ -180,7 +180,9 @@ mod tests {
             file_id: None,
         };
 
-        let citations_delta = CitationsDelta::new_with_char_location(char_location);
+        let citations_delta = CitationsDelta {
+            citation: Citation::CharLocation(char_location),
+        };
         let delta = ContentBlockDelta::CitationsDelta(citations_delta);
 
         let json = to_value(&delta).unwrap();

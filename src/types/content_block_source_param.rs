@@ -1,6 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
-use std::str::FromStr;
 
 use crate::types::Content;
 
@@ -38,14 +36,6 @@ impl ContentBlockSourceParam {
         Self {
             content: ContentBlockSourceContent::Array(content),
         }
-    }
-}
-
-impl FromStr for ContentBlockSourceParam {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new_with_string(s))
     }
 }
 
@@ -122,18 +112,6 @@ mod tests {
     #[test]
     fn new_with_string_from_literal() {
         let source = ContentBlockSourceParam::new_with_string("Sample content");
-
-        match &source.content {
-            ContentBlockSourceContent::String(content) => {
-                assert_eq!(content, "Sample content");
-            }
-            _ => panic!("Expected String variant"),
-        }
-    }
-
-    #[test]
-    fn from_str() {
-        let source = "Sample content".parse::<ContentBlockSourceParam>().unwrap();
 
         match &source.content {
             ContentBlockSourceContent::String(content) => {

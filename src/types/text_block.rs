@@ -1,6 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
-use std::str::FromStr;
 
 use crate::types::{CacheControlEphemeral, TextCitation};
 
@@ -61,24 +59,10 @@ impl TextBlock {
         self
     }
 
-    /// Returns the number of citations if any, or 0 if there are none.
-    #[must_use]
-    pub fn citation_count(&self) -> usize {
-        self.citations.as_ref().map_or(0, |c| c.len())
-    }
-
     /// Returns true if this text block has citations.
     #[must_use]
     pub fn has_citations(&self) -> bool {
-        self.citation_count() > 0
-    }
-}
-
-impl FromStr for TextBlock {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(s))
+        self.citations.as_ref().is_some_and(|c| !c.is_empty())
     }
 }
 
@@ -175,7 +159,6 @@ mod tests {
     #[test]
     fn helper_methods() {
         let text_block = TextBlock::new("Simple text");
-        assert_eq!(text_block.citation_count(), 0);
         assert!(!text_block.has_citations());
 
         let char_location = CitationCharLocation {
@@ -191,7 +174,6 @@ mod tests {
 
         let text_block = TextBlock::new_with_citations("Text with citation", vec![citation]);
 
-        assert_eq!(text_block.citation_count(), 1);
         assert!(text_block.has_citations());
     }
 
@@ -244,11 +226,5 @@ mod tests {
                 ]
             })
         );
-    }
-
-    #[test]
-    fn from_str() {
-        let text_block = "Sample text content".parse::<TextBlock>().unwrap();
-        assert_eq!(text_block.text, "Sample text content");
     }
 }

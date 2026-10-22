@@ -1,6 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
-use std::str::FromStr;
 
 /// A redacted thinking block that contains encoded/obscured thinking data.
 ///
@@ -17,14 +15,6 @@ impl RedactedThinkingBlock {
     #[must_use]
     pub fn new(data: impl Into<String>) -> Self {
         Self { data: data.into() }
-    }
-}
-
-impl FromStr for RedactedThinkingBlock {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(s))
     }
 }
 
@@ -62,13 +52,5 @@ mod tests {
                 "data": "Redacted thinking content"
             })
         );
-    }
-
-    #[test]
-    fn from_str() {
-        let block = "Redacted thinking content"
-            .parse::<RedactedThinkingBlock>()
-            .unwrap();
-        assert_eq!(block.data, "Redacted thinking content");
     }
 }

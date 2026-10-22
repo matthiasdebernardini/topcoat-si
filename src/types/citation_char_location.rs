@@ -54,12 +54,6 @@ impl CitationCharLocation {
         self.file_id = Some(file_id.into());
         self
     }
-
-    /// Returns the length of the cited text in characters
-    #[must_use]
-    pub fn length(&self) -> i32 {
-        self.end_char_index - self.start_char_index
-    }
 }
 
 #[cfg(test)]
@@ -110,19 +104,5 @@ mod tests {
         assert_eq!(location.document_title, Some("Document Title".to_string()));
         assert_eq!(location.end_char_index, 12);
         assert_eq!(location.start_char_index, 0);
-    }
-
-    #[test]
-    fn length() {
-        let location = CitationCharLocation {
-            cited_text: "example text".to_string(),
-            document_index: 0,
-            document_title: None,
-            end_char_index: 12,
-            start_char_index: 0,
-            file_id: None,
-        };
-
-        assert_eq!(location.length(), 12);
     }
 }

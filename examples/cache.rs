@@ -30,7 +30,7 @@ fn long_system_prompt() -> SystemPrompt {
     }
     let text = paragraphs.join("\n\n");
     let block = TextBlock::new(text).with_cache_control(CacheControlEphemeral::new());
-    SystemPrompt::from_blocks(vec![block])
+    SystemPrompt::from(vec![block])
 }
 
 #[tokio::main]

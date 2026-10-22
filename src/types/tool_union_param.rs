@@ -122,34 +122,6 @@ impl ToolUnionParam {
         }
         Ok(())
     }
-
-    /// Check if this tool has strict mode enabled.
-    ///
-    /// Only custom tools can have strict mode enabled. All other tool types
-    /// return `false`.
-    #[must_use]
-    pub fn is_strict(&self) -> bool {
-        match self {
-            Self::CustomTool(tool) => tool.strict == Some(true),
-            // Built-in tools don't support strict mode
-            Self::Bash20241022(_)
-            | Self::Bash20250124(_)
-            | Self::TextEditor20250124(_)
-            | Self::TextEditor20250429(_)
-            | Self::TextEditor20250728(_)
-            | Self::WebFetch20250910(_)
-            | Self::WebFetch20260209(_)
-            | Self::WebFetch20260309(_)
-            | Self::WebFetch20260318(_)
-            | Self::CodeExecution20250825(_)
-            | Self::CodeExecution20260120(_)
-            | Self::CodeExecution20260521(_)
-            | Self::ToolSearchToolRegex20251119(_)
-            | Self::ToolSearchToolBm2520251119(_)
-            | Self::Memory20250818(_)
-            | Self::McpToolset(_) => false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -400,7 +372,6 @@ mod tests {
             assert_eq!(to_value(&tool).unwrap(), expected);
             let parsed: ToolUnionParam = serde_json::from_value(expected).unwrap();
             assert_eq!(parsed, tool);
-            assert!(!tool.is_strict());
         }
     }
 

@@ -53,12 +53,6 @@ impl CitationContentBlockLocation {
         self.file_id = Some(file_id.into());
         self
     }
-
-    /// Returns the number of content blocks in the citation span
-    #[must_use]
-    pub fn block_count(&self) -> i32 {
-        self.end_block_index - self.start_block_index
-    }
 }
 
 #[cfg(test)]
@@ -109,19 +103,5 @@ mod tests {
         assert_eq!(location.document_title, Some("Document Title".to_string()));
         assert_eq!(location.end_block_index, 3);
         assert_eq!(location.start_block_index, 1);
-    }
-
-    #[test]
-    fn block_count() {
-        let location = CitationContentBlockLocation {
-            cited_text: "example text".to_string(),
-            document_index: 0,
-            document_title: None,
-            end_block_index: 3,
-            start_block_index: 1,
-            file_id: None,
-        };
-
-        assert_eq!(location.block_count(), 2);
     }
 }

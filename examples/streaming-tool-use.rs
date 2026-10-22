@@ -7,7 +7,7 @@ use serde_json::json;
 use topcoat_si::{
     AccumulatingStream, Anthropic, ContentBlock, ContentBlockDelta, KnownModel, Message,
     MessageCreateParams, MessageParam, MessageRole, MessageStreamEvent, Model, StopReason,
-    ToolChoice, ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock,
+    ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock,
 };
 
 // Each turn is a billed model call; stop a run that keeps calling tools.
@@ -146,16 +146,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     for turn in 1..=MAX_TURNS {
         println!("\n--- Turn {turn} ---");
-        let mut params = MessageCreateParams::new_streaming(
+        let params = MessageCreateParams::new_streaming(
             1024,
             messages.clone(),
             Model::Known(KnownModel::ClaudeHaiku55),
         )
         .with_tools(tools.clone());
-
-        if turn == 1 {
-            params = params.with_tool_choice(ToolChoice::tool("math_add"));
-        }
 
         let response = match stream_message(&client, &params).await {
             Ok(response) => response,

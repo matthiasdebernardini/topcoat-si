@@ -1,6 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
-use std::str::FromStr;
 
 /// A text delta, representing a piece of text in a streaming response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -15,14 +13,6 @@ impl TextDelta {
     #[must_use]
     pub fn new(text: impl Into<String>) -> Self {
         Self { text: text.into() }
-    }
-}
-
-impl FromStr for TextDelta {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(s.to_string()))
     }
 }
 
@@ -51,12 +41,6 @@ mod tests {
         });
 
         let delta: TextDelta = serde_json::from_value(json).unwrap();
-        assert_eq!(delta.text, "Hello world");
-    }
-
-    #[test]
-    fn from_str() {
-        let delta = "Hello world".parse::<TextDelta>().unwrap();
         assert_eq!(delta.text, "Hello world");
     }
 }

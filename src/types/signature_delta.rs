@@ -1,6 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
-use std::str::FromStr;
 
 /// A signature delta, representing a piece of a signature in a streaming response.
 ///
@@ -24,14 +22,6 @@ impl SignatureDelta {
         Self {
             signature: signature.into(),
         }
-    }
-}
-
-impl FromStr for SignatureDelta {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(s.to_string()))
     }
 }
 
@@ -60,12 +50,6 @@ mod tests {
         });
 
         let delta: SignatureDelta = serde_json::from_value(json).unwrap();
-        assert_eq!(delta.signature, "Robert Paulson");
-    }
-
-    #[test]
-    fn from_str() {
-        let delta = "Robert Paulson".parse::<SignatureDelta>().unwrap();
         assert_eq!(delta.signature, "Robert Paulson");
     }
 }

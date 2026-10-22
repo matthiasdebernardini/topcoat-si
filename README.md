@@ -738,7 +738,7 @@ let model = KnownModel::ClaudeHaiku55;
 let rules = TextBlock::new(long_instructions)
     .with_cache_control(CacheControlEphemeral::one_hour());
 let explicit = MessageCreateParams::simple("Summarise the rules.", model)
-    .with_system(SystemPrompt::from_blocks(vec![rules]));
+    .with_system(SystemPrompt::from(vec![rules]));
 
 // Automatic caching.
 let automatic = MessageCreateParams::simple("Continue.", model)

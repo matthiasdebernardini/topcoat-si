@@ -271,15 +271,6 @@ impl KnownModel {
         }
     }
 
-    /// The per-token rates that apply to `usage`, after every pricing modifier.
-    ///
-    /// Equivalent to [`rates_for_prompt_and_modifiers`](Self::rates_for_prompt_and_modifiers)
-    /// with `usage.prompt_tokens()`.
-    #[must_use]
-    pub fn rates_for_usage(&self, usage: &Usage) -> TokenRates {
-        self.rates_for_prompt_and_modifiers(usage.prompt_tokens(), usage)
-    }
-
     /// The per-token rates for a request of `prompt_tokens` prompt tokens, taking the pricing
     /// modifiers (speed, geography, service tier) from `usage`.
     ///
@@ -338,7 +329,10 @@ impl KnownModel {
             | UsageIteration::AdvisorMessage(it) => Some(it),
             UsageIteration::Unknown => None,
         });
-        let top_level = || self.rates_for_usage(usage).cost_micro_cents(usage);
+        let top_level = || {
+            self.rates_for_prompt_and_modifiers(usage.prompt_tokens(), usage)
+                .cost_micro_cents(usage)
+        };
         let Some(first) = known.next() else {
             return top_level();
         };

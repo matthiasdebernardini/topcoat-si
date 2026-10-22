@@ -105,8 +105,7 @@ pub struct MessageCreateParams {
 
     /// How the model should use the provided tools.
     ///
-    /// The model can use a specific tool, any available tool, decide by itself, or not
-    /// use tools at all.
+    /// The model can decide by itself or not use tools at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
 
@@ -492,16 +491,12 @@ impl MessageCreateParams {
                 self.output_config
                     .as_ref()
                     .is_some_and(|config| config.format.is_some()),
-                matches!(
-                    self.tool_choice,
-                    Some(ToolChoice::Any { .. } | ToolChoice::Tool { .. })
-                ),
             ]
             .into_iter()
             .any(std::convert::identity);
             if requires_output {
                 return Err(crate::Error::validation(
-                    "max_tokens: 0 cannot request streaming, thinking, structured output, or forced tools",
+                    "max_tokens: 0 cannot request streaming, thinking, or structured output",
                     Some("max_tokens".to_string()),
                 ));
             }

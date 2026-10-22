@@ -1,7 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use std::convert::Infallible;
-use std::str::FromStr;
 
 use crate::types::thinking_block;
 
@@ -37,14 +35,6 @@ impl ThinkingDelta {
         Self {
             thinking: thinking.into(),
         }
-    }
-}
-
-impl FromStr for ThinkingDelta {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(s.to_string()))
     }
 }
 
@@ -94,13 +84,5 @@ mod tests {
 
         let delta: ThinkingDelta = serde_json::from_value(json).unwrap();
         assert_eq!(delta.thinking, "Text-shaped thinking...");
-    }
-
-    #[test]
-    fn from_str() {
-        let delta = "Let me think about this..."
-            .parse::<ThinkingDelta>()
-            .unwrap();
-        assert_eq!(delta.thinking, "Let me think about this...");
     }
 }

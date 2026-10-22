@@ -16,12 +16,6 @@ impl UrlPdfSource {
     pub fn new(url: impl Into<String>) -> Self {
         Self { url: url.into() }
     }
-
-    /// Checks if the URL has a PDF file extension.
-    #[must_use]
-    pub fn has_pdf_extension(&self) -> bool {
-        self.url.to_lowercase().ends_with(".pdf")
-    }
 }
 
 #[cfg(test)]
@@ -46,17 +40,5 @@ mod tests {
         let source: UrlPdfSource = serde_json::from_value(json).unwrap();
 
         assert_eq!(source.url, "https://example.com/document.pdf");
-    }
-
-    #[test]
-    fn has_pdf_extension() {
-        let source = UrlPdfSource::new("https://example.com/document.pdf");
-        assert!(source.has_pdf_extension());
-
-        let source = UrlPdfSource::new("https://example.com/document.PDF");
-        assert!(source.has_pdf_extension());
-
-        let source = UrlPdfSource::new("https://example.com/document.docx");
-        assert!(!source.has_pdf_extension());
     }
 }

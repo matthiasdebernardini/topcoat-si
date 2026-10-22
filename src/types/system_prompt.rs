@@ -26,21 +26,6 @@ pub enum SystemPrompt {
     Blocks(Vec<SystemTextBlock>),
 }
 
-impl SystemPrompt {
-    /// Create a new SystemPrompt from text blocks.
-    #[must_use]
-    pub fn from_blocks(blocks: Vec<TextBlock>) -> Self {
-        let system_blocks = blocks
-            .into_iter()
-            .map(|block| SystemTextBlock {
-                r#type: TextTag,
-                block,
-            })
-            .collect();
-        Self::Blocks(system_blocks)
-    }
-}
-
 impl From<String> for SystemPrompt {
     fn from(content: String) -> Self {
         Self::String(content)
@@ -81,7 +66,7 @@ mod tests {
     #[test]
     fn system_prompt_blocks() {
         let blocks = vec![TextBlock::new("You are a helpful assistant.")];
-        let prompt = SystemPrompt::from_blocks(blocks);
+        let prompt = SystemPrompt::from(blocks);
         let json = to_value(&prompt).unwrap();
         assert_eq!(
             json,
@@ -107,13 +92,10 @@ mod tests {
     #[test]
     fn from_blocks() {
         let blocks = vec![TextBlock::new("Hello")];
-        let prompt = SystemPrompt::from_blocks(blocks.clone());
         let expected_blocks = vec![SystemTextBlock {
             r#type: TextTag,
             block: TextBlock::new("Hello"),
         }];
-        assert_eq!(prompt, SystemPrompt::Blocks(expected_blocks.clone()));
-
         let prompt: SystemPrompt = blocks.into();
         assert_eq!(prompt, SystemPrompt::Blocks(expected_blocks));
     }
