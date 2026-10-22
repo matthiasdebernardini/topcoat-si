@@ -15,11 +15,8 @@ use crate::{
     ErrorType, MessageDeltaEvent, MessageStartEvent, MessageStopEvent, MessageStreamEvent, Result,
 };
 
-/// Maximum buffer size to prevent DoS attacks (1MB)
+/// Maximum buffer and event size to prevent DoS attacks (1MB)
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
-
-/// Maximum event size (1MB).
-const MAX_EVENT_SIZE: usize = MAX_BUFFER_SIZE;
 
 /// A raw server-sent event frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,26 +44,19 @@ struct SseState {
     buffer: String,
     pending_utf8: Vec<u8>,
     finished: bool,
-    total_bytes_processed: usize,
     start: Instant,
     first_byte: Option<Instant>,
 }
 
-/// Process a stream of bytes into a stream of raw server-sent events with production hardening.
+/// Process a stream of bytes into a stream of raw server-sent events.
 ///
-/// This is the canonical SSE framing parser for Topcoat SI and is intended for
-/// reuse by other crates that need hardened SSE buffering and extraction.
+/// This function takes a byte stream from an HTTP response, buffers it, and
+/// yields each complete frame as an [`SseEvent`].
 ///
-/// This function takes a byte stream from an HTTP response and converts it into
-/// a stream of parsed [`SseEvent`] objects, handling SSE parsing, buffering,
-/// error conditions, DoS protection, and timeouts.
-///
-/// Production features:
-/// - Buffer size limits to prevent memory exhaustion
-/// - Event size validation
-/// - Timeout handling for stalled connections
-/// - Graceful error recovery
-/// - UTF-8 validation with partial byte handling
+/// - The buffer and each event are capped at 1MB to bound memory use.
+/// - UTF-8 sequences split across chunks are carried over to the next chunk.
+/// - Invalid UTF-8, an oversized buffer or event, a malformed frame, or a
+///   transport error yields one error, after which the stream ends.
 pub fn process_sse<S>(byte_stream: S) -> impl Stream<Item = Result<SseEvent>>
 where
     S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin + 'static,
@@ -81,7 +71,6 @@ where
         buffer: String::new(),
         pending_utf8: Vec::new(),
         finished: false,
-        total_bytes_processed: 0,
         start: Instant::now(),
         first_byte: None,
     };
@@ -129,7 +118,6 @@ where
             // Read more data
             match stream.next().await {
                 Some(Ok(bytes)) => {
-                    state.total_bytes_processed += bytes.len();
                     observability::stream_bytes(bytes.len() as u64);
                     if state.first_byte.is_none() {
                         let now = Instant::now();
@@ -151,21 +139,10 @@ where
                             let bytes = e.into_bytes();
 
                             if valid_up_to > 0 {
-                                let partial = match std::str::from_utf8(&bytes[..valid_up_to]) {
-                                    Ok(partial) => partial,
-                                    Err(error) => {
-                                        state.fail();
-                                        return Some((
-                                            Err(Error::new(
-                                                ErrorKind::Decode,
-                                                "Invalid UTF-8 prefix in SSE stream",
-                                            )
-                                            .with_source(error)),
-                                            (stream, state),
-                                        ));
-                                    }
-                                };
-                                state.buffer.push_str(partial);
+                                // `valid_up_to` marks a prefix that is valid UTF-8.
+                                state
+                                    .buffer
+                                    .push_str(&String::from_utf8_lossy(&bytes[..valid_up_to]));
                             }
 
                             if utf8_error.error_len().is_none() {
@@ -318,14 +295,14 @@ fn extract_event(buffer: &str) -> Result<Option<(Option<Result<SseEvent>>, Strin
     let event_text = &buffer[..event_end];
     let rest = buffer[event_end + delimiter_len..].to_string();
 
-    if event_text.len() > MAX_EVENT_SIZE {
+    if event_text.len() > MAX_BUFFER_SIZE {
         return Ok(Some((
             Some(Err(Error::new(
                 ErrorKind::Decode,
                 format!(
                     "SSE event size {} exceeds maximum limit of {} bytes",
                     event_text.len(),
-                    MAX_EVENT_SIZE
+                    MAX_BUFFER_SIZE
                 ),
             ))),
             rest,
@@ -582,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_event_size_limit() {
-        let large_event_data = "b".repeat(MAX_EVENT_SIZE + 100);
+        let large_event_data = "b".repeat(MAX_BUFFER_SIZE + 100);
         let data = format!("event: ping\ndata: {large_event_data}\n\n");
         let stream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(data))]);
 
@@ -654,11 +631,9 @@ mod tests {
         let stream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(data))]);
         let mut sse_stream = Box::pin(process_sse(stream));
 
-        if let Some(event) = sse_stream.next().await
-            && let Err(e) = event
-        {
-            assert!(e.to_string().contains("UTF-8"));
-        }
+        let error = sse_stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), &ErrorKind::Decode);
+        assert!(error.to_string().contains("UTF-8"));
     }
 
     #[tokio::test]
@@ -924,7 +899,7 @@ mod tests {
         );
         assert!(error.message().ends_with("..."));
 
-        let error = error_event(&"x".repeat(MAX_EVENT_SIZE / 2));
+        let error = error_event(&"x".repeat(MAX_BUFFER_SIZE / 2));
         assert!(error.message().len() < 400, "{}", error.message().len());
 
         let odd = format!("a{}", "\u{e9}".repeat(MAX_ERROR_TEXT_BYTES));
