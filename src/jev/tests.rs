@@ -1243,6 +1243,21 @@ async fn tool_reports_fixable_problems_as_error_results() {
 }
 
 #[tokio::test]
+async fn tool_reports_a_conflict_on_every_attempt_as_an_error_result() {
+    let conflict = || Canned::json(409, r#"{"detail":"busy"}"#);
+    let (url, recorded) = serve(vec![conflict(), conflict()]).await;
+    let tool = JevTool::new(client(&url).with_max_retries(1));
+    let result = tool.call(&tool_use(tool_input())).await.unwrap();
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result_text(&result).contains("409"),
+        "{}",
+        result_text(&result)
+    );
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn tool_returns_err_for_rejected_keys() {
     let (url, _) = serve(vec![
         Canned::json(
@@ -1562,14 +1577,14 @@ fn fatal_split_by_kind_and_status() {
             None,
         )
     };
-    for status in [400, 408, 413, 422, 429, 500, 502, 503, 529, 599] {
+    for status in [400, 408, 409, 413, 422, 429, 500, 502, 503, 529, 599] {
         assert!(!super::tool::is_fatal(&api(status, None)), "{status}");
     }
     assert!(!super::tool::is_fatal(&api(
         403,
         Some(JevErrorCode::EdgeBlocked)
     )));
-    for status in [401, 402, 403, 404, 405, 409] {
+    for status in [401, 402, 403, 404, 405] {
         assert!(super::tool::is_fatal(&api(status, None)), "{status}");
     }
     assert!(super::tool::is_fatal(&api(

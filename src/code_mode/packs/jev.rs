@@ -90,7 +90,7 @@ pub fn jev(client: JevClient) -> Pack {
                     let response = mapped(client.ask(args.state, &questions).await)?;
                     let p = mapped(response.noul(QUESTION))?;
                     let certainty = (2.0 * p - 1.0).abs();
-                    let answer = mapped(response.yes_no(QUESTION, args.min_certainty))?.answered();
+                    let answer = (certainty >= args.min_certainty).then_some(p >= 0.5);
                     Ok(json!({"answer": answer, "best": p >= 0.5, "certainty": certainty}))
                 }
             },

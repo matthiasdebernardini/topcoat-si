@@ -14,9 +14,10 @@ const TOOL_NAME: &str = "jev";
 /// Jev exposed to Claude as a client-side `jev` tool.
 ///
 /// One call sends one state with any number of questions and costs one Jev request. Problems
-/// the model or a retry can fix (bad input, a failed check, 400, 413, 422, 429, 5xx, timeouts,
-/// connection failures, an edge-proxy block) come back as an `is_error` result. A rejected key
-/// (401), a 403 with a JSON body and other configuration problems are returned as `Err`.
+/// the model or a retry can fix (bad input, a failed check, 400, 408, 409, 413, 422, 429, 5xx,
+/// timeouts, connection failures, an edge-proxy block) come back as an `is_error` result. A
+/// rejected key (401), a 403 with a JSON body and other configuration problems are returned as
+/// `Err`.
 #[derive(Debug, Clone)]
 pub struct JevTool {
     client: JevClient,
@@ -193,10 +194,13 @@ pub(crate) struct ToolOption {
     description: Option<String>,
 }
 
-// Only these failures are the developer's to fix; everything else goes back to the model. Jev
-// answers in the `Api` kind only for non-2xx statuses; every transport or body failure has its
-// own kind and is not fatal.
+// Only these failures are the developer's to fix; everything else goes back to the model. A
+// retryable error is never fatal. Jev answers in the `Api` kind only for non-2xx statuses; every
+// transport or body failure has its own kind and is not fatal.
 pub(crate) fn is_fatal(error: &Error) -> bool {
+    if error.is_retryable() {
+        return false;
+    }
     match error.kind() {
         ErrorKind::Api {
             status: Some(403),
@@ -204,7 +208,7 @@ pub(crate) fn is_fatal(error: &Error) -> bool {
             ..
         } => error_code != &Some(ErrorCode::Jev(JevErrorCode::EdgeBlocked)),
         ErrorKind::Api {
-            status: Some(400 | 408 | 413 | 422 | 429 | 500..=599),
+            status: Some(400 | 413 | 422),
             ..
         } => false,
         ErrorKind::Api {
