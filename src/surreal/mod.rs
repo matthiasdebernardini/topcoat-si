@@ -11,6 +11,7 @@
 
 mod memory;
 mod page_cache;
+pub(crate) mod time;
 mod transcripts;
 mod usage_ledger;
 
