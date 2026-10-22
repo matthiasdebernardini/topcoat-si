@@ -15,9 +15,9 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client as ReqwestClient, Method, Response, header, redirect};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use tracing::{Span, field};
+use tracing::{Instrument, Span, field};
+use url::{Url, form_urlencoded};
 
-use crate::AccumulatingStream;
 use crate::backoff::{self, RetryPolicy};
 use crate::base_url;
 use crate::error::{
@@ -100,8 +100,6 @@ where
     S: Stream<Item = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    use tracing::Instrument;
-
     stream::unfold(Some((Box::pin(inner), span)), |state| async move {
         let (mut inner, span) = state?;
         let item = async {
@@ -129,6 +127,8 @@ const DEFAULT_API_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2026-10-21";
 /// Total deadline for non-streaming requests; streams use a separate read timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+/// A longer `retry-after` gives up at once instead of waiting.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
 const COMPACT_EDIT_BETA: &str = "compact-2026-01-12";
 const COMPACTION_BETA: &str = "compact-2026-09-04";
@@ -184,22 +184,22 @@ fn build_file_upload_body(
 }
 
 /// Betas implied by the request fields shared by messages and count-tokens requests.
-fn push_feature_betas(
-    auto_betas: &mut Vec<&'static str>,
+fn feature_betas(
     context_management: Option<&ContextManagement>,
     compaction: Option<&CompactionRequest>,
     mcp_servers: Option<&[McpServer]>,
     tools: Option<&[ToolUnionParam]>,
     output_config: Option<&OutputConfig>,
-) {
+) -> Vec<&'static str> {
+    let mut betas = Vec::new();
     if let Some(context_management) = context_management {
-        auto_betas.push(CONTEXT_MANAGEMENT_BETA);
+        betas.push(CONTEXT_MANAGEMENT_BETA);
         if context_management.has_compact_edit() {
-            auto_betas.push(COMPACT_EDIT_BETA);
+            betas.push(COMPACT_EDIT_BETA);
         }
     }
     if compaction.is_some() {
-        auto_betas.push(COMPACTION_BETA);
+        betas.push(COMPACTION_BETA);
     }
     let has_mcp_toolset = tools.is_some_and(|tools| {
         tools
@@ -207,39 +207,40 @@ fn push_feature_betas(
             .any(|tool| matches!(tool, ToolUnionParam::McpToolset(_)))
     });
     if mcp_servers.is_some() || has_mcp_toolset {
-        auto_betas.push(MCP_CLIENT_BETA);
+        betas.push(MCP_CLIENT_BETA);
     }
     if output_config.is_some_and(|config| config.task_budget.is_some()) {
-        auto_betas.push(TASK_BUDGETS_BETA);
+        betas.push(TASK_BUDGETS_BETA);
     }
+    betas
 }
 
-/// Betas implied by the features a Messages request uses.
-fn create_params_betas(params: &MessageCreateParams) -> Vec<&'static str> {
-    let mut auto_betas = Vec::new();
-    push_feature_betas(
-        &mut auto_betas,
+/// Betas implied by the features a Messages request uses, alone or inside a batch.
+fn message_betas(params: &MessageCreateParams) -> Vec<&'static str> {
+    let mut betas = feature_betas(
         params.context_management.as_ref(),
         params.compaction.as_ref(),
         params.mcp_servers.as_deref(),
         params.tools.as_deref(),
         params.output_config.as_ref(),
     );
-    auto_betas
+    if params.fallbacks.is_some() {
+        betas.push(SERVER_SIDE_FALLBACK_BETA);
+    }
+    if params.fallback_credit_token.is_some() {
+        betas.push(FALLBACK_CREDIT_BETA);
+    }
+    if params.requires_thinking_display_updates_beta() {
+        betas.push(THINKING_DISPLAY_UPDATES_BETA);
+    }
+    betas
 }
 
-/// Betas implied by the features a count-tokens request uses.
-fn count_params_betas(params: &MessageCountTokensParams) -> Vec<&'static str> {
-    let mut auto_betas = Vec::new();
-    push_feature_betas(
-        &mut auto_betas,
-        params.context_management.as_ref(),
-        None,
-        params.mcp_servers.as_deref(),
-        params.tools.as_deref(),
-        params.output_config.as_ref(),
-    );
-    auto_betas
+/// The encoded query string of `pairs`.
+fn encode_query(pairs: Vec<(String, String)>) -> String {
+    form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish()
 }
 
 /// Base URLs of providers that authenticate via the standard HTTP
@@ -407,22 +408,21 @@ struct ResponseMetadata {
 }
 
 fn response_metadata(response: &Response) -> ResponseMetadata {
-    let headers = response.headers();
-    Span::current().record("http.status_code", response.status().as_u16());
-    if let Some(id) = headers
+    let span = Span::current();
+    let status = response.status().as_u16();
+    span.record("http.status_code", status);
+    let request_id = response
+        .headers()
         .get("request-id")
         .and_then(|value| value.to_str().ok())
-    {
-        Span::current().record("request_id", id);
+        .map(String::from);
+    if let Some(id) = &request_id {
+        span.record("request_id", id.as_str());
     }
-    let retry_after = retry_after_from_headers(headers);
     ResponseMetadata {
-        status: response.status().as_u16(),
-        request_id: headers
-            .get("request-id")
-            .and_then(|value| value.to_str().ok())
-            .map(String::from),
-        retry_after,
+        status,
+        request_id,
+        retry_after: retry_after_from_headers(response.headers()),
     }
 }
 
@@ -459,7 +459,7 @@ enum ResponseMode {
     Streaming,
 }
 
-/// Client for the Anthropic API with performance optimizations.
+/// Client for the Anthropic API.
 #[derive(Clone)]
 pub struct Anthropic {
     api_key: String,
@@ -498,7 +498,7 @@ impl Anthropic {
         let builder = ReqwestClient::builder()
             .redirect(redirect::Policy::none())
             .connect_timeout(timeout.min(Duration::from_secs(60)))
-            .pool_max_idle_per_host(10) // Connection pooling optimization
+            .pool_max_idle_per_host(10)
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60));
         let builder = if matches!(mode, ResponseMode::Streaming) {
@@ -724,19 +724,26 @@ impl Anthropic {
         self.cached_headers.clone()
     }
 
-    /// Build a full endpoint URL from the base URL and endpoint path.
+    /// Build a full endpoint URL from the base URL and the endpoint's path segments.
     ///
     /// The stored base URL has no trailing slash and no `/v1` suffix (see
-    /// [`normalized_base_url`]), so `/v1/` is always inserted between it and the
-    /// endpoint path.
+    /// [`normalized_base_url`]), so `/v1` is always inserted between it and the
+    /// segments. Each segment is percent-encoded on its own, so an ID such as `../models`
+    /// stays one segment.
     ///
     /// # Examples
     ///
-    /// - Base: `https://api.anthropic.com`, endpoint: `messages` → `https://api.anthropic.com/v1/messages`
-    /// - Base: `https://api.minimax.io/anthropic`, endpoint: `messages` → `https://api.minimax.io/anthropic/v1/messages`
-    /// - Base: `https://example.com/`, endpoint: `models` → `https://example.com/v1/models`
-    fn build_url(&self, endpoint: &str) -> String {
-        format!("{}/v1/{}", self.base_url, endpoint)
+    /// - Base: `https://api.anthropic.com`, segments: `["messages"]` → `https://api.anthropic.com/v1/messages`
+    /// - Base: `https://api.minimax.io/anthropic`, segments: `["messages"]` → `https://api.minimax.io/anthropic/v1/messages`
+    /// - Base: `https://example.com`, segments: `["files", "a/b"]` → `https://example.com/v1/files/a%2Fb`
+    fn build_url(&self, segments: &[&str]) -> Result<Url> {
+        let invalid = || Error::validation("Invalid base URL", Some("base_url".to_string()));
+        let mut url = Url::parse(&format!("{}/v1", self.base_url))
+            .map_err(|error| invalid().with_source(error))?;
+        url.path_segments_mut()
+            .map_err(|()| invalid())?
+            .extend(segments);
+        Ok(url)
     }
 
     /// Collect all beta strings from client defaults, per-request, and auto-detected sources.
@@ -774,48 +781,121 @@ impl Anthropic {
         Ok(Some(headers))
     }
 
-    /// [`Anthropic::headers_with_betas`] for a public method: a failure is also reported to the
-    /// request's span and metrics, like any other validation failure.
-    fn checked_beta_headers(&self, betas: &[String], start: Instant) -> Result<Option<HeaderMap>> {
-        self.headers_with_betas(betas).inspect_err(|error| {
-            final_failure(error);
-            observability::request_failed(start.elapsed());
-        })
-    }
-
-    /// Runs `operation` under the shared retry loop. Only GET requests resend an
-    /// [`ErrorKind::Interrupted`] failure, since the server has already answered a POST or DELETE.
-    async fn retry_with_backoff<F, Fut, T>(&self, method: Method, operation: F) -> Result<T>
+    /// Sends `call` under the shared retry loop and reads each successful response with `read`.
+    ///
+    /// The call runs in its `topcoat_si.request` span, and its outcome, a failure found before
+    /// sending included, is reported once: the `request_completed` event and, on failure, the
+    /// error log. Only GET requests resend an [`ErrorKind::Interrupted`] failure, since the server
+    /// has already answered a POST or DELETE.
+    async fn execute<T, Read, Fut>(&self, call: Call<'_>, read: Read) -> Result<T>
     where
-        F: Fn() -> Fut,
+        Read: Fn(Response) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
+        let span = tracing::info_span!(
+            target: "topcoat_si::client",
+            "topcoat_si.request",
+            operation = call.operation,
+            otel.kind = "client", gen_ai.request.model = call.model.map(field::display),
+            stream = call.stream,
+            request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
+            input_tokens = field::Empty, output_tokens = field::Empty,
+            otel.status_code = field::Empty, cache_read_input_tokens = field::Empty,
+            cache_creation_input_tokens = field::Empty, cost_micro_cents = field::Empty
+        );
+        async {
+            let start = Instant::now();
+            let result = self.send_with_retries(call, read).await;
+            if let Err(error) = &result {
+                final_failure(error);
+            }
+            observability::request_completed(start.elapsed(), result.is_ok());
+            result
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// The body of [`Anthropic::execute`] without its reporting.
+    async fn send_with_retries<T, Read, Fut>(&self, call: Call<'_>, read: Read) -> Result<T>
+    where
+        Read: Fn(Response) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let Call {
+            method,
+            path,
+            query,
+            body,
+            content_type,
+            accept,
+            mode,
+            betas,
+            auto_betas,
+            check,
+            ..
+        } = call;
+        check?;
+        let betas = self.collect_betas(Some(&betas), &auto_betas);
+        let mut headers = self
+            .headers_with_betas(&betas)?
+            .unwrap_or_else(|| self.default_headers());
+        if let Some(accept) = accept {
+            headers.insert(header::ACCEPT, HeaderValue::from_static(accept));
+        }
+        match &content_type {
+            Some(content_type) => {
+                let value = HeaderValue::from_str(content_type).map_err(|error| {
+                    Error::validation("Invalid content type", Some("content_type".to_string()))
+                        .with_source(error)
+                })?;
+                headers.insert(header::CONTENT_TYPE, value);
+            }
+            None => {
+                if let Some(body) = &body {
+                    tracing::trace!(target: "topcoat_si::wire", request = %String::from_utf8_lossy(body));
+                }
+            }
+        }
+        let mut url = self.build_url(path)?;
+        if let Some(query) = query.as_deref().filter(|query| !query.is_empty()) {
+            url.set_query(Some(query));
+        }
+        let client = match mode {
+            ResponseMode::Buffered => &self.client,
+            ResponseMode::Streaming => &self.stream_client,
+        };
         let policy = RetryPolicy {
             max_retries: self.max_retries,
-            max_retry_after: Duration::from_secs(60),
+            max_retry_after: MAX_RETRY_AFTER,
             budget: None,
             resend_timeouts: false,
             resend_interrupted: method == Method::GET,
         };
+        let (method, url, headers, body, read) = (&method, &url, &headers, &body, &read);
         let retried = backoff::retry(
             &policy,
-            |_, _| operation(),
-            |error, attempt, sleep_duration| {
-                tracing::warn!(
-                    target: "topcoat_si::client",
-                    error = error as &dyn std::error::Error,
-                    attempt = attempt + 1,
-                    sleep_seconds = sleep_duration.as_secs_f64(),
-                    "Retrying API request"
-                );
-                observability::retry(sleep_duration);
+            |_, _| async move {
+                let mut request = client
+                    .request(method.clone(), url.clone())
+                    .headers(headers.clone());
+                if let Some(body) = body {
+                    request = request.body(body.clone());
+                }
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|error| map_reqwest_error(error, RequestPhase::Headers))?;
+                self.record_rate_limits(&response);
+                if !response.status().is_success() {
+                    return Err(Self::process_error_response(response).await);
+                }
+                read(response).await
             },
+            |_, _, delay| observability::retry(delay),
         )
         .await;
         Span::current().record("attempts", retried.attempts);
-        if let Err(error) = &retried.result {
-            final_failure(error);
-        }
         retried.result
     }
 
@@ -905,16 +985,17 @@ impl Anthropic {
             .clone()
     }
 
-    fn map_request_error(&self, error: reqwest::Error) -> Error {
-        map_reqwest_error(error, RequestPhase::Headers)
+    /// Reads the whole body of a successful response.
+    async fn read_bytes(response: Response) -> Result<Bytes> {
+        let request_id = response_metadata(&response).request_id;
+        response.bytes().await.map_err(|error| {
+            map_reqwest_error(error, RequestPhase::Body).with_request_id(request_id)
+        })
     }
 
     async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T> {
-        let metadata = response_metadata(&response);
-        let body = response.bytes().await.map_err(|error| {
-            map_reqwest_error(error, RequestPhase::Body)
-                .with_request_id(metadata.request_id.clone())
-        })?;
+        let request_id = response_metadata(&response).request_id;
+        let body = Self::read_bytes(response).await?;
         tracing::trace!(target: "topcoat_si::wire", response = %String::from_utf8_lossy(&body));
         // serde's message can quote the body, so neither it nor the error itself is kept.
         serde_json::from_slice(&body).map_err(|error| {
@@ -926,189 +1007,12 @@ impl Anthropic {
                     describe_json_error(&error)
                 ),
             )
-            .with_request_id(metadata.request_id)
+            .with_request_id(request_id)
         })
     }
 
-    /// Execute a POST request with error handling
-    async fn execute_post_request<T: DeserializeOwned>(
-        &self,
-        url: &str,
-        body: &impl serde::Serialize,
-        headers: Option<HeaderMap>,
-    ) -> Result<T> {
-        let headers = headers.unwrap_or_else(|| self.default_headers());
-
-        tracing::trace!(target: "topcoat_si::wire", request = %serde_json::to_string(body).unwrap_or_default());
-        let response = self
-            .client
-            .post(url)
-            .headers(headers)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| self.map_request_error(e))?;
-
-        self.record_rate_limits(&response);
-        if !response.status().is_success() {
-            return Err(Self::process_error_response(response).await);
-        }
-
-        Self::decode_response(response).await
-    }
-
-    /// Execute a POST request with a raw body and an explicit content type.
-    async fn execute_post_body_request<T: DeserializeOwned>(
-        &self,
-        url: &str,
-        body: Bytes,
-        content_type: &str,
-        headers: Option<HeaderMap>,
-    ) -> Result<T> {
-        let mut headers = headers.unwrap_or_else(|| self.default_headers());
-        let content_type = HeaderValue::from_str(content_type).map_err(|error| {
-            Error::validation("Invalid content type", Some("content_type".to_string()))
-                .with_source(error)
-        })?;
-        headers.insert(header::CONTENT_TYPE, content_type);
-
-        let response = self
-            .client
-            .post(url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| self.map_request_error(e))?;
-
-        self.record_rate_limits(&response);
-        if !response.status().is_success() {
-            return Err(Self::process_error_response(response).await);
-        }
-
-        Self::decode_response(response).await
-    }
-
-    /// Execute a GET request with error handling
-    async fn execute_get_request<T: DeserializeOwned>(
-        &self,
-        url: &str,
-        query_params: Option<&[(String, String)]>,
-        headers: Option<HeaderMap>,
-    ) -> Result<T> {
-        let headers = headers.unwrap_or_else(|| self.default_headers());
-        let mut request = self.client.get(url).headers(headers);
-
-        if let Some(params) = query_params {
-            for (key, value) in params {
-                request = request.query(&[(key, value)]);
-            }
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| self.map_request_error(e))?;
-
-        self.record_rate_limits(&response);
-        if !response.status().is_success() {
-            return Err(Self::process_error_response(response).await);
-        }
-
-        Self::decode_response(response).await
-    }
-
-    /// Execute an empty-body POST request with error handling.
-    async fn execute_post_empty_request<T: DeserializeOwned>(
-        &self,
-        url: &str,
-        headers: Option<HeaderMap>,
-    ) -> Result<T> {
-        let headers = headers.unwrap_or_else(|| self.default_headers());
-
-        let response = self
-            .client
-            .post(url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| self.map_request_error(e))?;
-
-        self.record_rate_limits(&response);
-        if !response.status().is_success() {
-            return Err(Self::process_error_response(response).await);
-        }
-
-        Self::decode_response(response).await
-    }
-
-    /// Execute a DELETE request with error handling.
-    async fn execute_delete_request<T: DeserializeOwned>(
-        &self,
-        url: &str,
-        headers: Option<HeaderMap>,
-    ) -> Result<T> {
-        let headers = headers.unwrap_or_else(|| self.default_headers());
-
-        let response = self
-            .client
-            .delete(url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| self.map_request_error(e))?;
-
-        self.record_rate_limits(&response);
-        if !response.status().is_success() {
-            return Err(Self::process_error_response(response).await);
-        }
-
-        Self::decode_response(response).await
-    }
-
-    /// Execute a streaming GET request with error handling.
-    async fn execute_get_stream_request(
-        &self,
-        url: &str,
-        headers: Option<HeaderMap>,
-    ) -> Result<Response> {
-        let headers = headers.unwrap_or_else(|| self.default_headers());
-
-        let response = self
-            .stream_client
-            .get(url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| self.map_request_error(e))?;
-
-        self.record_rate_limits(&response);
-        if !response.status().is_success() {
-            return Err(Self::process_error_response(response).await);
-        }
-
-        Ok(response)
-    }
-
     /// Send a message to the API and get a non-streaming response.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "send",
-        otel.kind = "client", gen_ai.request.model = %params.model, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty,
-        cache_read_input_tokens = field::Empty, cache_creation_input_tokens = field::Empty,
-        cost_micro_cents = field::Empty
-    ))]
     pub async fn send(&self, params: &MessageCreateParams) -> Result<Message> {
-        let start = Instant::now();
-
-        // Validate parameters first
-        if let Err(err) = params.validate() {
-            final_failure(&err);
-            observability::request_failed(start.elapsed());
-            return Err(err);
-        }
-
         // Send with stream disabled; copy the params only when the caller enabled it.
         let params = if params.stream {
             let mut buffered = params.clone();
@@ -1117,543 +1021,273 @@ impl Anthropic {
         } else {
             Cow::Borrowed(params)
         };
-
-        // Collect all betas: client defaults + per-request + auto-detected
-        let mut auto_betas = create_params_betas(&params);
-        if params.fallbacks.is_some() {
-            auto_betas.push(SERVER_SIDE_FALLBACK_BETA);
-        }
-        if params.fallback_credit_token.is_some() {
-            auto_betas.push(FALLBACK_CREDIT_BETA);
-        }
-        if params.requires_thinking_display_updates_beta() {
-            auto_betas.push(THINKING_DISPLAY_UPDATES_BETA);
-        }
-        let all_betas = self.collect_betas(params.betas.as_deref(), &auto_betas);
-        let headers = self.checked_beta_headers(&all_betas, start)?;
-
-        let result: Result<Message> = self
-            .retry_with_backoff(Method::POST, || async {
-                let url = self.build_url("messages");
-                self.execute_post_request(&url, &params, headers.clone())
-                    .await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        if let Ok(message) = &result {
-            record_usage(&params.model, &message.usage);
-            count_usage(&params.model, &message.usage);
-        }
-        result
+        let model = &params.model;
+        self.execute(Call::message("send", &params), |response| async move {
+            let message: Message = Self::decode_response(response).await?;
+            record_usage(model, &message.usage);
+            count_usage(model, &message.usage);
+            Ok(message)
+        })
+        .await
     }
 
     /// Send a message to the API and get a streaming response.
     ///
-    /// Returns a stream of MessageStreamEvent objects that can be processed incrementally.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "stream",
-        otel.kind = "client", gen_ai.request.model = %params.model, stream = true,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty,
-        cache_read_input_tokens = field::Empty, cache_creation_input_tokens = field::Empty,
-        cost_micro_cents = field::Empty
-    ))]
+    /// Returns a stream of MessageStreamEvent objects that can be processed incrementally. A
+    /// stream that ends before `message_stop` yields an [`ErrorKind::Interrupted`] error last.
     pub async fn stream(
         &self,
         params: &MessageCreateParams,
     ) -> Result<impl Stream<Item = Result<MessageStreamEvent>> + use<>> {
-        let start = Instant::now();
-
-        // Validate parameters first
-        if let Err(err) = params.validate() {
-            final_failure(&err);
-            observability::request_failed(start.elapsed());
-            return Err(err);
-        }
-
-        // Ensure stream is enabled
-        if !params.stream {
-            let err = Error::validation(
+        let stream_check = if params.stream {
+            Ok(())
+        } else {
+            Err(Error::validation(
                 "stream must be true for streaming requests",
                 Some("stream".to_string()),
-            );
-            final_failure(&err);
-            observability::request_failed(start.elapsed());
-            return Err(err);
-        }
-
-        // Collect all betas: client defaults + per-request + auto-detected
-        let mut auto_betas = create_params_betas(params);
-        if params.fallbacks.is_some() {
-            auto_betas.push(SERVER_SIDE_FALLBACK_BETA);
-        }
-        if params.fallback_credit_token.is_some() {
-            auto_betas.push(FALLBACK_CREDIT_BETA);
-        }
-        if params.requires_thinking_display_updates_beta() {
-            auto_betas.push(THINKING_DISPLAY_UPDATES_BETA);
-        }
-        let all_betas = self.collect_betas(params.betas.as_deref(), &auto_betas);
-        let beta_headers = self.checked_beta_headers(&all_betas, start)?;
-
-        let response = self
-            .retry_with_backoff(Method::POST, || async {
-                let url = self.build_url("messages");
-
-                let mut headers = beta_headers
-                    .clone()
-                    .unwrap_or_else(|| self.default_headers());
-                headers.insert(
-                    header::ACCEPT,
-                    HeaderValue::from_static("text/event-stream"),
-                );
-
-                tracing::trace!(target: "topcoat_si::wire", request = ?params);
-                let response = self
-                    .stream_client
-                    .post(&url)
-                    .headers(headers)
-                    .json(params)
-                    .send()
-                    .await
-                    .map_err(|e| self.map_request_error(e))?;
-
-                self.record_rate_limits(&response);
-                if !response.status().is_success() {
-                    return Err(Self::process_error_response(response).await);
-                }
-
-                Ok(response)
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &response);
-        let response = match response {
-            Ok(response) => response,
-            Err(err) => {
-                return Err(err);
-            }
+            ))
         };
-
-        // Get the byte stream from the response
-        let request_id = response_metadata(&response).request_id;
-        let stream = response.bytes_stream();
-        let (events, _receiver) = AccumulatingStream::new(process_message_stream_sse(stream));
-        let model = params.model.clone();
-        let mut usage: Option<Usage> = None;
-        let events = events
-            .map(move |item| item.map_err(|error| error.with_request_id(request_id.clone())))
-            .inspect(move |item| {
-                let Ok(event) = item else { return };
-                match event {
-                    MessageStreamEvent::MessageStart(start) => {
-                        record_usage(&model, &start.message.usage);
-                        usage = Some(start.message.usage.clone());
-                    }
-                    MessageStreamEvent::MessageDelta(delta) => {
-                        let running = usage.get_or_insert_with(|| Usage::new(0, 0));
-                        delta.usage.merge_into(running);
-                        record_usage(&model, running);
-                    }
-                    MessageStreamEvent::MessageStop(_) => {
-                        // Deltas carry cumulative counts and may repeat, so the counters
-                        // take the merged usage once, here.  A stream that ends without
-                        // `message_stop` is not counted.
-                        if let Some(running) = &usage {
-                            count_usage(&model, running);
+        let call = Call {
+            stream: true,
+            mode: ResponseMode::Streaming,
+            accept: Some("text/event-stream"),
+            ..Call::message("stream", params).and_check(stream_check)
+        };
+        self.execute(call, |response| {
+            let model = params.model.clone();
+            async move {
+                let request_id = response_metadata(&response).request_id;
+                let mut usage: Option<Usage> = None;
+                let events = process_message_stream_sse(response.bytes_stream())
+                    .map(move |item| {
+                        item.map_err(|error| error.with_request_id(request_id.clone()))
+                    })
+                    .inspect(move |item| {
+                        let Ok(event) = item else { return };
+                        match event {
+                            MessageStreamEvent::MessageStart(start) => {
+                                record_usage(&model, &start.message.usage);
+                                usage = Some(start.message.usage.clone());
+                            }
+                            MessageStreamEvent::MessageDelta(delta) => {
+                                let running = usage.get_or_insert_with(|| Usage::new(0, 0));
+                                delta.usage.merge_into(running);
+                                record_usage(&model, running);
+                            }
+                            MessageStreamEvent::MessageStop(_) => {
+                                // Deltas carry cumulative counts and may repeat, so the
+                                // counters take the merged usage once, here.  A stream that
+                                // ends without `message_stop` is not counted.
+                                if let Some(running) = &usage {
+                                    count_usage(&model, running);
+                                }
+                            }
+                            _ => {}
                         }
-                    }
-                    _ => {}
-                }
-            });
-        Ok(trace_stream(events, Span::current()))
+                    });
+                Ok(trace_stream(events, Span::current()))
+            }
+        })
+        .await
     }
 
     /// Count tokens for a message.
     ///
     /// This method counts the number of tokens that would be used by a message with the given parameters.
     /// It's useful for estimating costs or making sure your messages fit within the model's context window.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "count_tokens",
-        otel.kind = "client", gen_ai.request.model = %params.model, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn count_tokens(
         &self,
         params: MessageCountTokensParams,
     ) -> Result<MessageTokensCount> {
-        let start = Instant::now();
-
-        if let Err(err) = params.check_known_values() {
-            final_failure(&err);
-            observability::request_failed(start.elapsed());
-            return Err(err);
-        }
-
-        // Collect betas: client defaults + per-request + auto-detected
-        let auto_betas = count_params_betas(&params);
-        let all_betas = self.collect_betas(params.betas.as_deref(), &auto_betas);
-        let headers = self.checked_beta_headers(&all_betas, start)?;
-
-        let result = self
-            .retry_with_backoff(Method::POST, || async {
-                let url = self.build_url("messages/count_tokens");
-                self.execute_post_request(&url, &params, headers.clone())
-                    .await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        let call = Call {
+            model: Some(&params.model),
+            betas: params.betas.clone().unwrap_or_default(),
+            auto_betas: feature_betas(
+                params.context_management.as_ref(),
+                None,
+                params.mcp_servers.as_deref(),
+                params.tools.as_deref(),
+                params.output_config.as_ref(),
+            ),
+            check: params.check_known_values(),
+            ..Call::new("count_tokens", Method::POST, &["messages", "count_tokens"])
+        };
+        self.execute(call.with_json(&params), Self::decode_response)
+            .await
     }
 
     /// Create a Message Batch for asynchronous processing.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "create_message_batch",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
+    ///
+    /// The batch carries the betas of every request in it, including the ones implied by the
+    /// features each request uses.
     pub async fn create_message_batch(
         &self,
         params: MessageBatchCreateParams,
     ) -> Result<MessageBatch> {
-        let start = Instant::now();
-
-        if let Err(err) = params.validate() {
-            final_failure(&err);
-            observability::request_failed(start.elapsed());
-            return Err(err);
-        }
-
-        let mut request_betas = Vec::new();
-        if let Some(betas) = &params.betas {
-            request_betas.extend(betas.iter().cloned());
-        }
-        for request in &params.requests {
-            if let Some(betas) = &request.params.betas {
-                request_betas.extend(betas.iter().cloned());
-            }
-        }
-
-        let auto_betas: Vec<&str> = params
-            .requests
-            .iter()
-            .flat_map(|request| create_params_betas(&request.params))
-            .collect();
-        let all_betas = if request_betas.is_empty() {
-            self.collect_betas(None, &auto_betas)
-        } else {
-            self.collect_betas(Some(&request_betas), &auto_betas)
+        let requests = params.requests.iter().map(|request| &request.params);
+        let call = Call {
+            betas: params
+                .betas
+                .iter()
+                .chain(requests.clone().filter_map(|params| params.betas.as_ref()))
+                .flatten()
+                .cloned()
+                .collect(),
+            auto_betas: requests.flat_map(message_betas).collect(),
+            check: params.validate(),
+            ..Call::new(
+                "create_message_batch",
+                Method::POST,
+                &["messages", "batches"],
+            )
         };
-        let headers = self.checked_beta_headers(&all_betas, start)?;
-
-        let result = self
-            .retry_with_backoff(Method::POST, || async {
-                let url = self.build_url("messages/batches");
-                self.execute_post_request(&url, &params, headers.clone())
-                    .await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        self.execute(call.with_json(&params), Self::decode_response)
+            .await
     }
 
     /// Retrieve a Message Batch by ID.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "get_message_batch",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn get_message_batch(&self, message_batch_id: &str) -> Result<MessageBatch> {
-        let start = Instant::now();
-
-        let all_betas = self.collect_betas(None, &[]);
-        let headers = self.checked_beta_headers(&all_betas, start)?;
-
-        let result = self
-            .retry_with_backoff(Method::GET, || async {
-                let url = self.build_url(&format!("messages/batches/{message_batch_id}"));
-                self.execute_get_request(&url, None, headers.clone()).await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        let path = ["messages", "batches", message_batch_id];
+        let call = Call::new("get_message_batch", Method::GET, &path);
+        self.execute(call, Self::decode_response).await
     }
 
     /// List Message Batches in the current Workspace.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "list_message_batches",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn list_message_batches(
         &self,
         params: Option<MessageBatchListParams>,
     ) -> Result<MessageBatchListResponse> {
-        let start = Instant::now();
-
-        let request_betas = params.as_ref().and_then(|p| p.betas.as_deref());
-        let all_betas = self.collect_betas(request_betas, &[]);
-        let headers = self.checked_beta_headers(&all_betas, start)?;
-
-        let result = self
-            .retry_with_backoff(Method::GET, || async {
-                let url = self.build_url("messages/batches");
-                let query_params = params.as_ref().map(|p| {
-                    let mut params = Vec::new();
-                    if let Some(ref after_id) = p.after_id {
-                        params.push(("after_id".to_string(), after_id.clone()));
-                    }
-                    if let Some(ref before_id) = p.before_id {
-                        params.push(("before_id".to_string(), before_id.clone()));
-                    }
-                    if let Some(limit) = p.limit {
-                        params.push(("limit".to_string(), limit.to_string()));
-                    }
-                    params
-                });
-
-                self.execute_get_request(&url, query_params.as_deref(), headers.clone())
-                    .await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        let call = Call {
+            betas: params
+                .as_ref()
+                .and_then(|params| params.betas.clone())
+                .unwrap_or_default(),
+            query: params.as_ref().map(|params| {
+                let mut query = form_urlencoded::Serializer::new(String::new());
+                if let Some(after_id) = &params.after_id {
+                    query.append_pair("after_id", after_id);
+                }
+                if let Some(before_id) = &params.before_id {
+                    query.append_pair("before_id", before_id);
+                }
+                if let Some(limit) = params.limit {
+                    query.append_pair("limit", &limit.to_string());
+                }
+                query.finish()
+            }),
+            ..Call::new(
+                "list_message_batches",
+                Method::GET,
+                &["messages", "batches"],
+            )
+        };
+        self.execute(call, Self::decode_response).await
     }
 
     /// Cancel a Message Batch that is currently processing.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "cancel_message_batch",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn cancel_message_batch(&self, message_batch_id: &str) -> Result<MessageBatch> {
-        let start = Instant::now();
-
-        let all_betas = self.collect_betas(None, &[]);
-        let headers = self.checked_beta_headers(&all_betas, start)?;
-
-        let result = self
-            .retry_with_backoff(Method::POST, || async {
-                let url = self.build_url(&format!("messages/batches/{message_batch_id}/cancel"));
-                self.execute_post_empty_request(&url, headers.clone()).await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        let path = ["messages", "batches", message_batch_id, "cancel"];
+        let call = Call::new("cancel_message_batch", Method::POST, &path);
+        self.execute(call, Self::decode_response).await
     }
 
     /// Delete a Message Batch after processing has ended.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "delete_message_batch",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn delete_message_batch(
         &self,
         message_batch_id: &str,
     ) -> Result<DeletedMessageBatch> {
-        let start = Instant::now();
-
-        let all_betas = self.collect_betas(None, &[]);
-        let headers = self.checked_beta_headers(&all_betas, start)?;
-
-        let result = self
-            .retry_with_backoff(Method::DELETE, || async {
-                let url = self.build_url(&format!("messages/batches/{message_batch_id}"));
-                self.execute_delete_request(&url, headers.clone()).await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        let path = ["messages", "batches", message_batch_id];
+        let call = Call::new("delete_message_batch", Method::DELETE, &path);
+        self.execute(call, Self::decode_response).await
     }
 
     /// Stream results for an ended Message Batch as JSONL records.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "stream_message_batch_results",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = true,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn stream_message_batch_results(
         &self,
         message_batch_id: &str,
     ) -> Result<impl Stream<Item = Result<MessageBatchResult>> + use<>> {
-        let start = Instant::now();
-
-        let all_betas = self.collect_betas(None, &[]);
-        let headers = self.checked_beta_headers(&all_betas, start)?;
-
-        let response = self
-            .retry_with_backoff(Method::GET, || async {
-                let url = self.build_url(&format!("messages/batches/{message_batch_id}/results"));
-                self.execute_get_stream_request(&url, headers.clone()).await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &response);
-        let response = match response {
-            Ok(response) => response,
-            Err(err) => {
-                return Err(err);
-            }
+        let path = ["messages", "batches", message_batch_id, "results"];
+        let call = Call {
+            stream: true,
+            mode: ResponseMode::Streaming,
+            ..Call::new("stream_message_batch_results", Method::GET, &path)
         };
-
-        let request_id = response_metadata(&response).request_id;
-        let results = process_message_batch_result_jsonl(response.bytes_stream())
-            .map(move |result| result.map_err(|error| error.with_request_id(request_id.clone())));
-        Ok(trace_stream(results, Span::current()))
+        self.execute(call, |response| async move {
+            let request_id = response_metadata(&response).request_id;
+            let results =
+                process_message_batch_result_jsonl(response.bytes_stream()).map(move |result| {
+                    result.map_err(|error| error.with_request_id(request_id.clone()))
+                });
+            Ok(trace_stream(results, Span::current()))
+        })
+        .await
     }
 
     /// List available models from the API.
     ///
     /// Returns a paginated list of all available models. Use the parameters to control
     /// pagination and filter results.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "list_models",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn list_models(&self, params: Option<ModelListParams>) -> Result<ModelListResponse> {
-        let start = Instant::now();
-
-        if let Some(Err(err)) = params.as_ref().map(ModelListParams::check_known_values) {
-            final_failure(&err);
-            observability::request_failed(start.elapsed());
-            return Err(err);
-        }
-
-        // Collect betas: client defaults + per-request from ModelListParams
-        let request_betas = params.as_ref().and_then(|p| p.betas.as_deref());
-        let all_betas = self.collect_betas(request_betas, &[]);
-        let headers = self.checked_beta_headers(&all_betas, start)?;
-
-        let result = self
-            .retry_with_backoff(Method::GET, || async {
-                let url = self.build_url("models");
-
-                let query_params = params.as_ref().map(ModelListParams::query_pairs);
-
-                self.execute_get_request(&url, query_params.as_deref(), headers.clone())
-                    .await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        let call = Call {
+            betas: params
+                .as_ref()
+                .and_then(|params| params.betas.clone())
+                .unwrap_or_default(),
+            query: params
+                .as_ref()
+                .map(|params| encode_query(params.query_pairs())),
+            check: params
+                .as_ref()
+                .map_or(Ok(()), ModelListParams::check_known_values),
+            ..Call::new("list_models", Method::GET, &["models"])
+        };
+        self.execute(call, Self::decode_response).await
     }
 
     /// Fetch the organization's Messages usage report.
     ///
     /// This is an Admin API endpoint: the client must be built with an Admin API key
     /// (`sk-ant-admin01-...`), which is sent in the same `x-api-key` header.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "usage_report",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn usage_report(&self, params: UsageReportParams) -> Result<UsageReport> {
-        let start = Instant::now();
-
-        if let Err(err) = params.check_known_values() {
-            final_failure(&err);
-            observability::request_failed(start.elapsed());
-            return Err(err);
-        }
-
-        let all_betas = self.collect_betas(None, &[]);
-        let headers = self.checked_beta_headers(&all_betas, start)?;
-        let query = params.to_query();
-
-        let result = self
-            .retry_with_backoff(Method::GET, || async {
-                let url = format!(
-                    "{}?{query}",
-                    self.build_url("organizations/usage_report/messages")
-                );
-                self.execute_get_request(&url, None, headers.clone()).await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        let path = ["organizations", "usage_report", "messages"];
+        let call = Call {
+            query: Some(params.to_query()),
+            check: params.check_known_values(),
+            ..Call::new("usage_report", Method::GET, &path)
+        };
+        self.execute(call, Self::decode_response).await
     }
 
     /// Fetch the organization's daily cost report.
     ///
     /// This is an Admin API endpoint: the client must be built with an Admin API key
     /// (`sk-ant-admin01-...`), which is sent in the same `x-api-key` header.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "cost_report",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn cost_report(&self, params: CostReportParams) -> Result<CostReport> {
-        let start = Instant::now();
-
-        let all_betas = self.collect_betas(None, &[]);
-        let headers = self.checked_beta_headers(&all_betas, start)?;
-        let query = params.to_query();
-
-        let result = self
-            .retry_with_backoff(Method::GET, || async {
-                let url = format!("{}?{query}", self.build_url("organizations/cost_report"));
-                self.execute_get_request(&url, None, headers.clone()).await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        let call = Call {
+            query: Some(params.to_query()),
+            ..Call::new(
+                "cost_report",
+                Method::GET,
+                &["organizations", "cost_report"],
+            )
+        };
+        self.execute(call, Self::decode_response).await
     }
 
     /// Retrieve information about a specific model.
     ///
     /// Returns detailed information about the specified model, including its
     /// ID, creation date, display name, and type.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "get_model",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn get_model(&self, model_id: &str) -> Result<ModelInfo> {
-        let start = Instant::now();
-        let result = self
-            .retry_with_backoff(Method::GET, || async {
-                let url = self.build_url(&format!("models/{}", model_id));
-                self.execute_get_request(&url, None, None).await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        let path = ["models", model_id];
+        let call = Call::new("get_model", Method::GET, &path);
+        self.execute(call, Self::decode_response).await
     }
 
     /// Upload a file to the Files API.
     ///
     /// The file is sent as `multipart/form-data`. `expires_in_seconds`, when given, must be
     /// between 3,600 (one hour) and 7,776,000 (90 days).
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "upload_file",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn upload_file(
         &self,
         filename: &str,
@@ -1661,452 +1295,192 @@ impl Anthropic {
         bytes: &[u8],
         expires_in_seconds: Option<u64>,
     ) -> Result<FileInfo> {
-        if let Some(seconds) = expires_in_seconds
-            && !FILE_EXPIRY_SECONDS.contains(&seconds)
+        let check = if let Some(seconds) =
+            expires_in_seconds.filter(|seconds| !FILE_EXPIRY_SECONDS.contains(seconds))
         {
-            return Err(Error::validation(
+            Err(Error::validation(
                 format!(
                     "expires_in_seconds must be between {} and {}, got {seconds}",
                     FILE_EXPIRY_SECONDS.start(),
                     FILE_EXPIRY_SECONDS.end()
                 ),
                 Some("expires_in_seconds".to_string()),
-            ));
-        }
-        if [filename, mime_type]
+            ))
+        } else if [filename, mime_type]
             .iter()
             .any(|value| value.contains(['\r', '\n']))
         {
-            return Err(Error::validation(
+            Err(Error::validation(
                 "filename and mime_type must not contain line breaks",
                 Some("filename".to_string()),
-            ));
-        }
-
-        let start = Instant::now();
-
+            ))
+        } else {
+            Ok(())
+        };
         let boundary = multipart_boundary();
-        let content_type = format!("multipart/form-data; boundary={boundary}");
-        let body = Bytes::from(build_file_upload_body(
-            &boundary,
-            filename,
-            mime_type,
-            bytes,
-            expires_in_seconds,
-        ));
-        let result = self
-            .retry_with_backoff(Method::POST, || async {
-                let url = self.build_url("files");
-                self.execute_post_body_request(&url, body.clone(), &content_type, None)
-                    .await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        let call = Call {
+            body: Some(Bytes::from(build_file_upload_body(
+                &boundary,
+                filename,
+                mime_type,
+                bytes,
+                expires_in_seconds,
+            ))),
+            content_type: Some(format!("multipart/form-data; boundary={boundary}")),
+            check,
+            ..Call::new("upload_file", Method::POST, &["files"])
+        };
+        self.execute(call, Self::decode_response).await
     }
 
     /// List files stored through the Files API.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "list_files",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn list_files(&self, params: Option<FileListParams>) -> Result<FileList> {
-        let start = Instant::now();
-
-        let result = self
-            .retry_with_backoff(Method::GET, || async {
-                let url = self.build_url("files");
-                let query_params = params.as_ref().map(FileListParams::query_pairs);
-                self.execute_get_request(&url, query_params.as_deref(), None)
-                    .await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        let call = Call {
+            query: params
+                .as_ref()
+                .map(|params| encode_query(params.query_pairs())),
+            ..Call::new("list_files", Method::GET, &["files"])
+        };
+        self.execute(call, Self::decode_response).await
     }
 
     /// Fetch the metadata of a file.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "get_file",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn get_file(&self, file_id: &str) -> Result<FileInfo> {
-        let start = Instant::now();
-        let result = self
-            .retry_with_backoff(Method::GET, || async {
-                let url = self.build_url(&format!("files/{file_id}"));
-                self.execute_get_request(&url, None, None).await
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        let path = ["files", file_id];
+        let call = Call::new("get_file", Method::GET, &path);
+        self.execute(call, Self::decode_response).await
     }
 
     /// Download the raw content of a file.
     ///
     /// Only files created by code execution or skills are downloadable.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "download_file",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn download_file(&self, file_id: &str) -> Result<Bytes> {
-        let start = Instant::now();
-        let result = self
-            .retry_with_backoff(Method::GET, || async {
-                let url = self.build_url(&format!("files/{file_id}/content"));
-                let response = self.execute_get_stream_request(&url, None).await?;
-                let metadata = response_metadata(&response);
-                response.bytes().await.map_err(|error| {
-                    map_reqwest_error(error, RequestPhase::Body)
-                        .with_request_id(metadata.request_id)
-                })
-            })
-            .await;
-
-        observability::request_finished(start.elapsed(), &result);
-        result
+        let path = ["files", file_id, "content"];
+        let call = Call {
+            mode: ResponseMode::Streaming,
+            ..Call::new("download_file", Method::GET, &path)
+        };
+        self.execute(call, Self::read_bytes).await
     }
 
     /// Delete a file.
-    #[tracing::instrument(name = "topcoat_si.request", target = "topcoat_si::client", skip_all, fields(
-        operation = "delete_file",
-        otel.kind = "client", gen_ai.request.model = field::Empty, stream = false,
-        request_id = field::Empty, http.status_code = field::Empty, attempts = field::Empty,
-        input_tokens = field::Empty, output_tokens = field::Empty, otel.status_code = field::Empty
-    ))]
     pub async fn delete_file(&self, file_id: &str) -> Result<DeletedFile> {
-        let start = Instant::now();
-        let result = self
-            .retry_with_backoff(Method::DELETE, || async {
-                let url = self.build_url(&format!("files/{file_id}"));
-                self.execute_delete_request(&url, None).await
-            })
-            .await;
+        let path = ["files", file_id];
+        let call = Call::new("delete_file", Method::DELETE, &path);
+        self.execute(call, Self::decode_response).await
+    }
+}
 
-        observability::request_finished(start.elapsed(), &result);
-        result
+/// One API call for [`Anthropic::execute`]: what to send and how its span is labelled.
+struct Call<'a> {
+    /// The span's `operation` field: the name of the public method.
+    operation: &'static str,
+    /// The span's `gen_ai.request.model` field.
+    model: Option<&'a Model>,
+    /// The span's `stream` field.
+    stream: bool,
+    method: Method,
+    /// Path segments after `/v1`, each percent-encoded on its own.
+    path: &'a [&'a str],
+    /// The encoded query string.
+    query: Option<String>,
+    body: Option<Bytes>,
+    /// Replaces the default `application/json` content type.
+    content_type: Option<String>,
+    /// Replaces the default `application/json` accept type.
+    accept: Option<&'static str>,
+    mode: ResponseMode,
+    /// The request's own betas; the client's defaults go first.
+    betas: Vec<String>,
+    /// Betas implied by the features the request uses.
+    auto_betas: Vec<&'static str>,
+    /// A failure found before sending, reported like any other failure.
+    check: Result<()>,
+}
+
+impl<'a> Call<'a> {
+    fn new(operation: &'static str, method: Method, path: &'a [&'a str]) -> Self {
+        Self {
+            operation,
+            model: None,
+            stream: false,
+            method,
+            path,
+            query: None,
+            body: None,
+            content_type: None,
+            accept: None,
+            mode: ResponseMode::Buffered,
+            betas: Vec::new(),
+            auto_betas: Vec::new(),
+            check: Ok(()),
+        }
+    }
+
+    /// A Messages request for `params`.
+    fn message(operation: &'static str, params: &'a MessageCreateParams) -> Self {
+        Self {
+            model: Some(&params.model),
+            betas: params.betas.clone().unwrap_or_default(),
+            auto_betas: message_betas(params),
+            check: params.validate(),
+            ..Self::new(operation, Method::POST, &["messages"])
+        }
+        .with_json(params)
+    }
+
+    /// Sends `body` as JSON. A body that cannot be serialized fails the call.
+    fn with_json(self, body: &impl serde::Serialize) -> Self {
+        match serde_json::to_vec(body) {
+            Ok(bytes) => Self {
+                body: Some(Bytes::from(bytes)),
+                ..self
+            },
+            Err(error) => self.and_check(Err(Error::validation(
+                "Failed to serialize the request body",
+                None,
+            )
+            .with_source(error))),
+        }
+    }
+
+    /// Fails the call with `check`'s error, unless an earlier check already failed it.
+    fn and_check(mut self, check: Result<()>) -> Self {
+        if self.check.is_ok() {
+            self.check = check;
+        }
+        self
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Canned, record_targets, serve, uses_proxies};
+    use crate::test_support::{
+        Canned, Recorded, read_request, record_targets, serve, uses_proxies,
+    };
     use crate::{
         KnownModel, McpToolset, MessageBatchCreateParams, MessageBatchCreateRequest,
         MessageBatchListParams, MessageBatchResultVariant, MessageParam, Model, TaskBudget,
+        ThinkingConfig, ThinkingDisplay,
     };
     use futures::StreamExt;
     use serde_json::Value;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
     use tokio::runtime::Builder;
 
-    fn request_headers_end(buffer: &[u8]) -> Option<usize> {
-        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+    /// The request line of a recorded request, such as `GET /v1/models HTTP/1.1`.
+    fn request_line(recorded: &Recorded) -> &str {
+        recorded.headers.lines().next().unwrap()
     }
 
-    async fn read_http_request_bytes(socket: &mut TcpStream) -> Vec<u8> {
-        let mut buffer = Vec::new();
-        let mut chunk = [0_u8; 1024];
-        loop {
-            let read = socket.read(&mut chunk).await.unwrap();
-            assert!(
-                read > 0,
-                "client closed the connection before sending headers"
-            );
-            buffer.extend_from_slice(&chunk[..read]);
-            if request_headers_end(&buffer).is_some() {
-                break;
-            }
-        }
-
-        let headers_end = request_headers_end(&buffer).unwrap();
-        let headers = String::from_utf8_lossy(&buffer[..headers_end]);
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let mut parts = line.splitn(2, ':');
-                let name = parts.next()?.trim();
-                let value = parts.next()?.trim();
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or(0);
-
-        while buffer.len() - (headers_end + 4) < content_length {
-            let read = socket.read(&mut chunk).await.unwrap();
-            assert!(
-                read > 0,
-                "client closed the connection before sending the full body"
-            );
-            buffer.extend_from_slice(&chunk[..read]);
-        }
-        buffer
-    }
-
-    async fn read_http_request(socket: &mut TcpStream) {
-        read_http_request_bytes(socket).await;
-    }
-
-    fn split_http_request(request: &[u8]) -> (String, String) {
-        let headers_end = request_headers_end(request).unwrap();
-        let headers = String::from_utf8_lossy(&request[..headers_end]).to_string();
-        let body = String::from_utf8_lossy(&request[headers_end + 4..]).to_string();
-        (headers, body)
-    }
-
-    fn request_target(headers: &str) -> &str {
-        headers
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap()
-    }
-
-    fn request_method(headers: &str) -> &str {
-        headers
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().next())
-            .unwrap()
-    }
-
-    fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
-        headers.lines().find_map(|line| {
-            let mut parts = line.splitn(2, ':');
-            let header_name = parts.next()?.trim();
-            let value = parts.next()?.trim();
-            header_name.eq_ignore_ascii_case(name).then_some(value)
+    /// The value of the header `name` in a recorded request.
+    fn header<'a>(recorded: &'a Recorded, name: &str) -> Option<&'a str> {
+        recorded.headers.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
         })
-    }
-
-    async fn write_json_response(socket: &mut TcpStream, body: &str) {
-        let response = format!(
-            "HTTP/1.1 200 OK\r\n\
-Content-Type: application/json\r\n\
-Content-Length: {}\r\n\
-Connection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        socket.write_all(response.as_bytes()).await.unwrap();
-        socket.shutdown().await.unwrap();
-    }
-
-    async fn start_test_server<F, Fut>(handler: F) -> String
-    where
-        F: FnOnce(TcpStream) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            socket.set_nodelay(true).unwrap();
-            handler(socket).await;
-        });
-        format!("http://{}", address)
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn retry_logic_with_backoff() {
-        let client = Anthropic {
-            api_key: "test".to_string(),
-            client: ReqwestClient::new(),
-            stream_client: ReqwestClient::new(),
-            base_url: "http://localhost".to_string(),
-            timeout: Duration::from_secs(1),
-            max_retries: 2,
-            cached_headers: HeaderMap::new(),
-            default_betas: Vec::new(),
-            last_rate_limits: Arc::new(Mutex::new(None)),
-        };
-
-        let attempt_counter = Arc::new(AtomicUsize::new(0));
-        let counter_clone = attempt_counter.clone();
-
-        let result = client
-            .retry_with_backoff(Method::POST, || {
-                let counter = counter_clone.clone();
-                async move {
-                    let attempt = counter.fetch_add(1, Ordering::SeqCst);
-                    match attempt {
-                        0 | 1 => Err(Error::api(
-                            Service::Anthropic,
-                            Some(429),
-                            None,
-                            "Rate limited",
-                            Some(Duration::from_secs(1)),
-                        )),
-                        _ => Ok("success".to_string()),
-                    }
-                }
-            })
-            .await;
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "success");
-        assert_eq!(attempt_counter.load(Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test]
-    async fn retry_logic_with_non_retryable_error() {
-        let client = Anthropic {
-            api_key: "test".to_string(),
-            client: ReqwestClient::new(),
-            stream_client: ReqwestClient::new(),
-            base_url: "http://localhost".to_string(),
-            timeout: Duration::from_secs(1),
-            max_retries: 2,
-            cached_headers: HeaderMap::new(),
-            default_betas: Vec::new(),
-            last_rate_limits: Arc::new(Mutex::new(None)),
-        };
-
-        let attempt_counter = Arc::new(AtomicUsize::new(0));
-        let counter_clone = attempt_counter.clone();
-
-        let result: Result<String> = client
-            .retry_with_backoff(Method::POST, || {
-                let counter = counter_clone.clone();
-                async move {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::api(
-                        Service::Anthropic,
-                        Some(401),
-                        None,
-                        "Invalid API key",
-                        None,
-                    ))
-                }
-            })
-            .await;
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().status(), Some(401));
-        // Should only attempt once since authentication errors are not retryable
-        assert_eq!(attempt_counter.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn retry_logic_max_retries_exceeded() {
-        let client = Anthropic {
-            api_key: "test".to_string(),
-            client: ReqwestClient::new(),
-            stream_client: ReqwestClient::new(),
-            base_url: "http://localhost".to_string(),
-            timeout: Duration::from_secs(1),
-            max_retries: 2,
-            cached_headers: HeaderMap::new(),
-            default_betas: Vec::new(),
-            last_rate_limits: Arc::new(Mutex::new(None)),
-        };
-
-        let attempt_counter = Arc::new(AtomicUsize::new(0));
-        let counter_clone = attempt_counter.clone();
-
-        let result: Result<String> = client
-            .retry_with_backoff(Method::POST, || {
-                let counter = counter_clone.clone();
-                async move {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::api(
-                        Service::Anthropic,
-                        Some(429),
-                        None,
-                        "Always rate limited",
-                        Some(Duration::from_secs(1)),
-                    ))
-                }
-            })
-            .await;
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().status(), Some(429));
-        // Should attempt max_retries + 1 times (3 total: initial + 2 retries)
-        assert_eq!(attempt_counter.load(Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn error_529_is_retryable() {
-        // Test that 529 errors are properly mapped to rate_limit and are retryable
-        let client = Anthropic {
-            api_key: "test".to_string(),
-            client: ReqwestClient::new(),
-            stream_client: ReqwestClient::new(),
-            base_url: "http://localhost".to_string(),
-            timeout: Duration::from_secs(1),
-            max_retries: 2,
-            cached_headers: HeaderMap::new(),
-            default_betas: Vec::new(),
-            last_rate_limits: Arc::new(Mutex::new(None)),
-        };
-
-        let attempt_counter = Arc::new(AtomicUsize::new(0));
-        let counter_clone = attempt_counter.clone();
-
-        let result = client
-            .retry_with_backoff(Method::POST, || {
-                let counter = counter_clone.clone();
-                async move {
-                    let attempt = counter.fetch_add(1, Ordering::SeqCst);
-                    match attempt {
-                        0 | 1 => {
-                            // Simulate a 529 overloaded error
-                            Err(Error::api(
-                                Service::Anthropic,
-                                Some(529),
-                                Some(ErrorType::OverloadedError),
-                                "Overloaded",
-                                None,
-                            ))
-                        }
-                        _ => Ok("success".to_string()),
-                    }
-                }
-            })
-            .await;
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "success");
-        // Should retry: initial attempt + 2 retries = 3 total
-        assert_eq!(attempt_counter.load(Ordering::SeqCst), 3);
-    }
-
-    #[test]
-    fn error_529_mapped_correctly() {
-        // Test that a 529 API error is correctly identified as retryable
-        let error = Error::api(
-            Service::Anthropic,
-            Some(529),
-            Some(ErrorType::OverloadedError),
-            "Overloaded",
-            None,
-        );
-        assert!(error.is_retryable());
-
-        // Test that rate_limit error (which 529 now maps to) is also retryable
-        let rate_limit_error = Error::api(
-            Service::Anthropic,
-            Some(429),
-            None,
-            "Overloaded",
-            Some(Duration::from_secs(5)),
-        );
-        assert!(rate_limit_error.is_retryable());
     }
 
     #[test]
@@ -2172,33 +1546,22 @@ Connection: close\r\n\r\n{}",
     }
 
     #[test]
-    fn client_builder_methods() {
-        let client = Anthropic::try_new(Some("test_key".to_string())).unwrap();
-
-        // Test builder pattern methods
-        let configured_client = client
-            .with_base_url("https://custom.api.com".to_string())
-            .unwrap()
-            .with_max_retries(5);
-
-        assert_eq!(configured_client.base_url, "https://custom.api.com");
-        assert_eq!(configured_client.max_retries, 5);
-    }
-
-    #[test]
     fn build_url_default_base() {
         let client = Anthropic::try_new(Some("test_key".to_string())).unwrap();
         // Default base URL: https://api.anthropic.com
         assert_eq!(
-            client.build_url("messages"),
+            client.build_url(&["messages"]).unwrap().as_str(),
             "https://api.anthropic.com/v1/messages"
         );
         assert_eq!(
-            client.build_url("messages/count_tokens"),
+            client
+                .build_url(&["messages", "count_tokens"])
+                .unwrap()
+                .as_str(),
             "https://api.anthropic.com/v1/messages/count_tokens"
         );
         assert_eq!(
-            client.build_url("models"),
+            client.build_url(&["models"]).unwrap().as_str(),
             "https://api.anthropic.com/v1/models"
         );
     }
@@ -2210,7 +1573,7 @@ Connection: close\r\n\r\n{}",
             .with_base_url("https://api.minimax.io/anthropic".to_string())
             .unwrap();
         assert_eq!(
-            client.build_url("messages"),
+            client.build_url(&["messages"]).unwrap().as_str(),
             "https://api.minimax.io/anthropic/v1/messages"
         );
     }
@@ -2222,7 +1585,7 @@ Connection: close\r\n\r\n{}",
             .with_base_url("https://api.minimax.io/anthropic/".to_string())
             .unwrap();
         assert_eq!(
-            client.build_url("messages"),
+            client.build_url(&["messages"]).unwrap().as_str(),
             "https://api.minimax.io/anthropic/v1/messages"
         );
     }
@@ -2298,7 +1661,7 @@ Connection: close\r\n\r\n{}",
                 .with_base_url(base_url.to_string())
                 .unwrap();
             assert_eq!(
-                client.build_url("messages"),
+                client.build_url(&["messages"]).unwrap().as_str(),
                 "https://gateway.example.com/anthropic/v1/messages",
                 "{base_url}"
             );
@@ -2312,104 +1675,33 @@ Connection: close\r\n\r\n{}",
             .with_base_url("https://api.minimaxi.com/anthropic".to_string())
             .unwrap();
         assert_eq!(
-            client.build_url("messages"),
+            client.build_url(&["messages"]).unwrap().as_str(),
             "https://api.minimaxi.com/anthropic/v1/messages"
         );
         assert_eq!(
-            client.build_url(&format!("models/{}", "claude-3-opus")),
+            client
+                .build_url(&["models", "claude-3-opus"])
+                .unwrap()
+                .as_str(),
             "https://api.minimaxi.com/anthropic/v1/models/claude-3-opus"
         );
-    }
-
-    #[test]
-    fn client_timeout_configuration() {
-        let client = Anthropic::try_new(Some("test_key".to_string())).unwrap();
-        let timeout = Duration::from_secs(30);
-
-        let configured_client = client.with_timeout(timeout).unwrap();
-        assert_eq!(configured_client.timeout, timeout);
     }
 
     #[test]
     fn default_headers_carry_key_version_and_content_type() {
         let client = Anthropic::try_new(Some("test_key".to_string())).unwrap();
 
-        let headers1 = client.default_headers();
-        let headers2 = client.default_headers();
+        let headers = client.default_headers();
 
-        assert_eq!(headers1.len(), headers2.len());
-        assert!(headers1.contains_key("x-api-key"));
-        assert_eq!(headers1["anthropic-version"], "2026-10-21");
-        assert!(headers1.contains_key("content-type"));
-    }
-
-    #[test]
-    fn new_client_uses_default_timeout() {
-        let client = Anthropic::try_new(Some("test_key".to_string())).unwrap();
-        assert_eq!(client.timeout, DEFAULT_TIMEOUT);
-    }
-
-    #[tokio::test]
-    async fn concurrent_retry_safety() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::spawn;
-
-        let client = Anthropic {
-            api_key: "test".to_string(),
-            client: ReqwestClient::new(),
-            stream_client: ReqwestClient::new(),
-            base_url: "http://localhost".to_string(),
-            timeout: Duration::from_secs(1),
-            max_retries: 1,
-            cached_headers: HeaderMap::new(),
-            default_betas: Vec::new(),
-            last_rate_limits: Arc::new(Mutex::new(None)),
-        };
-
-        let attempt_counter = Arc::new(AtomicUsize::new(0));
-        let mut handles = vec![];
-
-        // Spawn multiple concurrent retry operations
-        for _ in 0..3 {
-            let client_clone = client.clone();
-            let counter_clone = attempt_counter.clone();
-
-            let handle = spawn(async move {
-                client_clone
-                    .retry_with_backoff(Method::POST, || {
-                        let counter = counter_clone.clone();
-                        async move {
-                            counter.fetch_add(1, Ordering::SeqCst);
-                            Ok::<String, Error>("success".to_string())
-                        }
-                    })
-                    .await
-            });
-            handles.push(handle);
-        }
-
-        // Wait for all operations to complete
-        for handle in handles {
-            let result = handle.await.unwrap();
-            assert!(result.is_ok());
-        }
-
-        // Verify all operations executed
-        assert_eq!(attempt_counter.load(Ordering::SeqCst), 3);
+        assert!(headers.contains_key("x-api-key"));
+        assert_eq!(headers["anthropic-version"], "2026-10-21");
+        assert!(headers.contains_key("content-type"));
     }
 
     fn test_client() -> Anthropic {
-        Anthropic {
-            api_key: "test".to_string(),
-            client: ReqwestClient::new(),
-            stream_client: ReqwestClient::new(),
-            base_url: "http://localhost".to_string(),
-            timeout: Duration::from_secs(1),
-            max_retries: 0,
-            cached_headers: HeaderMap::new(),
-            default_betas: Vec::new(),
-            last_rate_limits: Arc::new(Mutex::new(None)),
-        }
+        Anthropic::try_new(Some("test".to_string()))
+            .unwrap()
+            .with_max_retries(0)
     }
 
     fn sample_create_params() -> MessageCreateParams {
@@ -2417,47 +1709,47 @@ Connection: close\r\n\r\n{}",
     }
 
     #[test]
-    fn create_params_betas_none_by_default() {
-        assert!(create_params_betas(&sample_create_params()).is_empty());
+    fn message_betas_none_by_default() {
+        assert!(message_betas(&sample_create_params()).is_empty());
     }
 
     #[test]
-    fn create_params_betas_context_management() {
+    fn message_betas_context_management() {
         use crate::types::ContextEdit;
         let params = sample_create_params()
             .with_context_management(ContextManagement::new(vec![ContextEdit::clear_tool_uses()]));
-        assert_eq!(create_params_betas(&params), vec![CONTEXT_MANAGEMENT_BETA]);
+        assert_eq!(message_betas(&params), vec![CONTEXT_MANAGEMENT_BETA]);
     }
 
     #[test]
-    fn create_params_betas_compact_edit_adds_both() {
+    fn message_betas_compact_edit_adds_both() {
         use crate::types::ContextEdit;
         let params = sample_create_params()
             .with_context_management(ContextManagement::new(vec![ContextEdit::compact()]));
         assert_eq!(
-            create_params_betas(&params),
+            message_betas(&params),
             vec![CONTEXT_MANAGEMENT_BETA, COMPACT_EDIT_BETA]
         );
     }
 
     #[test]
-    fn create_params_betas_compaction() {
+    fn message_betas_compaction() {
         let params = sample_create_params().with_compaction(CompactionRequest::new());
-        assert_eq!(create_params_betas(&params), vec![COMPACTION_BETA]);
+        assert_eq!(message_betas(&params), vec![COMPACTION_BETA]);
     }
 
     #[test]
-    fn create_params_betas_mcp_servers() {
+    fn message_betas_mcp_servers() {
         let params = sample_create_params()
             .with_mcp_servers(vec![McpServer::new("a", "https://mcp.example.com")]);
-        assert_eq!(create_params_betas(&params), vec![MCP_CLIENT_BETA]);
+        assert_eq!(message_betas(&params), vec![MCP_CLIENT_BETA]);
     }
 
     #[test]
-    fn create_params_betas_task_budget() {
+    fn message_betas_task_budget() {
         let params = sample_create_params()
             .with_output_config(OutputConfig::new().with_task_budget(TaskBudget::new(64_000)));
-        assert_eq!(create_params_betas(&params), vec![TASK_BUDGETS_BETA]);
+        assert_eq!(message_betas(&params), vec![TASK_BUDGETS_BETA]);
     }
 
     #[test]
@@ -2473,11 +1765,11 @@ Connection: close\r\n\r\n{}",
                 serde_json::json!({"type": "object", "additionalProperties": false}),
             )))
             .with_tools(vec![ToolUnionParam::CustomTool(tool)]);
-        assert!(create_params_betas(&params).is_empty());
+        assert!(message_betas(&params).is_empty());
     }
 
     #[test]
-    fn count_params_betas_mirror_create_params() {
+    fn count_tokens_feature_betas_mirror_create_params() {
         use crate::types::{ContextEdit, MessageParam};
         let params = MessageCountTokensParams::new(
             vec![MessageParam::user("Hi")],
@@ -2487,7 +1779,13 @@ Connection: close\r\n\r\n{}",
         .with_mcp_servers(vec![McpServer::new("a", "https://mcp.example.com")])
         .with_output_config(OutputConfig::new().with_task_budget(TaskBudget::new(20_000)));
         assert_eq!(
-            count_params_betas(&params),
+            feature_betas(
+                params.context_management.as_ref(),
+                None,
+                params.mcp_servers.as_deref(),
+                params.tools.as_deref(),
+                params.output_config.as_ref(),
+            ),
             vec![
                 CONTEXT_MANAGEMENT_BETA,
                 COMPACT_EDIT_BETA,
@@ -2559,15 +1857,8 @@ Connection: close\r\n\r\n{}",
         );
     }
 
-    #[test]
-    fn with_default_betas_builder() {
-        let client = test_client().with_default_betas(["a", "b", "c"]);
-        assert_eq!(client.default_betas, vec!["a", "b", "c"]);
-    }
-
-    #[tokio::test]
-    async fn create_message_batch_posts_expected_body_and_betas() {
-        let response_body = r#"{
+    fn in_progress_batch_json() -> &'static str {
+        r#"{
             "id": "msgbatch_123",
             "type": "message_batch",
             "processing_status": "in_progress",
@@ -2583,33 +1874,12 @@ Connection: close\r\n\r\n{}",
             "expires_at": "2024-09-25T18:37:24Z",
             "cancel_initiated_at": null,
             "results_url": null
-        }"#;
+        }"#
+    }
 
-        let base_url = start_test_server(move |mut socket| async move {
-            let request = read_http_request_bytes(&mut socket).await;
-            let (headers, body) = split_http_request(&request);
-            assert_eq!(request_method(&headers), "POST");
-            assert_eq!(request_target(&headers), "/v1/messages/batches");
-            assert_eq!(
-                header_value(&headers, "anthropic-beta"),
-                Some("default-beta, batch-beta, request-beta")
-            );
-
-            let body_json: Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(body_json["requests"][0]["custom_id"], "request-1");
-            assert_eq!(
-                body_json["requests"][0]["params"]["model"],
-                "claude-haiku-5-5"
-            );
-            assert!(
-                body_json["requests"][0]["params"].get("stream").is_none(),
-                "stream must not be serialized inside batch params"
-            );
-            assert!(body_json.get("betas").is_none());
-
-            write_json_response(&mut socket, response_body).await;
-        })
-        .await;
+    #[tokio::test]
+    async fn create_message_batch_posts_expected_body_and_betas() {
+        let (base_url, recorded) = serve(vec![Canned::json(200, in_progress_batch_json())]).await;
 
         let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
@@ -2630,6 +1900,55 @@ Connection: close\r\n\r\n{}",
 
         let batch = client.create_message_batch(params).await.unwrap();
         assert_eq!(batch.id, "msgbatch_123");
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(
+            request_line(&requests[0]),
+            "POST /v1/messages/batches HTTP/1.1"
+        );
+        assert_eq!(
+            header(&requests[0], "anthropic-beta"),
+            Some("default-beta, batch-beta, request-beta")
+        );
+        let body_json: Value = serde_json::from_str(&requests[0].body).unwrap();
+        assert_eq!(body_json["requests"][0]["custom_id"], "request-1");
+        assert_eq!(
+            body_json["requests"][0]["params"]["model"],
+            "claude-haiku-5-5"
+        );
+        assert!(
+            body_json["requests"][0]["params"].get("stream").is_none(),
+            "stream must not be serialized inside batch params"
+        );
+        assert!(body_json.get("betas").is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_requests_carry_the_betas_their_features_need() {
+        let (base_url, recorded) = serve(vec![Canned::json(200, in_progress_batch_json())]).await;
+        let request = MessageCreateParams::new(
+            16,
+            vec![MessageParam::user("ping")],
+            Model::Known(KnownModel::ClaudeSonnet55),
+        )
+        .with_fallback(KnownModel::ClaudeHaiku55)
+        .with_fallback_credit_token("credit")
+        .with_thinking(ThinkingConfig::adaptive().with_display(ThinkingDisplay::Updates));
+        let params =
+            MessageBatchCreateParams::new(vec![MessageBatchCreateRequest::new("r", request)]);
+
+        files_client(base_url)
+            .create_message_batch(params)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            header(&recorded.lock().unwrap()[0], "anthropic-beta"),
+            Some(
+                "server-side-fallback-2026-07-01, fallback-credit-2026-07-01, \
+                 thinking-display-updates-2026-08-18"
+            )
+        );
     }
 
     #[tokio::test]
@@ -2651,19 +1970,7 @@ Connection: close\r\n\r\n{}",
             "cancel_initiated_at": null,
             "results_url": "https://api.anthropic.com/results"
         }"#;
-
-        let base_url = start_test_server(move |mut socket| async move {
-            let request = read_http_request_bytes(&mut socket).await;
-            let (headers, body) = split_http_request(&request);
-            assert_eq!(request_method(&headers), "GET");
-            assert_eq!(
-                request_target(&headers),
-                "/v1/messages/batches/msgbatch_123"
-            );
-            assert!(body.is_empty());
-            write_json_response(&mut socket, response_body).await;
-        })
-        .await;
+        let (base_url, recorded) = serve(vec![Canned::json(200, response_body)]).await;
 
         let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
@@ -2672,6 +1979,13 @@ Connection: close\r\n\r\n{}",
         let batch = client.get_message_batch("msgbatch_123").await.unwrap();
         assert_eq!(batch.id, "msgbatch_123");
         assert_eq!(batch.request_counts.succeeded, 1);
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(
+            request_line(&requests[0]),
+            "GET /v1/messages/batches/msgbatch_123 HTTP/1.1"
+        );
+        assert!(requests[0].body.is_empty());
     }
 
     #[tokio::test]
@@ -2682,20 +1996,7 @@ Connection: close\r\n\r\n{}",
             "first_id": null,
             "last_id": null
         }"#;
-
-        let base_url = start_test_server(move |mut socket| async move {
-            let request = read_http_request_bytes(&mut socket).await;
-            let (headers, body) = split_http_request(&request);
-            assert_eq!(request_method(&headers), "GET");
-            assert_eq!(
-                request_target(&headers),
-                "/v1/messages/batches?after_id=msgbatch_a&limit=20"
-            );
-            assert_eq!(header_value(&headers, "anthropic-beta"), Some("list-beta"));
-            assert!(body.is_empty());
-            write_json_response(&mut socket, response_body).await;
-        })
-        .await;
+        let (base_url, recorded) = serve(vec![Canned::json(200, response_body)]).await;
 
         let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
@@ -2708,28 +2009,26 @@ Connection: close\r\n\r\n{}",
         let page = client.list_message_batches(Some(params)).await.unwrap();
         assert!(page.data.is_empty());
         assert!(!page.has_more);
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(
+            request_line(&requests[0]),
+            "GET /v1/messages/batches?after_id=msgbatch_a&limit=20 HTTP/1.1"
+        );
+        assert_eq!(header(&requests[0], "anthropic-beta"), Some("list-beta"));
+        assert!(requests[0].body.is_empty());
     }
 
     #[tokio::test]
     async fn last_rate_limits_reflects_response_headers() {
         let body = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
-        let base_url = start_test_server(move |mut socket| async move {
-            let _ = read_http_request_bytes(&mut socket).await;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-Content-Type: application/json\r\n\
-anthropic-ratelimit-requests-limit: 50\r\n\
-anthropic-ratelimit-requests-remaining: 49\r\n\
-anthropic-ratelimit-requests-reset: 2026-10-19T12:00:00Z\r\n\
-request-id: req_abc\r\n\
-Content-Length: {}\r\n\
-Connection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            socket.shutdown().await.unwrap();
-        })
+        let (base_url, _) = serve(vec![
+            Canned::json(200, body)
+                .with_header("anthropic-ratelimit-requests-limit", "50")
+                .with_header("anthropic-ratelimit-requests-remaining", "49")
+                .with_header("anthropic-ratelimit-requests-reset", "2026-10-19T12:00:00Z")
+                .with_header("request-id", "req_abc"),
+        ])
         .await;
 
         let client = Anthropic::try_new(Some("test_key".to_string()))
@@ -2751,42 +2050,17 @@ Connection: close\r\n\r\n{}",
     #[tokio::test]
     async fn response_without_rate_limit_headers_keeps_last_rate_limits() {
         let body = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
-        let with_headers = start_test_server(move |mut socket| async move {
-            let _ = read_http_request_bytes(&mut socket).await;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-Content-Type: application/json\r\n\
-anthropic-ratelimit-requests-limit: 50\r\n\
-anthropic-ratelimit-requests-remaining: 49\r\n\
-request-id: req_abc\r\n\
-Content-Length: {}\r\n\
-Connection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            socket.shutdown().await.unwrap();
-        })
+        let (with_headers, _) = serve(vec![
+            Canned::json(200, body)
+                .with_header("anthropic-ratelimit-requests-limit", "50")
+                .with_header("anthropic-ratelimit-requests-remaining", "49")
+                .with_header("request-id", "req_abc"),
+        ])
         .await;
-        let without_headers = start_test_server(move |mut socket| async move {
-            let _ = read_http_request_bytes(&mut socket).await;
-            write_json_response(&mut socket, body).await;
-        })
-        .await;
-        let fast_only = start_test_server(move |mut socket| async move {
-            let _ = read_http_request_bytes(&mut socket).await;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-Content-Type: application/json\r\n\
-anthropic-fast-input-tokens-limit: 1000\r\n\
-Content-Length: {}\r\n\
-Connection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            socket.shutdown().await.unwrap();
-        })
+        let (without_headers, _) = serve(vec![Canned::json(200, body)]).await;
+        let (fast_only, _) = serve(vec![
+            Canned::json(200, body).with_header("anthropic-fast-input-tokens-limit", "1000"),
+        ])
         .await;
 
         let client = Anthropic::try_new(Some("test_key".to_string()))
@@ -2832,19 +2106,7 @@ Connection: close\r\n\r\n{}",
             "cancel_initiated_at": "2024-09-24T18:39:03Z",
             "results_url": null
         }"#;
-
-        let base_url = start_test_server(move |mut socket| async move {
-            let request = read_http_request_bytes(&mut socket).await;
-            let (headers, body) = split_http_request(&request);
-            assert_eq!(request_method(&headers), "POST");
-            assert_eq!(
-                request_target(&headers),
-                "/v1/messages/batches/msgbatch_123/cancel"
-            );
-            assert!(body.is_empty());
-            write_json_response(&mut socket, response_body).await;
-        })
-        .await;
+        let (base_url, recorded) = serve(vec![Canned::json(200, response_body)]).await;
 
         let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
@@ -2852,6 +2114,13 @@ Connection: close\r\n\r\n{}",
             .unwrap();
         let batch = client.cancel_message_batch("msgbatch_123").await.unwrap();
         assert_eq!(batch.id, "msgbatch_123");
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(
+            request_line(&requests[0]),
+            "POST /v1/messages/batches/msgbatch_123/cancel HTTP/1.1"
+        );
+        assert!(requests[0].body.is_empty());
     }
 
     #[tokio::test]
@@ -2860,19 +2129,7 @@ Connection: close\r\n\r\n{}",
             "id": "msgbatch_123",
             "type": "message_batch_deleted"
         }"#;
-
-        let base_url = start_test_server(move |mut socket| async move {
-            let request = read_http_request_bytes(&mut socket).await;
-            let (headers, body) = split_http_request(&request);
-            assert_eq!(request_method(&headers), "DELETE");
-            assert_eq!(
-                request_target(&headers),
-                "/v1/messages/batches/msgbatch_123"
-            );
-            assert!(body.is_empty());
-            write_json_response(&mut socket, response_body).await;
-        })
-        .await;
+        let (base_url, recorded) = serve(vec![Canned::json(200, response_body)]).await;
 
         let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
@@ -2883,6 +2140,13 @@ Connection: close\r\n\r\n{}",
             serde_json::to_value(&deleted).unwrap()["type"],
             "message_batch_deleted"
         );
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(
+            request_line(&requests[0]),
+            "DELETE /v1/messages/batches/msgbatch_123 HTTP/1.1"
+        );
+        assert!(requests[0].body.is_empty());
     }
 
     #[tokio::test]
@@ -2910,36 +2174,9 @@ Connection: close\r\n\r\n{}",
             "\n",
             r#"{"custom_id":"first","result":{"type":"succeeded","message":{"id":"msg_123","type":"message","role":"assistant","model":"claude-haiku-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}}"#
         );
-
-        let base_url = start_test_server(move |mut socket| async move {
-            let request = read_http_request_bytes(&mut socket).await;
-            let (headers, body) = split_http_request(&request);
-            assert_eq!(request_method(&headers), "GET");
-            assert_eq!(
-                request_target(&headers),
-                "/v1/messages/batches/msgbatch_123/results"
-            );
-            assert!(body.is_empty());
-
-            let response_headers = format!(
-                "HTTP/1.1 200 OK\r\n\
-Content-Type: application/jsonl\r\n\
-Content-Length: {}\r\n\
-Connection: close\r\n\r\n",
-                results_body.len()
-            );
-            socket.write_all(response_headers.as_bytes()).await.unwrap();
-            let split_at = results_body.find('\n').unwrap() + 1;
-            socket
-                .write_all(&results_body.as_bytes()[..split_at])
-                .await
-                .unwrap();
-            socket
-                .write_all(&results_body.as_bytes()[split_at..])
-                .await
-                .unwrap();
-            socket.shutdown().await.unwrap();
-        })
+        let (base_url, recorded) = serve(vec![
+            Canned::json(200, results_body).with_content_type("application/jsonl"),
+        ])
         .await;
 
         let client = Anthropic::try_new(Some("test_key".to_string()))
@@ -2964,39 +2201,45 @@ Connection: close\r\n\r\n",
         ));
 
         assert!(stream.next().await.is_none());
+        assert_eq!(
+            request_line(&recorded.lock().unwrap()[0]),
+            "GET /v1/messages/batches/msgbatch_123/results HTTP/1.1"
+        );
     }
 
+    /// The event takes longer than the timeout to arrive, but no gap between its 25 chunks comes
+    /// near it: each gap is a 20th of the timeout. (A paused clock does not work here: it jumps to
+    /// the client's timeouts while the loopback server is still answering.)
     #[tokio::test]
     async fn streaming_timeout_is_inactivity_based() {
-        let base_url = start_test_server(|mut socket| async move {
-            read_http_request(&mut socket).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\n\
 Content-Type: text/event-stream\r\n\
 Cache-Control: no-cache\r\n\
-Connection: close\r\n\r\n",
+Connection: close\r\n\r\nevent: ping\n",
                 )
                 .await
                 .unwrap();
-
-            for chunk in [
-                b"event: ping\n".as_slice(),
-                b"data: {}\n".as_slice(),
-                b"\n".as_slice(),
-            ] {
-                socket.write_all(chunk).await.unwrap();
+            for _ in 0..25 {
                 socket.flush().await.unwrap();
-                tokio::time::sleep(Duration::from_millis(40)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                socket.write_all(b": keepalive\n").await.unwrap();
             }
-        })
-        .await;
+            socket.write_all(b"data: {}\n\n").await.unwrap();
+            socket.flush().await.unwrap();
+        });
 
         let client = Anthropic::try_new(Some("test_key".to_string()))
             .unwrap()
             .with_base_url(base_url)
             .unwrap()
-            .with_timeout(Duration::from_millis(75))
+            .with_timeout(Duration::from_millis(400))
             .unwrap();
         let params = MessageCreateParams::new_streaming(
             16,
@@ -3009,25 +2252,16 @@ Connection: close\r\n\r\n",
         assert_eq!(first, MessageStreamEvent::Ping);
     }
 
+    /// A stall far longer than any test run, so only the client's timeout can end it.
+    const ENDLESS_STALL: Duration = Duration::from_secs(3600);
+
     #[tokio::test]
     async fn streaming_stall_reports_timeout_error() {
-        let base_url = start_test_server(|mut socket| async move {
-            read_http_request(&mut socket).await;
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\n\
-Content-Type: text/event-stream\r\n\
-Cache-Control: no-cache\r\n\
-Connection: close\r\n\r\n\
-event: ping\n",
-                )
-                .await
-                .unwrap();
-            socket.flush().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            socket.write_all(b"data: {}\n\n").await.unwrap();
-            socket.flush().await.unwrap();
-        })
+        let (base_url, _) = serve(vec![
+            Canned::json(200, "event: ping\ndata: {}\n\n")
+                .with_content_type("text/event-stream")
+                .with_stall(ENDLESS_STALL),
+        ])
         .await;
 
         let client = Anthropic::try_new(Some("test_key".to_string()))
@@ -3050,28 +2284,9 @@ event: ping\n",
 
     #[tokio::test]
     async fn non_streaming_body_stall_reports_timeout_error() {
-        let base_url = start_test_server(|mut socket| async move {
-            read_http_request(&mut socket).await;
-            let body_prefix = b"{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-haiku-5-5\",\"content\":[{\"type\":\"text\",\"text\":\"hel";
-            let body_suffix = b"lo\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}";
-            let headers = format!(
-                "HTTP/1.1 200 OK\r\n\
-Content-Type: application/json\r\n\
-Content-Length: {}\r\n\
-Connection: close\r\n\r\n",
-                body_prefix.len() + body_suffix.len()
-            );
-            socket
-                .write_all(headers.as_bytes())
-                .await
-                .unwrap();
-            socket.write_all(body_prefix).await.unwrap();
-            socket.flush().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            socket.write_all(body_suffix).await.unwrap();
-            socket.flush().await.unwrap();
-            socket.shutdown().await.unwrap();
-        })
+        let (base_url, _) = serve(vec![
+            Canned::json(200, reply_json()).with_stall(ENDLESS_STALL),
+        ])
         .await;
 
         let client = Anthropic::try_new(Some("test_key".to_string()))
@@ -3103,10 +2318,10 @@ Connection: close\r\n\r\n",
     }
 
     #[test]
-    fn create_params_betas_mcp_toolset() {
+    fn message_betas_mcp_toolset() {
         let params = sample_create_params()
             .with_tools(vec![ToolUnionParam::McpToolset(McpToolset::new("a"))]);
-        assert_eq!(create_params_betas(&params), vec![MCP_CLIENT_BETA]);
+        assert_eq!(message_betas(&params), vec![MCP_CLIENT_BETA]);
     }
 
     #[test]
@@ -3126,30 +2341,7 @@ Connection: close\r\n\r\n",
 
     #[tokio::test]
     async fn upload_file_sends_multipart_body() {
-        let base_url = start_test_server(move |mut socket| async move {
-            let request = read_http_request_bytes(&mut socket).await;
-            let (headers, body) = split_http_request(&request);
-            assert_eq!(request_method(&headers), "POST");
-            assert_eq!(request_target(&headers), "/v1/files");
-            let content_type = header_value(&headers, "content-type").unwrap();
-            let boundary = content_type
-                .strip_prefix("multipart/form-data; boundary=")
-                .expect("multipart content type");
-            assert!(header_value(&headers, "anthropic-beta").is_none());
-            assert_eq!(
-                body,
-                format!(
-                    "--{boundary}\r\n\
-                     Content-Disposition: form-data; name=\"file\"; filename=\"notes.txt\"\r\n\
-                     Content-Type: text/plain\r\n\r\nhello\r\n\
-                     --{boundary}\r\n\
-                     Content-Disposition: form-data; name=\"expires_in_seconds\"\r\n\r\n7200\r\n\
-                     --{boundary}--\r\n"
-                )
-            );
-            write_json_response(&mut socket, file_info_json()).await;
-        })
-        .await;
+        let (base_url, recorded) = serve(vec![Canned::json(200, file_info_json())]).await;
 
         let info = files_client(base_url)
             .upload_file("notes.txt", "text/plain", b"hello", Some(7_200))
@@ -3158,16 +2350,44 @@ Connection: close\r\n\r\n",
         assert_eq!(info.id, "file_01");
         assert_eq!(info.size_bytes, 5);
         assert!(!info.downloadable);
+
+        let requests = recorded.lock().unwrap();
+        assert_eq!(request_line(&requests[0]), "POST /v1/files HTTP/1.1");
+        let boundary = header(&requests[0], "content-type")
+            .unwrap()
+            .strip_prefix("multipart/form-data; boundary=")
+            .expect("multipart content type");
+        assert!(header(&requests[0], "anthropic-beta").is_none());
+        assert_eq!(
+            requests[0].body,
+            format!(
+                "--{boundary}\r\n\
+                 Content-Disposition: form-data; name=\"file\"; filename=\"notes.txt\"\r\n\
+                 Content-Type: text/plain\r\n\r\nhello\r\n\
+                 --{boundary}\r\n\
+                 Content-Disposition: form-data; name=\"expires_in_seconds\"\r\n\r\n7200\r\n\
+                 --{boundary}--\r\n"
+            )
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn upload_file_rejects_bad_expiry_and_line_breaks() {
         let client = test_client();
+        let (guard, targets) = record_targets();
         let too_short = client
             .upload_file("a.txt", "text/plain", &[], Some(60))
             .await
             .unwrap_err();
+        drop(guard);
         assert!(matches!(too_short.kind(), ErrorKind::Validation { .. }));
+        assert!(
+            targets
+                .lock()
+                .unwrap()
+                .contains(&"event topcoat_si::client".to_string()),
+            "a validation failure is reported like any other: {targets:?}"
+        );
         let too_long = client
             .upload_file("a.txt", "text/plain", &[], Some(7_776_001))
             .await
@@ -3182,18 +2402,11 @@ Connection: close\r\n\r\n",
 
     #[tokio::test]
     async fn list_files_sends_query() {
-        let base_url = start_test_server(move |mut socket| async move {
-            let request = read_http_request_bytes(&mut socket).await;
-            let (headers, _) = split_http_request(&request);
-            assert_eq!(request_method(&headers), "GET");
-            assert_eq!(request_target(&headers), "/v1/files?limit=2&page=p2");
-            let body = format!(
-                r#"{{"data":[{}],"has_more":true,"next_page":"p3"}}"#,
-                file_info_json()
-            );
-            write_json_response(&mut socket, &body).await;
-        })
-        .await;
+        let body = format!(
+            r#"{{"data":[{}],"has_more":true,"next_page":"p3"}}"#,
+            file_info_json()
+        );
+        let (base_url, recorded) = serve(vec![Canned::json(200, body)]).await;
 
         let list = files_client(base_url)
             .list_files(Some(FileListParams::new().with_limit(2).with_page("p2")))
@@ -3202,32 +2415,56 @@ Connection: close\r\n\r\n",
         assert_eq!(list.data.len(), 1);
         assert_eq!(list.next_page.as_deref(), Some("p3"));
         assert_eq!(list.has_more, Some(true));
+        assert_eq!(
+            request_line(&recorded.lock().unwrap()[0]),
+            "GET /v1/files?limit=2&page=p2 HTTP/1.1"
+        );
     }
 
     #[tokio::test]
     async fn get_file_uses_file_endpoint() {
-        let base_url = start_test_server(move |mut socket| async move {
-            let request = read_http_request_bytes(&mut socket).await;
-            let (headers, _) = split_http_request(&request);
-            assert_eq!(request_method(&headers), "GET");
-            assert_eq!(request_target(&headers), "/v1/files/file_01");
-            write_json_response(&mut socket, file_info_json()).await;
-        })
-        .await;
+        let (base_url, recorded) = serve(vec![Canned::json(200, file_info_json())]).await;
 
         let info = files_client(base_url).get_file("file_01").await.unwrap();
         assert_eq!(info.filename, "notes.txt");
+        assert_eq!(
+            request_line(&recorded.lock().unwrap()[0]),
+            "GET /v1/files/file_01 HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn ids_stay_one_path_segment() {
+        let (base_url, recorded) = serve(vec![Canned::json(200, file_info_json())]).await;
+
+        files_client(base_url).get_file("../models").await.unwrap();
+        assert_eq!(
+            request_line(&recorded.lock().unwrap()[0]),
+            "GET /v1/files/..%2Fmodels HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_betas_reach_the_file_endpoints() {
+        let (base_url, recorded) = serve(vec![Canned::json(200, file_info_json())]).await;
+
+        files_client(base_url)
+            .with_default_betas(["files-api-2025-04-14"])
+            .get_file("file_01")
+            .await
+            .unwrap();
+        assert_eq!(
+            header(&recorded.lock().unwrap()[0], "anthropic-beta"),
+            Some("files-api-2025-04-14")
+        );
     }
 
     #[tokio::test]
     async fn delete_file_uses_delete_endpoint() {
-        let base_url = start_test_server(move |mut socket| async move {
-            let request = read_http_request_bytes(&mut socket).await;
-            let (headers, _) = split_http_request(&request);
-            assert_eq!(request_method(&headers), "DELETE");
-            assert_eq!(request_target(&headers), "/v1/files/file_01");
-            write_json_response(&mut socket, r#"{"id":"file_01","type":"file_deleted"}"#).await;
-        })
+        let (base_url, recorded) = serve(vec![Canned::json(
+            200,
+            r#"{"id":"file_01","type":"file_deleted"}"#,
+        )])
         .await;
 
         let deleted = files_client(base_url).delete_file("file_01").await.unwrap();
@@ -3236,31 +2473,29 @@ Connection: close\r\n\r\n",
             serde_json::to_value(&deleted).unwrap()["type"],
             "file_deleted"
         );
+        assert_eq!(
+            request_line(&recorded.lock().unwrap()[0]),
+            "DELETE /v1/files/file_01 HTTP/1.1"
+        );
     }
 
     #[tokio::test]
     async fn download_file_returns_raw_bytes() {
-        let base_url = start_test_server(move |mut socket| async move {
-            let request = read_http_request_bytes(&mut socket).await;
-            let (headers, _) = split_http_request(&request);
-            assert_eq!(request_method(&headers), "GET");
-            assert_eq!(request_target(&headers), "/v1/files/file_01/content");
-            let payload: &[u8] = &[0, 159, 146, 150, 255];
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                payload.len()
-            );
-            socket.write_all(head.as_bytes()).await.unwrap();
-            socket.write_all(payload).await.unwrap();
-            socket.shutdown().await.unwrap();
-        })
+        let payload = "\u{0}\u{9f}raw\u{ff}";
+        let (base_url, recorded) = serve(vec![
+            Canned::json(200, payload).with_content_type("application/octet-stream"),
+        ])
         .await;
 
         let bytes = files_client(base_url)
             .download_file("file_01")
             .await
             .unwrap();
-        assert_eq!(bytes.as_ref(), &[0, 159, 146, 150, 255]);
+        assert_eq!(bytes.as_ref(), payload.as_bytes());
+        assert_eq!(
+            request_line(&recorded.lock().unwrap()[0]),
+            "GET /v1/files/file_01/content HTTP/1.1"
+        );
     }
 
     fn send_params() -> MessageCreateParams {
@@ -3540,40 +2775,6 @@ Connection: close\r\n\r\n",
         )
     }
 
-    /// Serves one raw HTTP response per connection, in order, and counts the connections.
-    async fn serve_raw(responses: Vec<String>) -> (String, Arc<AtomicUsize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let connections = Arc::new(AtomicUsize::new(0));
-        let counter = connections.clone();
-        tokio::spawn(async move {
-            for response in responses {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                counter.fetch_add(1, Ordering::SeqCst);
-                read_http_request(&mut socket).await;
-                socket.write_all(response.as_bytes()).await.unwrap();
-                socket.shutdown().await.unwrap();
-            }
-        });
-        (format!("http://{address}"), connections)
-    }
-
-    /// A response that promises 100 bytes of JSON and closes after 7.
-    fn cut_off_response(extra_headers: &str) -> String {
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{extra_headers}\
-             Content-Length: 100\r\nConnection: close\r\n\r\npartial"
-        )
-    }
-
-    fn ok_response(body: &str) -> String {
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-             Connection: close\r\n\r\n{body}",
-            body.len()
-        )
-    }
-
     #[tokio::test]
     async fn stream_items_keep_their_kind_with_or_without_a_request_id() {
         let bad_event = "event: message_start\ndata: nope\n\n";
@@ -3622,35 +2823,28 @@ Connection: close\r\n\r\n",
         assert_eq!(kinds[0], kinds[1]);
     }
 
-    /// Tests at the retry-loop seam, not through `send`: a full `send` would wait out the real
-    /// backoff delay, and a base URL that never answers must be https to pass the base URL rule.
+    /// The base URL must be https to pass the base URL rule and never answer, so the client is
+    /// swapped for one that skips proxies. A retry waits out a backoff of at least half a second
+    /// on the paused clock; one attempt alone takes at most the 100 ms connect timeout.
     #[tokio::test(start_paused = true)]
     async fn connect_timeout_is_retried() {
-        let client = Anthropic {
-            client: ReqwestClient::builder()
-                .connect_timeout(Duration::from_millis(100))
-                .no_proxy()
-                .build()
-                .unwrap(),
-            base_url: "https://192.0.2.1".to_string(),
-            max_retries: 1,
-            ..test_client()
-        };
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let counter = attempts.clone();
-        let url = client.build_url("models/m");
+        let mut client = Anthropic::try_new(Some("test_key".to_string()))
+            .unwrap()
+            .with_base_url("https://192.0.2.1".to_string())
+            .unwrap()
+            .with_max_retries(1);
+        client.client = ReqwestClient::builder()
+            .connect_timeout(Duration::from_millis(100))
+            .no_proxy()
+            .build()
+            .unwrap();
+        let start = tokio::time::Instant::now();
 
-        let result: Result<ModelInfo> = client
-            .retry_with_backoff(Method::GET, || {
-                counter.fetch_add(1, Ordering::SeqCst);
-                client.execute_get_request(&url, None, None)
-            })
-            .await;
+        let error = client.get_model("m").await.unwrap_err();
 
-        let error = result.unwrap_err();
         assert_eq!(error.kind(), &ErrorKind::Connection, "{error}");
         assert!(error.is_retryable());
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(start.elapsed() >= Duration::from_millis(500));
     }
 
     #[tokio::test]
@@ -3770,7 +2964,12 @@ Connection: close\r\n\r\n",
 
     #[tokio::test]
     async fn download_body_failure_carries_the_request_id() {
-        let (base_url, _) = serve_raw(vec![cut_off_response("request-id: req_dl\r\n")]).await;
+        let (base_url, _) = serve(vec![
+            Canned::json(200, "partial")
+                .with_header("request-id", "req_dl")
+                .with_cut_body(),
+        ])
+        .await;
         let error = quiet_client(base_url)
             .download_file("file_01")
             .await
@@ -3779,58 +2978,57 @@ Connection: close\r\n\r\n",
         assert_eq!(error.request_id(), Some("req_dl"));
     }
 
-    #[tokio::test]
-    async fn a_get_whose_body_read_fails_is_resent() {
-        let (base_url, connections) =
-            serve_raw(vec![cut_off_response(""), ok_response(file_info_json())]).await;
-        let info = files_client(base_url).get_file("file_01").await.unwrap();
-        assert_eq!(info.id, "file_01");
-        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    /// A client for tests on the paused clock. Its HTTP clients have no timeouts, which the
+    /// clock would otherwise jump to while the loopback server is still answering.
+    fn untimed_client(base_url: String) -> Anthropic {
+        let mut client = files_client(base_url);
+        let untimed = || ReqwestClient::builder().no_proxy().build().unwrap();
+        client.client = untimed();
+        client.stream_client = untimed();
+        client
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn a_get_whose_body_read_fails_is_resent() {
+        let (base_url, recorded) = serve(vec![
+            Canned::json(200, "partial").with_cut_body(),
+            Canned::json(200, file_info_json()),
+        ])
+        .await;
+        let info = untimed_client(base_url).get_file("file_01").await.unwrap();
+        assert_eq!(info.id, "file_01");
+        assert_eq!(recorded.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_post_closed_before_any_reply_is_resent() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let connections = Arc::new(AtomicUsize::new(0));
-        let counter = connections.clone();
-        tokio::spawn(async move {
-            // The first connection is read, then dropped without a reply.
-            let (mut socket, _) = listener.accept().await.unwrap();
-            counter.fetch_add(1, Ordering::SeqCst);
-            read_http_request(&mut socket).await;
-            drop(socket);
-            let (mut socket, _) = listener.accept().await.unwrap();
-            counter.fetch_add(1, Ordering::SeqCst);
-            read_http_request(&mut socket).await;
-            socket
-                .write_all(ok_response(&reply_json()).as_bytes())
-                .await
-                .unwrap();
-            socket.shutdown().await.unwrap();
-        });
-        let message = files_client(format!("http://{address}"))
-            .send(&send_params())
-            .await
-            .unwrap();
+        let (base_url, recorded) = serve(vec![
+            Canned::json(200, "").closing_unanswered(),
+            Canned::json(200, reply_json()),
+        ])
+        .await;
+        let message = untimed_client(base_url).send(&send_params()).await.unwrap();
         assert_eq!(message.id, "msg_1");
-        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        assert_eq!(recorded.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn a_post_whose_body_read_fails_is_not_resent() {
-        let (base_url, connections) =
-            serve_raw(vec![cut_off_response(""), ok_response("{}")]).await;
+        let (base_url, recorded) = serve(vec![
+            Canned::json(200, "partial").with_cut_body(),
+            Canned::json(200, "{}"),
+        ])
+        .await;
         let error = files_client(base_url)
             .cancel_message_batch("msgbatch_1")
             .await
             .unwrap_err();
         assert_eq!(error.kind(), &ErrorKind::Interrupted, "{error}");
         assert!(error.is_retryable());
-        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        assert_eq!(recorded.lock().unwrap().len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn spend_limit_429_is_not_resent_but_a_plain_429_is() {
         let spend_cap = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Spend limit reached","details":{"error_code":"enforced_spend_limit_reached"}}}"#;
         let (base_url, recorded) = serve(vec![
@@ -3838,7 +3036,7 @@ Connection: close\r\n\r\n",
             Canned::json(200, reply_json()),
         ])
         .await;
-        let error = files_client(base_url)
+        let error = untimed_client(base_url)
             .send(&send_params())
             .await
             .unwrap_err();
@@ -3863,7 +3061,7 @@ Connection: close\r\n\r\n",
             Canned::json(200, reply_json()),
         ])
         .await;
-        let message = files_client(base_url).send(&send_params()).await.unwrap();
+        let message = untimed_client(base_url).send(&send_params()).await.unwrap();
         assert_eq!(message.id, "msg_1");
         assert_eq!(recorded.lock().unwrap().len(), 2);
     }

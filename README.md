@@ -126,7 +126,7 @@ The current models restrict some thinking settings:
 
 ### Streaming
 
-Streaming shows the reply while it is written. `client.stream` returns raw server-sent events. Wrap them in `AccumulatingStream` to print deltas as they arrive and still get the assembled `Message` at the end.
+Streaming shows the reply while it is written. `client.stream` returns raw server-sent events. A stream that ends before `message_stop` yields an `Interrupted` error as its last item. Wrap the events in `AccumulatingStream` to print deltas as they arrive and still get the assembled `Message` at the end; it sends the message only after `message_stop`, and sends the error instead when the stream fails.
 
 ```rust,no_run
 use std::io::Write;

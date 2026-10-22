@@ -226,14 +226,15 @@ pub fn parse_message_stream_event(event: &SseEvent) -> Result<MessageStreamEvent
 /// Process a stream of bytes into decoded Topcoat SI [`MessageStreamEvent`] values.
 ///
 /// An error item carries [`Error::events_delivered`]: the number of events other than pings
-/// yielded before it. `Some(0)` means sending the request again is clean.
+/// yielded before it. `Some(0)` means sending the request again is clean. A stream whose bytes
+/// end before `message_stop` yields an [`ErrorKind::Interrupted`] error last.
 pub fn process_message_stream_sse<S>(
     byte_stream: S,
 ) -> impl Stream<Item = Result<MessageStreamEvent>>
 where
     S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin + 'static,
 {
-    process_sse(byte_stream)
+    let events = process_sse(byte_stream)
         .scan(false, |finished, result| {
             let output = if *finished {
                 None
@@ -251,19 +252,54 @@ where
                 Ok(MessageStreamEvent::Unknown) => None,
                 other => Some(other),
             })
-        })
-        .scan(0_u64, |delivered, result| {
-            futures::future::ready(Some(match result {
-                Ok(event) => {
-                    if !matches!(event, MessageStreamEvent::Ping) {
-                        *delivered += 1;
+        });
+    let state = MessageStreamState {
+        events: Box::pin(events),
+        delivered: 0,
+        stopped: false,
+        finished: false,
+    };
+    stream::unfold(state, |mut state| async move {
+        if state.finished {
+            return None;
+        }
+        let item = match state.events.next().await {
+            Some(Ok(event)) => {
+                match event {
+                    MessageStreamEvent::Ping => {}
+                    MessageStreamEvent::MessageStop(_) => {
+                        state.stopped = true;
+                        state.delivered += 1;
                     }
-                    Ok(event)
+                    _ => state.delivered += 1,
                 }
-                Err(error) => Err(error.with_events_delivered(*delivered)),
-            }))
-        })
-        .fuse()
+                Ok(event)
+            }
+            Some(Err(error)) => {
+                state.finished = true;
+                Err(error.with_events_delivered(state.delivered))
+            }
+            None if state.stopped => return None,
+            None => {
+                state.finished = true;
+                Err(
+                    Error::new(ErrorKind::Interrupted, "stream ended before message_stop")
+                        .with_events_delivered(state.delivered),
+                )
+            }
+        };
+        Some((item, state))
+    })
+    .fuse()
+}
+
+/// The decoded events of a message stream, how many were not pings, and whether `message_stop`
+/// arrived.
+struct MessageStreamState<E> {
+    events: std::pin::Pin<Box<E>>,
+    delivered: u64,
+    stopped: bool,
+    finished: bool,
 }
 
 /// Decode one framed SSE event, counting a stream error only when decoding fails.
@@ -922,10 +958,13 @@ mod tests {
     #[tokio::test]
     async fn comment_only_frames_yield_nothing_in_a_message_stream() {
         let stream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
-            b": keepalive\n\n: another\n\n",
+            b": keepalive\n\n: another\n\nevent: message_stop\ndata: {}\n\n",
         ))]);
         let events: Vec<_> = process_message_stream_sse(stream).collect().await;
-        assert!(events.is_empty(), "{events:?}");
+        assert!(
+            matches!(events[..], [Ok(MessageStreamEvent::MessageStop(_))]),
+            "{events:?}"
+        );
     }
 
     #[tokio::test]
@@ -968,11 +1007,37 @@ mod tests {
     #[tokio::test]
     async fn legal_sse_does_not_end_a_message_stream() {
         let stream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
-            b": keepalive\n\nretry: 5\n\ndata: {}\n\nevent: ping\ndata: {}\n\n",
+            b": keepalive\n\nretry: 5\n\ndata: {}\n\nevent: ping\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
         ))]);
         let events: Vec<_> = process_message_stream_sse(stream).collect().await;
         assert!(events.iter().all(Result::is_ok), "{events:?}");
-        assert!(matches!(events.last(), Some(Ok(MessageStreamEvent::Ping))));
+        assert!(matches!(
+            events[..],
+            [
+                Ok(MessageStreamEvent::Ping),
+                Ok(MessageStreamEvent::MessageStop(_))
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn message_delta_with_stop_reason_but_no_message_stop_yields_interrupted() {
+        let text = concat!(
+            "event: message_start\n",
+            r#"data: {"message":{"id":"msg_1","content":[],"model":"claude","role":"assistant","type":"message","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            "\n\nevent: ping\ndata: {}\n\nevent: message_delta\n",
+            r#"data: {"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+            "\n\n",
+        );
+        for (bytes, delivered) in [(text, 2), ("", 0)] {
+            let stream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(bytes))]);
+            let items: Vec<_> = process_message_stream_sse(stream).collect().await;
+            let error = items.last().unwrap().as_ref().unwrap_err();
+            assert_eq!(error.kind(), &ErrorKind::Interrupted, "{error}");
+            assert!(error.is_retryable());
+            assert_eq!(error.events_delivered(), Some(delivered));
+            assert!(items[..items.len() - 1].iter().all(Result::is_ok));
+        }
     }
 
     #[tokio::test]

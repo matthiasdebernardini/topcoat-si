@@ -20,32 +20,14 @@
 
 use std::time::Duration;
 
-/// One API call finished successfully after `duration`.
-pub(crate) fn request_succeeded(duration: Duration) {
+/// One API call finished after `duration`; `ok` says whether it succeeded.
+pub(crate) fn request_completed(duration: Duration, ok: bool) {
     tracing::debug!(
         target: "topcoat_si::client",
         duration_seconds = duration.as_secs_f64(),
-        ok = true,
+        ok,
         "request_completed"
     );
-}
-
-/// One API call failed after `duration`.
-pub(crate) fn request_failed(duration: Duration) {
-    tracing::debug!(
-        target: "topcoat_si::client",
-        duration_seconds = duration.as_secs_f64(),
-        ok = false,
-        "request_completed"
-    );
-}
-
-/// One API call finished after `duration`; report it by the outcome in `result`.
-pub(crate) fn request_finished<T, E>(duration: Duration, result: &Result<T, E>) {
-    match result {
-        Ok(_) => request_succeeded(duration),
-        Err(_) => request_failed(duration),
-    }
 }
 
 /// One retry is about to sleep for `backoff`.

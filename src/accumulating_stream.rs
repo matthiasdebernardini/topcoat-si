@@ -17,8 +17,9 @@ use crate::{
 /// A stream wrapper that accumulates `MessageStreamEvent`s into a complete `Message`.
 ///
 /// This allows streaming tokens to the user while simultaneously building the final message
-/// without buffering. When the stream is fully drained, the accumulated message is sent via
-/// the oneshot channel returned by `new()`.
+/// without buffering. When the stream is fully drained after `message_stop`, the accumulated
+/// message is sent via the oneshot channel returned by `new()`. A stream that fails sends the
+/// error instead, and one that ends before `message_stop` closes the channel without a message.
 #[must_use = "streams do nothing unless polled"]
 pub struct AccumulatingStream {
     inner: Pin<Box<dyn Stream<Item = Result<MessageStreamEvent, Error>> + Send>>,
@@ -35,7 +36,7 @@ impl AccumulatingStream {
     /// Wraps a `MessageStreamEvent` stream to accumulate events into a `Message`.
     ///
     /// Returns the stream and a receiver that will contain the accumulated `Message` once the
-    /// stream is fully drained.
+    /// stream is fully drained after `message_stop`.
     pub fn new<S>(stream: S) -> (Self, oneshot::Receiver<Result<Message, Error>>)
     where
         S: Stream<Item = Result<MessageStreamEvent, Error>> + Send + 'static,
@@ -114,8 +115,13 @@ impl AccumulatingStream {
         Ok(())
     }
 
+    /// Ends the stream with `error`. An error from the inner stream keeps the count it carries,
+    /// such as the one [`crate::process_message_stream_sse`] sets.
     fn fail(&mut self, error: Error) -> Poll<Option<Result<MessageStreamEvent, Error>>> {
-        let error = error.with_events_delivered(self.delivered);
+        let error = match error.events_delivered() {
+            Some(_) => error,
+            None => error.with_events_delivered(self.delivered),
+        };
         self.done = true;
         if let Some(tx) = self.message_tx.take() {
             // The caller may drop the final-message receiver while still reading events.
@@ -169,13 +175,12 @@ impl Stream for AccumulatingStream {
             }
             Poll::Ready(Some(Err(error))) => self.fail(error),
             Poll::Ready(None) => {
+                self.done = true;
                 if !self.completed {
-                    let reason = if self.message.is_none() {
-                        "stream ended without a message start event"
-                    } else {
-                        "stream ended before message completion"
-                    };
-                    return self.fail(Error::new(ErrorKind::Interrupted, reason));
+                    // `Anthropic::stream` already ended with an error; another stream that ends
+                    // early closes the channel without a message.
+                    self.message_tx.take();
+                    return Poll::Ready(None);
                 }
                 match self.finalize() {
                     Ok(message) => {
@@ -455,9 +460,7 @@ mod tests {
             Ok(content_start),
             Ok(content_delta),
             Ok(delta_event),
-            Ok(MessageStreamEvent::MessageStop(
-                crate::MessageStopEvent::new(),
-            )),
+            Ok(message_stop()),
         ];
         let event_stream = stream::iter(events);
 
@@ -535,9 +538,7 @@ mod tests {
             Ok(content_delta),
             Ok(content_stop),
             Ok(delta_event),
-            Ok(MessageStreamEvent::MessageStop(
-                crate::MessageStopEvent::new(),
-            )),
+            Ok(message_stop()),
         ];
         let event_stream = stream::iter(events);
 
@@ -605,9 +606,7 @@ mod tests {
             Ok(content_start),
             Ok(content_stop),
             Ok(delta_event),
-            Ok(MessageStreamEvent::MessageStop(
-                crate::MessageStopEvent::new(),
-            )),
+            Ok(message_stop()),
         ];
         let event_stream = stream::iter(events);
 
@@ -679,9 +678,7 @@ mod tests {
                 start_message,
             ))),
             Ok(MessageStreamEvent::MessageDelta(delta_event)),
-            Ok(MessageStreamEvent::MessageStop(
-                crate::MessageStopEvent::new(),
-            )),
+            Ok(message_stop()),
         ];
         let (mut stream, rx) = AccumulatingStream::new(stream::iter(events));
         while futures::StreamExt::next(&mut stream).await.is_some() {}
@@ -738,9 +735,7 @@ mod tests {
                 MessageDeltaUsage::new(1),
             ),
         )));
-        events.push(Ok(MessageStreamEvent::MessageStop(
-            crate::MessageStopEvent::new(),
-        )));
+        events.push(Ok(message_stop()));
 
         let (mut acc_stream, rx) = AccumulatingStream::new(stream::iter(events));
         while acc_stream.next().await.is_some() {}
@@ -840,9 +835,7 @@ mod tests {
     async fn stop_without_start_fails_stream_and_receiver() {
         use futures::StreamExt;
 
-        let events = vec![Ok(MessageStreamEvent::MessageStop(
-            crate::MessageStopEvent::new(),
-        ))];
+        let events = vec![Ok(message_stop())];
         let (mut acc_stream, rx) = AccumulatingStream::new(stream::iter(events));
         assert!(acc_stream.next().await.unwrap().is_ok());
         let error = acc_stream.next().await.unwrap().unwrap_err();
@@ -857,18 +850,42 @@ mod tests {
     async fn stop_without_start_is_decode_and_early_end_is_interrupted() {
         use futures::StreamExt;
 
-        let stop = vec![Ok(MessageStreamEvent::MessageStop(
-            crate::MessageStopEvent::new(),
-        ))];
+        let stop = vec![Ok(message_stop())];
         let (mut acc_stream, _rx) = AccumulatingStream::new(stream::iter(stop));
         assert!(acc_stream.next().await.unwrap().is_ok());
         let error = acc_stream.next().await.unwrap().unwrap_err();
         assert_eq!(error.kind(), &ErrorKind::Decode, "{error}");
         assert!(!error.is_retryable());
 
-        let (mut acc_stream, _rx) = AccumulatingStream::new(stream::iter(Vec::new()));
+        let (mut acc_stream, _rx) = AccumulatingStream::new(message_stream(""));
         let error = acc_stream.next().await.unwrap().unwrap_err();
         assert_eq!(error.kind(), &ErrorKind::Interrupted, "{error}");
+    }
+
+    /// A stream that ends before `message_stop` yields no error of its own and never sends a
+    /// message.
+    #[tokio::test]
+    async fn early_end_never_sends_a_message() {
+        use futures::StreamExt;
+
+        let events = vec![Ok(start_event()), Ok(stop_event(StopReason::EndTurn))];
+        let (acc_stream, rx) = AccumulatingStream::new(stream::iter(events));
+        let items: Vec<_> = acc_stream.collect().await;
+        assert!(items.iter().all(Result::is_ok));
+        assert!(rx.await.is_err(), "the channel closes without a message");
+    }
+
+    /// The decoded events of the server-sent `text`, as `Anthropic::stream` yields them.
+    fn message_stream(
+        text: &'static str,
+    ) -> impl futures::Stream<Item = Result<MessageStreamEvent, Error>> + Send {
+        crate::process_message_stream_sse(stream::iter(vec![Ok::<_, reqwest::Error>(
+            bytes::Bytes::from_static(text.as_bytes()),
+        )]))
+    }
+
+    fn message_stop() -> MessageStreamEvent {
+        MessageStreamEvent::MessageStop(crate::MessageStopEvent::new())
     }
 
     /// `finalize_partial` on a running stream with no `message_start` is not malformed output.
@@ -909,10 +926,6 @@ mod tests {
         ))
     }
 
-    fn message_stop_event() -> MessageStreamEvent {
-        MessageStreamEvent::MessageStop(crate::MessageStopEvent::new())
-    }
-
     /// Drains a stream over `events`, returning its items and the final message.
     async fn drain(
         events: Vec<Result<MessageStreamEvent, Error>>,
@@ -934,7 +947,7 @@ mod tests {
             Ok(tool_start_event()),
             Ok(json_delta_event(0, r#"{"query": SECRET-INPUT"#)),
             Ok(stop_event(StopReason::ToolUse)),
-            Ok(message_stop_event()),
+            Ok(message_stop()),
         ];
         let (items, message) = drain(events).await;
         let error = items.last().unwrap().as_ref().unwrap_err();
@@ -953,7 +966,7 @@ mod tests {
             Ok(tool_start_event()),
             Ok(json_delta_event(0, r#"{"query": "ru"#)),
             Ok(stop_event(StopReason::MaxTokens)),
-            Ok(message_stop_event()),
+            Ok(message_stop()),
         ];
         let (items, message) = drain(events).await;
         assert!(items.iter().all(Result::is_ok));
@@ -1007,29 +1020,13 @@ mod tests {
         assert_eq!(items[3].as_ref().unwrap_err().events_delivered(), Some(1));
 
         // A stream that ends early fails with the count too.
-        let (items, _) = drain(vec![Ok(start_event())]).await;
+        let start = concat!(
+            "event: message_start\n",
+            r#"data: {"message":{"id":"msg_1","content":[],"model":"claude","role":"assistant","type":"message","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            "\n\n",
+        );
+        let (acc_stream, _rx) = AccumulatingStream::new(message_stream(start));
+        let items: Vec<_> = futures::StreamExt::collect(acc_stream).await;
         assert_eq!(items[1].as_ref().unwrap_err().events_delivered(), Some(1));
-    }
-
-    /// A stop reason in `message_delta` does not stand in for `message_stop`.
-    #[tokio::test]
-    async fn stop_reason_without_message_stop_is_interrupted() {
-        let events = vec![
-            Ok(start_event()),
-            Ok(MessageStreamEvent::ContentBlockStart(
-                ContentBlockStartEvent::new(ContentBlock::Text(TextBlock::new(String::new())), 0),
-            )),
-            Ok(MessageStreamEvent::ContentBlockDelta(
-                ContentBlockDeltaEvent::new(ContentBlockDelta::TextDelta(TextDelta::new("Hi")), 0),
-            )),
-            Ok(MessageStreamEvent::ContentBlockStop(
-                ContentBlockStopEvent::new(0),
-            )),
-            Ok(stop_event(StopReason::EndTurn)),
-        ];
-        let (items, message) = drain(events).await;
-        let error = items.last().unwrap().as_ref().unwrap_err();
-        assert_eq!(error.kind(), &ErrorKind::Interrupted, "{error}");
-        assert!(message.is_err());
     }
 }
