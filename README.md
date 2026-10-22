@@ -709,10 +709,19 @@ Two time limits are fixed: one host call times out after 45 seconds, and one `py
 
 ### Advice for apps
 
-From real Sonnet 5.5 runs:
+From real runs. The cost and turn numbers come from the eval in [evals/](evals/README.md): 16 research questions, each answered twice per model with code mode and with the plain tool loop, on Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 (October 2026).
 
-- **Turn on prompt caching** with `with_cache_control`. In one test run it cut the cost from $0.20 to $0.08.
-- **Allow about 15 turns.** At 8, Sonnet ran out mid-research.
+- **Expect code mode to cost an eighth to a quarter of the tool loop, with no measurable difference in accuracy.** Code mode passed 122 of 128 runs and the tool loop 119. Code mode was cheaper on every model and every kind of question, even ones a single search answers. The costs below are Anthropic's only; Firecrawl and Jev are extra.
+
+  | Model | Tool loop, median per question | Code mode, median per question |
+  |---|---|---|
+  | Fable 5.1 | $0.60 | $0.068 |
+  | Opus 5.5 | $0.11 | $0.024 |
+  | Sonnet 5.5 | $0.13 | $0.015 |
+  | Haiku 5.5 | $0.0068 | $0.0012 |
+
+- **Turn on prompt caching** with `with_cache_control`. In one Sonnet test run it cut the cost from $0.20 to $0.08.
+- **Allow about 15 turns.** Code mode takes more turns than the tool loop: a median of 3 or 4 model calls, but 6 of 128 eval runs needed 10 or more and 2 hit the eval's 15-turn cap, one of them with no answer. The tool loop never needed more than 5. At 8 turns, Sonnet ran out mid-research.
 - **Tell Claude how to work** in the system prompt, as in the example above.
 - **Check that the final answer is not empty.** When `run_tools` forces a text answer on its last turn, Sonnet can reply with a thinking block and no text. `ToolRun::text` returns `None` then.
 

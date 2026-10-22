@@ -1,0 +1,435 @@
+{
+  "selection": {
+    "split": "dev",
+    "cases": [
+      "python-final-release-dates",
+      "postgres-first-release-dates",
+      "protocol-original-rfc-numbers",
+      "go-feature-versions",
+      "sqlite-feature-versions",
+      "python-eol-by-2024",
+      "nodejs-lts-lines",
+      "rfc-obsoleted-before-2025",
+      "debian-kernel-5-or-newer",
+      "rust-minor-releases-2023",
+      "apollo-eva-time-ranking",
+      "go-off-cycle-releases",
+      "quic-rfc9000-date",
+      "rust-1-0-release-date",
+      "python-walrus-version",
+      "http2-successor-rfc-editors"
+    ],
+    "models": [
+      "claude-fable-5-1",
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
+      "claude-haiku-5-5"
+    ],
+    "repeat": 2,
+    "cut_short": false
+  },
+  "groups": [
+    {
+      "model": "claude-fable-5-1",
+      "arm": "tool_loop",
+      "runs": 32,
+      "passes": 30,
+      "pass_rate": 0.9375,
+      "wilson_low": 0.7985287685584542,
+      "wilson_high": 0.982689432968359,
+      "mean_model_calls": 2.25,
+      "median_model_calls": 2.0,
+      "median_cost_per_case_micro_cents": 60487768.75,
+      "cost_per_pass_micro_cents": 82373079.16666667,
+      "p50_seconds": 14.616147875,
+      "p90_seconds": 34.716938,
+      "empty_final_answer_rate": 0.0,
+      "error_rate": 0.0
+    },
+    {
+      "model": "claude-fable-5-1",
+      "arm": "code_mode",
+      "runs": 32,
+      "passes": 31,
+      "pass_rate": 0.96875,
+      "wilson_low": 0.8425573617998744,
+      "wilson_high": 0.9944621398359969,
+      "mean_model_calls": 4.125,
+      "median_model_calls": 3.0,
+      "median_cost_per_case_micro_cents": 6762418.75,
+      "cost_per_pass_micro_cents": 9180750.806451613,
+      "p50_seconds": 11.5557235,
+      "p90_seconds": 27.209786042,
+      "empty_final_answer_rate": 0.0,
+      "error_rate": 0.0
+    },
+    {
+      "model": "claude-opus-5-5",
+      "arm": "tool_loop",
+      "runs": 32,
+      "passes": 30,
+      "pass_rate": 0.9375,
+      "wilson_low": 0.7985287685584542,
+      "wilson_high": 0.982689432968359,
+      "mean_model_calls": 2.625,
+      "median_model_calls": 2.0,
+      "median_cost_per_case_micro_cents": 10814540.0,
+      "cost_per_pass_micro_cents": 24140367.333333332,
+      "p50_seconds": 8.993236208,
+      "p90_seconds": 32.90109475,
+      "empty_final_answer_rate": 0.0,
+      "error_rate": 0.0
+    },
+    {
+      "model": "claude-opus-5-5",
+      "arm": "code_mode",
+      "runs": 32,
+      "passes": 32,
+      "pass_rate": 1.0,
+      "wilson_low": 0.8928208017449293,
+      "wilson_high": 1.0,
+      "mean_model_calls": 4.125,
+      "median_model_calls": 3.0,
+      "median_cost_per_case_micro_cents": 2434490.0,
+      "cost_per_pass_micro_cents": 3590571.875,
+      "p50_seconds": 9.13641875,
+      "p90_seconds": 26.996096708,
+      "empty_final_answer_rate": 0.0,
+      "error_rate": 0.0
+    },
+    {
+      "model": "claude-sonnet-5-5",
+      "arm": "tool_loop",
+      "runs": 32,
+      "passes": 30,
+      "pass_rate": 0.9375,
+      "wilson_low": 0.7985287685584542,
+      "wilson_high": 0.982689432968359,
+      "mean_model_calls": 2.5625,
+      "median_model_calls": 2.0,
+      "median_cost_per_case_micro_cents": 13190557.5,
+      "cost_per_pass_micro_cents": 12519144.666666666,
+      "p50_seconds": 10.428542583,
+      "p90_seconds": 25.919618167,
+      "empty_final_answer_rate": 0.0,
+      "error_rate": 0.0
+    },
+    {
+      "model": "claude-sonnet-5-5",
+      "arm": "code_mode",
+      "runs": 32,
+      "passes": 31,
+      "pass_rate": 0.96875,
+      "wilson_low": 0.8425573617998744,
+      "wilson_high": 0.9944621398359969,
+      "mean_model_calls": 4.9375,
+      "median_model_calls": 4.0,
+      "median_cost_per_case_micro_cents": 1498480.0,
+      "cost_per_pass_micro_cents": 2300101.290322581,
+      "p50_seconds": 8.849347,
+      "p90_seconds": 27.916678917,
+      "empty_final_answer_rate": 0.03125,
+      "error_rate": 0.0
+    },
+    {
+      "model": "claude-haiku-5-5",
+      "arm": "tool_loop",
+      "runs": 32,
+      "passes": 29,
+      "pass_rate": 0.90625,
+      "wilson_low": 0.7578184527161212,
+      "wilson_high": 0.9675984487016337,
+      "mean_model_calls": 2.15625,
+      "median_model_calls": 2.0,
+      "median_cost_per_case_micro_cents": 677493.25,
+      "cost_per_pass_micro_cents": 2556693.6896551726,
+      "p50_seconds": 11.805494708,
+      "p90_seconds": 40.54770375,
+      "empty_final_answer_rate": 0.0,
+      "error_rate": 0.0
+    },
+    {
+      "model": "claude-haiku-5-5",
+      "arm": "code_mode",
+      "runs": 32,
+      "passes": 28,
+      "pass_rate": 0.875,
+      "wilson_low": 0.7193169451834978,
+      "wilson_high": 0.9502986561251991,
+      "mean_model_calls": 4.09375,
+      "median_model_calls": 4.0,
+      "median_cost_per_case_micro_cents": 124473.5,
+      "cost_per_pass_micro_cents": 153784.9642857143,
+      "p50_seconds": 10.6183095,
+      "p90_seconds": 23.744440916,
+      "empty_final_answer_rate": 0.0,
+      "error_rate": 0.0
+    }
+  ],
+  "paired": [
+    {
+      "model": "claude-fable-5-1",
+      "kind": null,
+      "cases": 16,
+      "outcome": {
+        "wins": 2,
+        "losses": 1,
+        "ties": 13
+      },
+      "median_cost_ratio": 0.14372306656701717
+    },
+    {
+      "model": "claude-fable-5-1",
+      "kind": "fanout",
+      "cases": 5,
+      "outcome": {
+        "wins": 1,
+        "losses": 0,
+        "ties": 4
+      },
+      "median_cost_ratio": 0.07055088684537393
+    },
+    {
+      "model": "claude-fable-5-1",
+      "kind": "classify",
+      "cases": 4,
+      "outcome": {
+        "wins": 0,
+        "losses": 1,
+        "ties": 3
+      },
+      "median_cost_ratio": 0.1361679716741991
+    },
+    {
+      "model": "claude-fable-5-1",
+      "kind": "aggregate",
+      "cases": 3,
+      "outcome": {
+        "wins": 1,
+        "losses": 0,
+        "ties": 2
+      },
+      "median_cost_ratio": 0.22499915521504044
+    },
+    {
+      "model": "claude-fable-5-1",
+      "kind": "control",
+      "cases": 3,
+      "outcome": {
+        "wins": 0,
+        "losses": 0,
+        "ties": 3
+      },
+      "median_cost_ratio": 0.17259614151842156
+    },
+    {
+      "model": "claude-fable-5-1",
+      "kind": "multihop",
+      "cases": 1,
+      "outcome": {
+        "wins": 0,
+        "losses": 0,
+        "ties": 1
+      },
+      "median_cost_ratio": 0.5114032546433998
+    },
+    {
+      "model": "claude-opus-5-5",
+      "kind": null,
+      "cases": 16,
+      "outcome": {
+        "wins": 2,
+        "losses": 0,
+        "ties": 14
+      },
+      "median_cost_ratio": 0.240537373252475
+    },
+    {
+      "model": "claude-opus-5-5",
+      "kind": "fanout",
+      "cases": 5,
+      "outcome": {
+        "wins": 1,
+        "losses": 0,
+        "ties": 4
+      },
+      "median_cost_ratio": 0.13517174125040632
+    },
+    {
+      "model": "claude-opus-5-5",
+      "kind": "classify",
+      "cases": 4,
+      "outcome": {
+        "wins": 0,
+        "losses": 0,
+        "ties": 4
+      },
+      "median_cost_ratio": 0.3073782880047688
+    },
+    {
+      "model": "claude-opus-5-5",
+      "kind": "aggregate",
+      "cases": 3,
+      "outcome": {
+        "wins": 1,
+        "losses": 0,
+        "ties": 2
+      },
+      "median_cost_ratio": 0.3120394851259337
+    },
+    {
+      "model": "claude-opus-5-5",
+      "kind": "control",
+      "cases": 3,
+      "outcome": {
+        "wins": 0,
+        "losses": 0,
+        "ties": 3
+      },
+      "median_cost_ratio": 0.2173483785259827
+    },
+    {
+      "model": "claude-opus-5-5",
+      "kind": "multihop",
+      "cases": 1,
+      "outcome": {
+        "wins": 0,
+        "losses": 0,
+        "ties": 1
+      },
+      "median_cost_ratio": 0.37022567647748755
+    },
+    {
+      "model": "claude-sonnet-5-5",
+      "kind": null,
+      "cases": 16,
+      "outcome": {
+        "wins": 1,
+        "losses": 1,
+        "ties": 14
+      },
+      "median_cost_ratio": 0.19878779965557636
+    },
+    {
+      "model": "claude-sonnet-5-5",
+      "kind": "fanout",
+      "cases": 5,
+      "outcome": {
+        "wins": 0,
+        "losses": 0,
+        "ties": 5
+      },
+      "median_cost_ratio": 0.16473320008484446
+    },
+    {
+      "model": "claude-sonnet-5-5",
+      "kind": "classify",
+      "cases": 4,
+      "outcome": {
+        "wins": 0,
+        "losses": 0,
+        "ties": 4
+      },
+      "median_cost_ratio": 0.30302817964192297
+    },
+    {
+      "model": "claude-sonnet-5-5",
+      "kind": "aggregate",
+      "cases": 3,
+      "outcome": {
+        "wins": 0,
+        "losses": 1,
+        "ties": 2
+      },
+      "median_cost_ratio": 0.25677500739234776
+    },
+    {
+      "model": "claude-sonnet-5-5",
+      "kind": "control",
+      "cases": 3,
+      "outcome": {
+        "wins": 0,
+        "losses": 0,
+        "ties": 3
+      },
+      "median_cost_ratio": 0.13535335792908407
+    },
+    {
+      "model": "claude-sonnet-5-5",
+      "kind": "multihop",
+      "cases": 1,
+      "outcome": {
+        "wins": 1,
+        "losses": 0,
+        "ties": 0
+      },
+      "median_cost_ratio": 0.24605451698377923
+    },
+    {
+      "model": "claude-haiku-5-5",
+      "kind": null,
+      "cases": 16,
+      "outcome": {
+        "wins": 1,
+        "losses": 2,
+        "ties": 13
+      },
+      "median_cost_ratio": 0.13330197376960787
+    },
+    {
+      "model": "claude-haiku-5-5",
+      "kind": "fanout",
+      "cases": 5,
+      "outcome": {
+        "wins": 0,
+        "losses": 0,
+        "ties": 5
+      },
+      "median_cost_ratio": 0.10979698707856454
+    },
+    {
+      "model": "claude-haiku-5-5",
+      "kind": "classify",
+      "cases": 4,
+      "outcome": {
+        "wins": 0,
+        "losses": 1,
+        "ties": 3
+      },
+      "median_cost_ratio": 0.18524120476950562
+    },
+    {
+      "model": "claude-haiku-5-5",
+      "kind": "aggregate",
+      "cases": 3,
+      "outcome": {
+        "wins": 1,
+        "losses": 0,
+        "ties": 2
+      },
+      "median_cost_ratio": 0.19082775880115613
+    },
+    {
+      "model": "claude-haiku-5-5",
+      "kind": "control",
+      "cases": 3,
+      "outcome": {
+        "wins": 0,
+        "losses": 0,
+        "ties": 3
+      },
+      "median_cost_ratio": 0.1468921673634385
+    },
+    {
+      "model": "claude-haiku-5-5",
+      "kind": "multihop",
+      "cases": 1,
+      "outcome": {
+        "wins": 0,
+        "losses": 1,
+        "ties": 0
+      },
+      "median_cost_ratio": 0.25686555909610564
+    }
+  ]
+}
