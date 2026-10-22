@@ -1580,3 +1580,40 @@ async fn a_failed_request_is_not_cached() {
     assert_eq!(retry.data.markdown.as_deref(), Some("fine"));
     assert_eq!(recorded.lock().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn a_page_with_an_error_status_is_not_cached() {
+    let page = || scraped("gone", json!({"statusCode": 503}));
+    let (url, recorded) = serve(vec![page(), page()]).await;
+    let (client, cache) = cached_client(&url);
+    let request = ScrapeRequest::new("https://example.com/page");
+    client.scrape(&request).await.unwrap();
+    client.scrape(&request).await.unwrap();
+    assert!(cache.0.lock().unwrap().is_empty());
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_max_age_of_zero_bypasses_the_cache() {
+    let (url, recorded) = serve(vec![scraped("old", json!({})), scraped("new", json!({}))]).await;
+    let (client, _) = cached_client(&url);
+    let warm = ScrapeRequest::new("https://example.com/page");
+    client.scrape(&warm).await.unwrap();
+    let mut fresh = ScrapeRequest::new("https://example.com/page");
+    fresh.options.max_age = Some(Duration::ZERO);
+    let page = client.scrape(&fresh).await.unwrap();
+    assert_eq!(page.data.markdown.as_deref(), Some("new"));
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_cached_search_reports_zero_credits() {
+    let (url, _) = serve(vec![ok(
+        json!({"success": true, "creditsUsed": 2, "data": {"web": []}}),
+    )])
+    .await;
+    let (client, _) = cached_client(&url);
+    let request = SearchRequest::new("rust async");
+    assert_eq!(client.search(&request).await.unwrap().credits_used, Some(2));
+    assert_eq!(client.search(&request).await.unwrap().credits_used, Some(0));
+}

@@ -46,6 +46,8 @@ jobs:
       - name: clippy with code-mode and surreal
         run: cargo clippy --workspace --all-targets --features code-mode,surreal --locked -- -D warnings
       - name: code-mode and surreal tests
-        run: MONTY_BIN="$HOME/.cargo/bin/monty" cargo nextest run --workspace --lib --locked --features code-mode,surreal code_mode surreal db
+        run: |
+          MONTY_BIN="$HOME/.cargo/bin/monty" cargo nextest run --workspace --lib --locked --features code-mode,surreal code_mode surreal db
+          cargo nextest run -p topcoat-evals --locked
       - name: code-mode and surreal doc test
         run: cargo test --doc --locked --features code-mode,surreal

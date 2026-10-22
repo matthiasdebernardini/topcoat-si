@@ -36,7 +36,7 @@ UPSERT type::record('topcoat_usage', $message_id) SET
     cache_read_tokens = $cache_read_tokens,
     cache_write_tokens = $cache_write_tokens,
     cost_micro_cents = $cost_micro_cents,
-    at = time::now();
+    at = at ?? time::now();
 ";
 
 const TOTALS: &str = "
@@ -242,5 +242,26 @@ mod tests {
 
         let later = OffsetDateTime::now_utc() + Duration::from_secs(3600);
         assert!(ledger.totals(later).await.expect("totals").is_empty());
+    }
+
+    #[tokio::test]
+    async fn recording_again_keeps_the_first_timestamp() {
+        let db = temp_db().await;
+        let ledger = UsageLedger::try_new(db.clone()).await.expect("schema");
+        let sonnet = message("msg_1", "claude-sonnet-5-5", 100, 10);
+        let read_at = || async {
+            let at: Vec<surrealdb::types::Datetime> = db
+                .query("SELECT VALUE at FROM topcoat_usage")
+                .await
+                .and_then(|mut response| response.take(0))
+                .expect("read at");
+            at
+        };
+        ledger.record(&sonnet, None).await.expect("record");
+        let first = read_at().await;
+        assert_eq!(first.len(), 1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        ledger.record(&sonnet, None).await.expect("again");
+        assert_eq!(read_at().await, first);
     }
 }

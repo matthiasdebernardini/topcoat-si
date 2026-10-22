@@ -332,16 +332,16 @@ async fn execute(options: &Options, cases: &[Case], runs: &[PlannedRun]) -> Resu
             "[year][month][day]T[hour][minute][second]Z"
         ))
         .map_err(|error| format!("timestamp: {error}"))?;
+    let eval_db = match &options.db {
+        Some(path) => Some(EvalDb::open(path).await?),
+        None => None,
+    };
     let results = PathBuf::from(RESULTS_DIR);
     fs::create_dir_all(&results).map_err(|error| format!("{}: {error}", results.display()))?;
     let records_path = results.join(format!("{stamp}-code-mode.jsonl"));
     let file = File::create_new(&records_path)
         .map_err(|error| format!("{}: {error}", records_path.display()))?;
     let mut writer = BufWriter::new(file);
-    let eval_db = match &options.db {
-        Some(path) => Some(EvalDb::open(path).await?),
-        None => None,
-    };
 
     let mut records: Vec<RunRecord> = Vec::new();
     let mut spent: u64 = 0;

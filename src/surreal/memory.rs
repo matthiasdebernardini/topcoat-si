@@ -72,7 +72,6 @@ pub struct MemorySearch<C: Connection> {
 }
 
 #[derive(SurrealValue)]
-#[surreal(crate = "surrealdb::types")]
 struct HitRow {
     path: String,
     text: String,
@@ -194,6 +193,12 @@ impl<C: Connection> Memory<C> {
                 check_file_path(&path)?;
                 if self.is_directory(&path).await? {
                     return Err(model_error(format!("{path} is a directory")));
+                }
+                for (index, _) in path.match_indices('/').skip(1) {
+                    let parent = &path[..index];
+                    if self.file(parent).await?.is_some() {
+                        return Err(model_error(format!("{parent} is a file")));
+                    }
                 }
                 self.put(&path, &file_text).await?;
                 Ok(format!("File created successfully at: {path}"))
@@ -384,21 +389,23 @@ impl<C: Connection> Memory<C> {
                 return Err(model_error(format!("{destination} already exists")));
             }
         }
-        let at = to_datetime(OffsetDateTime::now_utc());
-        for (from, to) in moves {
-            self.db
-                .query(
-                    "UPDATE topcoat_memory SET path = $to, updated_at = $at \
-                     WHERE scope = $scope AND path = $from",
-                )
-                .bind(("scope", self.scope.clone()))
-                .bind(("from", from.clone()))
-                .bind(("to", to))
-                .bind(("at", at))
-                .await
-                .and_then(|response| response.check())
-                .map_err(|error| store_error(format!("renaming {from}"), error))?;
-        }
+        // One statement, so a crash cannot leave half of a directory moved.
+        self.db
+            .query(
+                "UPDATE topcoat_memory SET \
+                 path = string::concat($new, string::slice(path, $old_len)), updated_at = $at \
+                 WHERE scope = $scope \
+                 AND (path = $old OR string::starts_with(path, $old_prefix))",
+            )
+            .bind(("scope", self.scope.clone()))
+            .bind(("old", old_path.to_string()))
+            .bind(("old_prefix", old_prefix))
+            .bind(("new", new_path.to_string()))
+            .bind(("old_len", old_path.chars().count() as i64))
+            .bind(("at", to_datetime(OffsetDateTime::now_utc())))
+            .await
+            .and_then(|response| response.check())
+            .map_err(|error| store_error(format!("renaming {old_path}"), error))?;
         Ok(())
     }
 }
@@ -656,6 +663,33 @@ mod tests {
             json!({"command": "create", "path": path, "file_text": text}),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn a_file_cannot_become_a_directory() {
+        let memory = memory("a").await;
+        create(&memory, "/memories/a.md", "one").await;
+        fails(
+            &memory,
+            json!({"command": "create", "path": "/memories/a.md/b.md", "file_text": "two"}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn renaming_a_directory_moves_every_file() {
+        let memory = memory("a").await;
+        create(&memory, "/memories/d/x.md", "x").await;
+        create(&memory, "/memories/d/y/z.md", "z").await;
+        ok(
+            &memory,
+            json!({"command": "rename", "old_path": "/memories/d", "new_path": "/memories/e"}),
+        )
+        .await;
+        let view = |path: &str| json!({"command": "view", "path": path});
+        assert!(ok(&memory, view("/memories/e/x.md")).await.contains('x'));
+        assert!(ok(&memory, view("/memories/e/y/z.md")).await.contains('z'));
+        fails(&memory, view("/memories/d")).await;
     }
 
     #[tokio::test]
