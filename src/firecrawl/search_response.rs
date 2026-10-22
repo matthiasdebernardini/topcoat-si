@@ -1,11 +1,11 @@
 //! The search response.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::ResultMetadata;
 
 /// A successful Firecrawl search.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct SearchResponse {
@@ -26,7 +26,7 @@ pub struct SearchResponse {
 }
 
 /// Results grouped by source.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct SearchData {
     /// Web results.
@@ -41,7 +41,7 @@ pub struct SearchData {
 }
 
 /// A web search result.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct WebResult {
     /// Page URL.
@@ -68,7 +68,7 @@ pub struct WebResult {
 }
 
 /// A news search result.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct NewsResult {
     /// Article URL.
@@ -95,7 +95,7 @@ pub struct NewsResult {
 }
 
 /// An image search result.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct ImageResult {

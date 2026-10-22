@@ -1,6 +1,7 @@
 //! The Firecrawl HTTP client.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, HeaderValue};
@@ -8,7 +9,7 @@ use reqwest::{Client as ReqwestClient, ClientBuilder};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::{ScrapeRequest, ScrapeResponse, SearchRequest, SearchResponse};
+use super::{FirecrawlCache, ScrapeRequest, ScrapeResponse, SearchRequest, SearchResponse};
 use crate::backoff::{self, RetryPolicy};
 use crate::error::{Error, ErrorCode, ErrorKind, Result, Service, describe_json_error};
 use crate::http;
@@ -32,6 +33,7 @@ pub struct FirecrawlClient {
     authorization: HeaderValue,
     pub(super) base_url: String,
     max_retries: usize,
+    cache: Option<(Arc<dyn FirecrawlCache>, Duration)>,
 }
 
 impl fmt::Debug for FirecrawlClient {
@@ -40,6 +42,7 @@ impl fmt::Debug for FirecrawlClient {
             .field("api_key", &"[REDACTED]")
             .field("base_url", &self.base_url)
             .field("max_retries", &self.max_retries)
+            .field("cache", &self.cache.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -55,6 +58,7 @@ impl FirecrawlClient {
             authorization: http::bearer(Service::Firecrawl, api_key)?,
             base_url: DEFAULT_BASE_URL.to_string(),
             max_retries: 2,
+            cache: None,
         })
     }
 
@@ -87,6 +91,16 @@ impl FirecrawlClient {
         self
     }
 
+    /// Keep answers in `cache` for `ttl`, so an identical search or scrape is paid for once.
+    ///
+    /// The key is the request body as sent, so any difference in the request is a miss. Failures
+    /// are never cached, and a cache that errors only costs a repeat call.
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<dyn FirecrawlCache>, ttl: Duration) -> Self {
+        self.cache = Some((cache, ttl));
+        self
+    }
+
     /// Run a search.
     ///
     /// The request is validated before anything is sent. Whatever [`Error::is_retryable`]
@@ -96,7 +110,13 @@ impl FirecrawlClient {
     /// longer; a `Retry-After` over 30 seconds fails at once without retrying.
     pub async fn search(&self, request: &SearchRequest) -> Result<SearchResponse> {
         request.validate()?;
-        self.post("/v2/search", &request.wire(), None).await
+        let key = cache_key("search:", &request.wire());
+        if let Some(hit) = self.cached(key.as_deref()).await {
+            return Ok(hit);
+        }
+        let response = self.post("/v2/search", &request.wire(), None).await?;
+        self.store(key.as_deref(), &response).await;
+        Ok(response)
     }
 
     /// Scrape one page as markdown.
@@ -112,7 +132,29 @@ impl FirecrawlClient {
             .options
             .timeout
             .map(|t| (t + SCRAPE_TIMEOUT_MARGIN).max(DEFAULT_TIMEOUT));
-        self.post("/v2/scrape", &request.wire(), timeout).await
+        let key = cache_key("scrape:", &request.wire());
+        if let Some(hit) = self.cached(key.as_deref()).await {
+            return Ok(hit);
+        }
+        let response = self.post("/v2/scrape", &request.wire(), timeout).await?;
+        self.store(key.as_deref(), &response).await;
+        Ok(response)
+    }
+
+    /// The cached response for `key`; a missing, stale or unreadable entry is a miss.
+    async fn cached<T: DeserializeOwned>(&self, key: Option<&str>) -> Option<T> {
+        let ((cache, _), key) = self.cache.as_ref().zip(key)?;
+        serde_json::from_str(&cache.get(key).await?).ok()
+    }
+
+    /// Caches `response` under `key`; a response that will not serialize is not cached.
+    async fn store<T: Serialize>(&self, key: Option<&str>, response: &T) {
+        let Some(((cache, ttl), key)) = self.cache.as_ref().zip(key) else {
+            return;
+        };
+        if let Ok(body) = serde_json::to_string(response) {
+            cache.put(key, body, *ttl).await;
+        }
     }
 
     /// Posts `body` to `path`, retrying transient failures.
@@ -206,6 +248,11 @@ impl FirecrawlClient {
         }
         Ok(parsed)
     }
+}
+
+/// The cache key for a request: `prefix` plus its wire body, or `None` when it will not serialize.
+fn cache_key(prefix: &str, wire: &impl Serialize) -> Option<String> {
+    Some(format!("{prefix}{}", serde_json::to_string(wire).ok()?))
 }
 
 /// The Firecrawl settings for [`http::client`].

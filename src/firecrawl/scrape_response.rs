@@ -1,11 +1,11 @@
 //! The scrape response.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::ResultMetadata;
 
 /// A successful Firecrawl scrape.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(from = "WireScrapeResponse")]
 #[non_exhaustive]
 pub struct ScrapeResponse {
@@ -16,7 +16,7 @@ pub struct ScrapeResponse {
 }
 
 /// A scraped page.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct ScrapeData {
     /// Page content as markdown.
