@@ -30,7 +30,8 @@ pub struct Selection {
     pub cases: Vec<String>,
     pub models: Vec<String>,
     pub repeat: u32,
-    /// Whether the budget stopped the run before every planned run was done.
+    /// Whether the run is partial: the budget stopped it, or `summarize` found runs missing
+    /// or duplicated.
     pub cut_short: bool,
 }
 
@@ -315,11 +316,7 @@ fn describe_selection(selection: &Selection) -> String {
         selection.cases.join(","),
         selection.models.join(","),
         selection.repeat,
-        if selection.cut_short {
-            ", cut short by the budget"
-        } else {
-            ""
-        }
+        if selection.cut_short { ", partial" } else { "" }
     )
 }
 

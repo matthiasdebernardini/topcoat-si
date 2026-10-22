@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use topcoat_si::code_mode::{self, CodeMode, Limits, Pool, packs};
 use topcoat_si::jev::{JevClient, JevTool, Outcome, Questions};
 use topcoat_si::{
@@ -83,7 +83,7 @@ pub fn check_pinned(model: &str) -> Result<(), String> {
 }
 
 /// One run's line in the results file.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunRecord {
     pub case_id: String,
     pub kind: Kind,
