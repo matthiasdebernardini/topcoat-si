@@ -220,8 +220,18 @@ impl FirecrawlClient {
                 ),
             )
         })?;
+        // A 2xx is not an HTTP error status, so a body saying it failed is a decode error that
+        // carries only Firecrawl's `error` text.
         if !parsed.succeeded() {
-            return Err(http_error(status, &bytes, None));
+            let message = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| value["error"].as_str().map(String::from))
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or_else(|| "no error message".to_string());
+            return Err(Error::new(
+                ErrorKind::Decode,
+                format!("Firecrawl response had success false: {message}"),
+            ));
         }
         Ok(parsed)
     }

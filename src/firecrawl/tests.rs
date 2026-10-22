@@ -1426,6 +1426,22 @@ async fn unparseable_success_leaks_neither_text_nor_source() {
 }
 
 #[tokio::test]
+async fn success_false_on_2xx_is_decode_without_status() {
+    let (url, _) = serve(vec![Canned::json(
+        200,
+        json!({"success": false, "error": "x"}).to_string(),
+    )])
+    .await;
+    let err = client(&url)
+        .search(&SearchRequest::new("q"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err.kind(), ErrorKind::Decode), "{err:?}");
+    assert_eq!(err.status(), None);
+    assert!(err.to_string().ends_with(": x"), "{err}");
+}
+
+#[tokio::test]
 async fn fetch_page_unauthorized_is_err_and_not_found_is_an_error_result() {
     let (url, recorded) = serve(vec![Canned::json(
         401,
