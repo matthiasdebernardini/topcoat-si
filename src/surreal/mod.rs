@@ -15,6 +15,7 @@ pub(crate) mod time;
 mod transcripts;
 mod usage_ledger;
 
+pub use memory::{Memory, MemoryHit, MemorySearch};
 pub use transcripts::{Batches, TrackedBatch, Transcript, Transcripts};
 
 use std::path::Path;
