@@ -19,7 +19,8 @@ use crate::plan::Arm;
 
 const MAX_TOKENS: u32 = 4096;
 const MAX_TURNS: u32 = 15;
-const FIRECRAWL_MAX_CREDITS: u32 = 40;
+// No cap: the tool loop's Firecrawl tools have none, so a cap here would handicap code mode only.
+const FIRECRAWL_MAX_CREDITS: u32 = u32::MAX;
 const MAX_WORKERS: usize = 2;
 /// A run passes the judge only on a yes at this certainty or more.
 const JUDGE_MIN_CERTAINTY: f64 = 0.8;

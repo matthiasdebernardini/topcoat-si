@@ -7,7 +7,7 @@
 The `code-mode` eval asks the same questions two ways, with the same model, and compares them:
 
 - **`tool_loop`**: `Anthropic::run_tools` with three client tools: `web_search` and `fetch_page` (Firecrawl) and `jev`. Claude calls one tool, reads the result, calls the next.
-- **`code_mode`**: `run_tools` with the one `python` tool and all five packs (`firecrawl` with a 40-credit budget, `jev`, `research`, `triage`, `reports`) and `Limits::default()`. Claude writes Python that calls the same services.
+- **`code_mode`**: `run_tools` with the one `python` tool and all five packs (`firecrawl` with no credit cap, as in the tool loop; `jev`, `research`, `triage`, `reports`) and `Limits::default()`. Claude writes Python that calls the same services.
 
 Both arms use `max_tokens` 4096, at most 15 turns, prompt caching and the same base system prompt: "Answer the user's question using the tools. Do not answer from memory. End with a plain-text answer." The tool loop adds "You may call several tools in one turn." Code mode adds the system prompt from the code-mode example in the main README, as "Advice for apps" recommends.
 
