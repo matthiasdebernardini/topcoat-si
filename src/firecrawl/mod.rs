@@ -6,6 +6,7 @@
 //! [`FirecrawlWebSearch::execute`]. [`FirecrawlFetchPage`] wraps scrape as a client-side
 //! `fetch_page` tool through [`ClientTool`](crate::ClientTool).
 
+mod cache;
 mod client;
 mod fetch_page;
 mod filter;
@@ -21,6 +22,7 @@ mod web_search;
 #[cfg(test)]
 mod tests;
 
+pub use cache::FirecrawlCache;
 pub use client::FirecrawlClient;
 pub use fetch_page::FirecrawlFetchPage;
 pub use result_metadata::ResultMetadata;

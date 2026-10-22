@@ -1,6 +1,6 @@
 //! Metadata of a scraped page.
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Metadata from scraping a page.
 ///
@@ -27,6 +27,24 @@ pub struct ResultMetadata {
     pub num_pages: Option<u32>,
     /// For a PDF, the document's full page count, when Firecrawl knows it.
     pub total_pages: Option<u32>,
+}
+
+impl Serialize for ResultMetadata {
+    /// Writes the keys [`Deserialize`] reads, so a cached response reads back unchanged.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde_json::json!({
+            "title": self.title,
+            "description": self.description,
+            "sourceURL": self.source_url,
+            "url": self.url,
+            "statusCode": self.status_code,
+            "error": self.error,
+            "contentType": self.content_type,
+            "numPages": self.num_pages,
+            "totalPages": self.total_pages,
+        })
+        .serialize(serializer)
+    }
 }
 
 impl<'de> Deserialize<'de> for ResultMetadata {

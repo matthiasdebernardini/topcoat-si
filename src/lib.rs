@@ -38,7 +38,7 @@ pub use accumulating_stream::AccumulatingStream;
 pub use anthropic::Anthropic;
 pub use client_tool::ClientTool;
 pub use error::{Error, ErrorCode, ErrorKind, Result, Service};
-pub use firecrawl::{FirecrawlClient, FirecrawlFetchPage, FirecrawlWebSearch};
+pub use firecrawl::{FirecrawlCache, FirecrawlClient, FirecrawlFetchPage, FirecrawlWebSearch};
 pub use sse::{SseEvent, parse_message_stream_event, process_message_stream_sse, process_sse};
 pub use structured::Parsed;
 #[cfg(feature = "surreal")]

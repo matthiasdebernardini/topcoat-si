@@ -16,6 +16,7 @@ mod transcripts;
 mod usage_ledger;
 
 pub use memory::{Memory, MemoryHit, MemorySearch};
+pub use page_cache::{CachedPage, PageCache};
 pub use transcripts::{Batches, TrackedBatch, Transcript, Transcripts};
 
 use std::path::Path;

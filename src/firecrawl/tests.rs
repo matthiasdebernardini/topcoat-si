@@ -1493,3 +1493,90 @@ async fn fetch_page_unauthorized_is_err_and_not_found_is_an_error_result() {
         .unwrap();
     assert_eq!(result.is_error, Some(true));
 }
+
+#[derive(Default)]
+struct MemoryCache(Mutex<std::collections::HashMap<String, String>>);
+
+impl FirecrawlCache for MemoryCache {
+    fn get<'a>(&'a self, key: &'a str) -> futures::future::BoxFuture<'a, Option<String>> {
+        Box::pin(async move { self.0.lock().unwrap().get(key).cloned() })
+    }
+
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        body: String,
+        _ttl: Duration,
+    ) -> futures::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.0.lock().unwrap().insert(key.to_string(), body);
+        })
+    }
+}
+
+fn cached_client(base_url: &str) -> (FirecrawlClient, Arc<MemoryCache>) {
+    let cache = Arc::new(MemoryCache::default());
+    let client = client(base_url).with_cache(cache.clone(), Duration::from_secs(60));
+    (client, cache)
+}
+
+#[tokio::test]
+async fn an_identical_scrape_is_served_from_the_cache() {
+    let (url, recorded) = serve(vec![scraped("# Hi", json!({"title": "Hi"}))]).await;
+    let (client, cache) = cached_client(&url);
+    let request = ScrapeRequest::new("https://example.com/page");
+    let first = client.scrape(&request).await.unwrap();
+    let second = client.scrape(&request).await.unwrap();
+    assert_eq!(first, second);
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+    let keys: Vec<String> = cache.0.lock().unwrap().keys().cloned().collect();
+    assert_eq!(keys.len(), 1);
+    assert!(keys[0].starts_with("scrape:"), "{}", keys[0]);
+}
+
+#[tokio::test]
+async fn an_identical_search_is_served_from_the_cache() {
+    let (url, recorded) = serve(vec![ok(
+        json!({"success": true, "data": {"web": [{"url": "https://a.test", "title": "A"}]}}),
+    )])
+    .await;
+    let (client, _) = cached_client(&url);
+    let request = SearchRequest::new("rust async");
+    let first = client.search(&request).await.unwrap();
+    let second = client.search(&request).await.unwrap();
+    assert_eq!(first, second);
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_different_url_misses_the_cache() {
+    let (url, recorded) = serve(vec![scraped("one", json!({})), scraped("two", json!({}))]).await;
+    let (client, _) = cached_client(&url);
+    let one = client
+        .scrape(&ScrapeRequest::new("https://example.com/one"))
+        .await
+        .unwrap();
+    let two = client
+        .scrape(&ScrapeRequest::new("https://example.com/two"))
+        .await
+        .unwrap();
+    assert_eq!(one.data.markdown.as_deref(), Some("one"));
+    assert_eq!(two.data.markdown.as_deref(), Some("two"));
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_failed_request_is_not_cached() {
+    let (url, recorded) = serve(vec![
+        Canned::json(400, json!({"success": false, "error": "bad"}).to_string()),
+        scraped("fine", json!({})),
+    ])
+    .await;
+    let (client, cache) = cached_client(&url);
+    let request = ScrapeRequest::new("https://example.com/page");
+    assert!(client.scrape(&request).await.is_err());
+    assert!(cache.0.lock().unwrap().is_empty());
+    let retry = client.scrape(&request).await.unwrap();
+    assert_eq!(retry.data.markdown.as_deref(), Some("fine"));
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
