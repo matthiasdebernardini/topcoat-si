@@ -48,7 +48,14 @@ const SEARCH: &str = "
     WHERE text @1@ $query AND expires_at > time::now()
     ORDER BY score DESC LIMIT $limit
 ";
-const PURGE: &str = "DELETE topcoat_page_cache WHERE expires_at <= time::now() RETURN BEFORE";
+// The count comes first, so no body is loaded just to be counted. Both statements use the same
+// cutoff, so the count is the number of rows the delete removes.
+const PURGE: &str = "
+    SELECT VALUE count FROM (
+        SELECT count() FROM topcoat_page_cache WHERE expires_at <= $now GROUP ALL
+    );
+    DELETE topcoat_page_cache WHERE expires_at <= $now RETURN NONE;
+";
 
 /// A [`FirecrawlCache`] kept in SurrealDB.
 ///
@@ -139,13 +146,14 @@ impl<C: Connection> PageCache<C> {
     ///
     /// [`ErrorKind::Store`](crate::ErrorKind::Store) when the delete fails.
     pub async fn purge_expired(&self) -> Result<u64> {
-        let removed: Vec<serde_json::Value> = self
+        let removed: Vec<u64> = self
             .db
             .query(PURGE)
+            .bind(("now", to_datetime(OffsetDateTime::now_utc())))
             .await
             .and_then(|mut response| response.take(0))
             .map_err(|error| store_error("purging the page cache", error))?;
-        Ok(removed.len() as u64)
+        Ok(removed.into_iter().sum())
     }
 
     async fn lookup(&self, key: &str) -> Result<Option<String>> {
@@ -162,6 +170,10 @@ impl<C: Connection> PageCache<C> {
     async fn store(&self, key: &str, body: String, ttl: Duration) -> Result<()> {
         let extract = extract(key, &body);
         let now = OffsetDateTime::now_utc();
+        // A ttl too long to represent never expires.
+        let expires_at = now
+            .checked_add(ttl.try_into().unwrap_or(time::Duration::MAX))
+            .unwrap_or(time::PrimitiveDateTime::MAX.assume_utc());
         self.db
             .query(PUT)
             .bind(("key", key.to_string()))
@@ -169,7 +181,7 @@ impl<C: Connection> PageCache<C> {
             .bind(("url", extract.url))
             .bind(("title", extract.title))
             .bind(("text", extract.text))
-            .bind(("expires_at", to_datetime(now + ttl)))
+            .bind(("expires_at", to_datetime(expires_at)))
             .bind(("stored_at", to_datetime(now)))
             .await
             .and_then(|response| response.check())
@@ -278,6 +290,14 @@ mod tests {
         cache.put(&key, scrape_body("hello"), HOUR).await;
         assert_eq!(cache.get(&key).await, Some(scrape_body("hello")));
         assert_eq!(cache.get("scrape:other").await, None);
+    }
+
+    #[tokio::test]
+    async fn an_enormous_ttl_never_expires() {
+        let cache = PageCache::try_new(temp_db().await).await.unwrap();
+        let key = scrape_key("https://example.com/a");
+        cache.put(&key, scrape_body("hello"), Duration::MAX).await;
+        assert_eq!(cache.get(&key).await, Some(scrape_body("hello")));
     }
 
     #[tokio::test]

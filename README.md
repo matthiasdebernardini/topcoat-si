@@ -1014,7 +1014,7 @@ Two rules come from SurrealKV:
 
 ### Firecrawl cache
 
-`FirecrawlClient::with_cache` takes anything implementing `FirecrawlCache` and a time to live. An identical search or scrape within that time is answered from the cache and costs no credits; failures are never cached, and a cache error only costs a repeat call. `PageCache` is the SurrealDB implementation. It also indexes the cached markdown, so `PageCache::search` finds pages Claude has already fetched, and `purge_expired` drops stale rows.
+`FirecrawlClient::with_cache` takes anything implementing `FirecrawlCache` and a time to live. An identical search or scrape within that time is answered from the cache and costs no credits; failures are never cached (a page that answered with an error status, such as 404 or 503, counts as one), a scrape with `max_age` of zero skips the cache lookup, and a cache error only costs a repeat call. `PageCache` is the SurrealDB implementation. It also indexes the cached markdown, so `PageCache::search` finds pages Claude has already fetched, and `purge_expired` drops stale rows.
 
 ```rust,no_run
 #[cfg(feature = "surreal")]

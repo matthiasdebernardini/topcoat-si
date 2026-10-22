@@ -187,8 +187,8 @@ impl<C: Connection> Transcripts<C> {
     /// A stream of the transcript under `id`: one item for each later save. It ends when the
     /// transcript is deleted.
     ///
-    /// The stream lives as long as the database handle; dropping the handle ends it. A record
-    /// that cannot be decoded arrives as an `Err` and the stream goes on.
+    /// The stream holds its own client clone, so it outlives the handle it came from; dropping
+    /// the stream ends the live query. A record that cannot be decoded arrives as an `Err` and the stream goes on.
     ///
     /// # Errors
     ///

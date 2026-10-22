@@ -111,7 +111,12 @@ impl FirecrawlClient {
     pub async fn search(&self, request: &SearchRequest) -> Result<SearchResponse> {
         request.validate()?;
         let key = cache_key("search:", &request.wire());
-        if let Some(hit) = self.cached(key.as_deref()).await {
+        if let Some(mut hit) = self.cached::<SearchResponse>(key.as_deref()).await {
+            // A cached answer costs nothing, so a credit budget must not be charged again. An
+            // answer that reported no credits stays as it was.
+            if hit.credits_used.is_some() {
+                hit.credits_used = Some(0);
+            }
             return Ok(hit);
         }
         let response = self.post("/v2/search", &request.wire(), None).await?;
@@ -133,11 +138,23 @@ impl FirecrawlClient {
             .timeout
             .map(|t| (t + SCRAPE_TIMEOUT_MARGIN).max(DEFAULT_TIMEOUT));
         let key = cache_key("scrape:", &request.wire());
-        if let Some(hit) = self.cached(key.as_deref()).await {
+        // `max_age` of zero asks for a fresh page, so the lookup is skipped.
+        if request.options.max_age != Some(Duration::ZERO)
+            && let Some(hit) = self.cached(key.as_deref()).await
+        {
             return Ok(hit);
         }
-        let response = self.post("/v2/scrape", &request.wire(), timeout).await?;
-        self.store(key.as_deref(), &response).await;
+        let response: ScrapeResponse = self.post("/v2/scrape", &request.wire(), timeout).await?;
+        // A page that answered with an error status is a failure, so it is not cached either.
+        let page_failed = response
+            .data
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.status_code)
+            .is_some_and(|status| status >= 400);
+        if !page_failed {
+            self.store(key.as_deref(), &response).await;
+        }
         Ok(response)
     }
 
