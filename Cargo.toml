@@ -7,6 +7,9 @@ description = "Superintelligence for Topcoat apps: Claude, Jev and Firecrawl"
 license = "Apache-2.0"
 repository = "https://github.com/matthiasdebernardini/topcoat-si"
 
+[workspace]
+members = [".", "evals"]
+
 [features]
 code-mode = ["dep:monty-pool", "dep:monty-types"]
 
