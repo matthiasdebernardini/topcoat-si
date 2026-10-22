@@ -1070,7 +1070,7 @@ The tool examples need more keys:
 
 The Jev variables are `TYPESAFE_API_KEY` and `TYPESAFE_DEFAULT_MODEL`.
 
-`cargo test --test live -- --ignored` checks every model and the Firecrawl and Jev tools against the real APIs; it needs all four keys and costs a few cents.
+`cargo test --test live -- --ignored` checks every model and the three client tools (`web_search`, `fetch_page` and `jev`) against the real APIs. `MONTY_BIN=/path/to/monty cargo test --test live --features code-mode -- --ignored` runs those checks and code mode with all five built-in packs as well. Both need all four keys. The first costs a few cents; code mode adds a multi-turn Sonnet run, about ten cents more.
 
 ## License
 
