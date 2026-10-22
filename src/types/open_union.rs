@@ -4,7 +4,6 @@
 //! and is logged as a warning on the `topcoat_si::unknown` target the first time it appears in
 //! the process, so a new API value shows up in the logs instead of failing the whole reply.
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{LazyLock, Mutex};
@@ -63,25 +62,16 @@ fn first_sighting(type_name: &'static str, tag: &str) -> bool {
 /// Only the type name and the unknown tag or string are logged, never the payload, which can
 /// hold user content.
 pub(crate) fn warn_unknown(type_name: &'static str, tag: &str) {
-    let tag = shortened_tag(tag);
+    let tag = crate::http::truncate_chars(tag, MAX_UNKNOWN_TAG_CHARS, TRUNCATED_MARKER);
     if !first_sighting(type_name, &tag) {
         return;
     }
     tracing::warn!(
         target: "topcoat_si::unknown",
         rust_type = type_name,
-        tag = &*tag,
+        tag = tag.as_str(),
         "unknown API value; update topcoat-si to read it"
     );
-}
-
-/// Returns `tag` cut to its first [`MAX_UNKNOWN_TAG_CHARS`] chars and marked with
-/// [`TRUNCATED_MARKER`] when it is longer, or unchanged otherwise.
-fn shortened_tag(tag: &str) -> Cow<'_, str> {
-    match tag.char_indices().nth(MAX_UNKNOWN_TAG_CHARS) {
-        Some((end, _)) => Cow::Owned(format!("{}{TRUNCATED_MARKER}", &tag[..end])),
-        None => Cow::Borrowed(tag),
-    }
 }
 
 /// The validation error for an `Unknown` value in a request. It stands for an API value this

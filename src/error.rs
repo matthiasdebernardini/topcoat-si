@@ -89,12 +89,14 @@ pub enum ErrorKind {
     Connection,
     /// The request was sent, but no complete response arrived in time.
     Timeout,
-    /// The service refused: an HTTP error status, or an `error` event inside a stream.
+    /// The service refused: an HTTP error status, an `error` event inside a stream, or a
+    /// Firecrawl 2xx body with `success: false`.
     #[non_exhaustive]
     Api {
         /// The service that refused.
         service: Service,
-        /// The HTTP status; `None` for an `error` event inside a stream.
+        /// The HTTP status; `None` for an `error` event inside a stream or a Firecrawl 2xx body
+        /// with `success: false`.
         status: Option<u16>,
         /// Anthropic's `error.type`, such as `overloaded_error`.
         error_type: Option<ErrorType>,
@@ -374,8 +376,16 @@ impl fmt::Display for Error {
         match (status, error_type) {
             (Some(status), Some(error_type)) => write!(f, "HTTP {status} {error_type}")?,
             (Some(status), None) => write!(f, "HTTP {status}")?,
-            (None, Some(error_type)) => write!(f, "in stream, {error_type}")?,
-            (None, None) => f.write_str("in stream")?,
+            (None, error_type) => {
+                // Firecrawl's only refusal without an error status is a 2xx `success: false`.
+                f.write_str(match service {
+                    Service::Firecrawl => "success false",
+                    _ => "in stream",
+                })?;
+                if let Some(error_type) = error_type {
+                    write!(f, ", {error_type}")?;
+                }
+            }
         }
         if let Some(id) = &self.request_id {
             write!(f, ", request {id}")?;

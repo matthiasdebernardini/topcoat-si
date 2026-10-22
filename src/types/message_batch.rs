@@ -409,6 +409,21 @@ impl MessageBatchListParams {
         self
     }
 
+    /// The query-string pairs for this request.
+    pub(crate) fn query_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        if let Some(after_id) = &self.after_id {
+            pairs.push(("after_id".to_string(), after_id.clone()));
+        }
+        if let Some(before_id) = &self.before_id {
+            pairs.push(("before_id".to_string(), before_id.clone()));
+        }
+        if let Some(limit) = self.limit {
+            pairs.push(("limit".to_string(), limit.to_string()));
+        }
+        pairs
+    }
+
     /// Set beta feature headers for this list request.
     #[must_use]
     pub fn with_betas(mut self, betas: impl IntoIterator<Item = impl Into<String>>) -> Self {

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{
     BashTool, CodeExecutionTool, McpToolset, MemoryTool, TextEditorTool, ToolParam, ToolSearchTool,
-    ToolTextEditor20250728, WebFetchTool,
+    WebFetchTool,
 };
 
 /// Union type for different tool parameter types.
@@ -44,7 +44,7 @@ pub enum ToolUnionParam {
 
     /// A text editor tool for making changes to text (version 20250728)
     #[serde(rename = "text_editor_20250728")]
-    TextEditor20250728(ToolTextEditor20250728),
+    TextEditor20250728(TextEditorTool),
 
     /// A web fetch tool (version 20250910)
     #[serde(rename = "web_fetch_20250910")]
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn text_editor_20250728_tool() {
-        let text_editor_tool = ToolTextEditor20250728::new()
+        let text_editor_tool = TextEditorTool::new_20250728()
             .with_max_characters(5000)
             .with_ephemeral_cache_control();
         let tool = ToolUnionParam::TextEditor20250728(text_editor_tool);

@@ -249,19 +249,18 @@ impl UsageReportParams {
             })
     }
 
-    /// Build the URL-encoded query string, repeating array keys with a `[]` suffix.
-    #[must_use]
-    pub fn to_query(&self) -> String {
-        let mut query = url::form_urlencoded::Serializer::new(String::new());
-        query.append_pair("starting_at", &rfc3339(self.starting_at));
+    /// The query-string pairs for this request, repeating array keys with a `[]` suffix.
+    pub(crate) fn query_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        pairs.push(("starting_at".to_string(), rfc3339(self.starting_at)));
         if let Some(ending_at) = self.ending_at {
-            query.append_pair("ending_at", &rfc3339(ending_at));
+            pairs.push(("ending_at".to_string(), rfc3339(ending_at)));
         }
         if let Some(width) = self.bucket_width {
-            query.append_pair("bucket_width", &width.to_string());
+            pairs.push(("bucket_width".to_string(), width.to_string()));
         }
         for group in &self.group_by {
-            query.append_pair("group_by[]", group.as_str());
+            pairs.push(("group_by[]".to_string(), group.as_str().to_string()));
         }
         let arrays: [(&str, &[String]); 7] = [
             ("models[]", &self.models),
@@ -274,22 +273,22 @@ impl UsageReportParams {
         ];
         for (key, values) in arrays {
             for value in values {
-                query.append_pair(key, value);
+                pairs.push((key.to_string(), value.to_string()));
             }
         }
         for tier in &self.service_tiers {
-            query.append_pair("service_tiers[]", &wire_str(tier));
+            pairs.push(("service_tiers[]".to_string(), wire_str(tier)));
         }
         for speed in &self.speeds {
-            query.append_pair("speeds[]", &wire_str(speed));
+            pairs.push(("speeds[]".to_string(), wire_str(speed)));
         }
         if let Some(limit) = self.limit {
-            query.append_pair("limit", &limit.to_string());
+            pairs.push(("limit".to_string(), limit.to_string()));
         }
         if let Some(page) = &self.page {
-            query.append_pair("page", page);
+            pairs.push(("page".to_string(), page.clone()));
         }
-        query.finish()
+        pairs
     }
 }
 
@@ -443,6 +442,7 @@ pub struct UsageReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::encode_query;
 
     const REPORT: &str = r#"{"data":[{"ending_at":"2025-08-02T00:00:00Z","results":[{"account_id":"user_01WCz1FkmYMm4gnmykNKUu3Q","api_key_id":"apikey_01Rj2N8SVvo6BePZj99NhmiT","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"cache_read_input_tokens":200,"context_window":"0-200k","inference_geo":"global","model":"claude-opus-5-5","output_tokens":500,"server_tool_use":{"web_search_requests":10},"service_account_id":"svac_01Hk3R9TWxq7CfQak00OiVw4","service_tier":"standard","speed":"standard","uncached_input_tokens":1500,"workspace_id":"wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ"}],"starting_at":"2025-08-01T00:00:00Z"}],"has_more":true,"next_page":"page_MjAyNS0wNS0xNFQwMDowMDowMFo="}"#;
 
@@ -491,9 +491,9 @@ mod tests {
             .with_speed(InferenceSpeed::Fast)
             .with_limit(7)
             .with_page("page_abc")
-            .to_query();
+            .query_pairs();
         assert_eq!(
-            query,
+            encode_query(query),
             "starting_at=2025-08-01T00%3A00%3A00Z&ending_at=2025-08-08T00%3A00%3A00Z\
              &bucket_width=1d&group_by%5B%5D=model&group_by%5B%5D=workspace_id\
              &models%5B%5D=claude-opus-5-5&speeds%5B%5D=fast&limit=7&page=page_abc"
@@ -524,7 +524,7 @@ mod tests {
             .with_speed(InferenceSpeed::Standard);
         assert!(params.check_known_values().is_ok());
         assert_eq!(
-            params.to_query(),
+            encode_query(params.query_pairs()),
             "starting_at=2025-08-01T00%3A00%3A00Z&service_tiers%5B%5D=priority_on_demand\
              &service_tiers%5B%5D=flex_discount&speeds%5B%5D=standard"
         );

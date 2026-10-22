@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use crate::code_mode::{Example, HostError, Pack, PyError, host_fn, value};
 use crate::error::{ErrorKind, Result};
-use crate::jev::{self, JevClient, JevResponse, Questions, ToolQuestion};
+use crate::jev::{self, JevClient, JevResponse, Outcome, Questions, ToolQuestion};
 
 // The one question the shortcuts ask. Jev never sees names.
 const QUESTION: &str = "answer";
@@ -88,10 +88,10 @@ pub fn jev(client: JevClient) -> Pack {
                 async move {
                     let questions = Questions::new().noul(QUESTION, args.question);
                     let response = mapped(client.ask(args.state, &questions).await)?;
-                    let p = mapped(response.noul(QUESTION))?;
-                    let certainty = (2.0 * p - 1.0).abs();
-                    let answer = (certainty >= args.min_certainty).then_some(p >= 0.5);
-                    Ok(json!({"answer": answer, "best": p >= 0.5, "certainty": certainty}))
+                    let (outcome, certainty) =
+                        mapped(response.yes_no_certainty(QUESTION, args.min_certainty))?;
+                    let (Outcome::Answered(best) | Outcome::Unsure { best, .. }) = outcome;
+                    Ok(json!({"answer": outcome.answered(), "best": best, "certainty": certainty}))
                 }
             },
         ))

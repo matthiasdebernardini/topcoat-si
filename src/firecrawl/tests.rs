@@ -519,17 +519,17 @@ fn api_key_with_inner_whitespace_is_rejected() {
 }
 
 #[test]
-fn api_key_not_allowed_in_a_header_keeps_the_header_error() {
+fn api_key_not_allowed_in_a_header_is_not_printable_ascii() {
     let error = FirecrawlClient::try_new("fc-key\nInjected: 1").unwrap_err();
     assert!(
-        matches!(error.kind(), ErrorKind::Validation { .. }),
+        matches!(error.kind(), ErrorKind::Validation { param } if param.as_deref() == Some("api_key")),
         "{error:?}"
     );
-    let source = error.source().expect("the header error is the source");
-    assert!(
-        source.is::<reqwest::header::InvalidHeaderValue>(),
-        "{source:?}"
+    assert_eq!(
+        error.to_string(),
+        "Firecrawl api_key must be printable ASCII without whitespace"
     );
+    assert!(error.source().is_none());
 }
 
 #[test]
@@ -1439,19 +1439,30 @@ async fn unparseable_success_leaks_neither_text_nor_source() {
 }
 
 #[tokio::test]
-async fn success_false_on_2xx_is_decode_without_status() {
+async fn success_false_on_2xx_is_api_without_status() {
     let (url, _) = serve(vec![Canned::json(
         200,
-        json!({"success": false, "error": "x"}).to_string(),
+        json!({"success": false, "error": "x", "code": "SCRAPE_FAILED"}).to_string(),
     )])
     .await;
     let err = client(&url)
         .search(&SearchRequest::new("q"))
         .await
         .unwrap_err();
-    assert!(matches!(err.kind(), ErrorKind::Decode), "{err:?}");
+    assert!(
+        matches!(
+            err.kind(),
+            ErrorKind::Api { service: Service::Firecrawl, status: None, error_code: Some(ErrorCode::Firecrawl(code)), .. }
+                if code == "SCRAPE_FAILED"
+        ),
+        "{err:?}"
+    );
     assert_eq!(err.status(), None);
-    assert!(err.to_string().ends_with(": x"), "{err}");
+    assert!(!err.is_retryable());
+    assert_eq!(
+        err.to_string(),
+        "Firecrawl API error: x (success false, SCRAPE_FAILED)"
+    );
 }
 
 #[tokio::test]

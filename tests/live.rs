@@ -7,11 +7,11 @@ use futures::StreamExt;
 use topcoat_si::jev::{JevClient, JevTool};
 use topcoat_si::{
     AccumulatingStream, Anthropic, ClientTool, ContentBlock, FirecrawlClient, FirecrawlWebSearch,
-    KnownModel, Message, MessageCreateParams, MessageParam, Model,
+    KnownModel, Message, MessageCreateParams, MessageParam, Model, StopReason,
 };
 
 // Enough for the models whose thinking cannot be disabled to think and still answer.
-const MAX_TOKENS: u32 = 1024;
+const MAX_TOKENS: u32 = 4096;
 const PROMPT: &str = "Reply with the single word: pong";
 
 fn text(message: &Message) -> String {
@@ -25,10 +25,26 @@ fn text(message: &Message) -> String {
         .collect()
 }
 
+/// Why a finished reply does not count as an answer, if it does not: it must end its turn and
+/// carry text.
+fn unanswered(message: &Message) -> Option<String> {
+    if message.stop_reason != Some(StopReason::EndTurn) {
+        return Some(format!(
+            "stopped with {:?}, not end_turn: {message:?}",
+            message.stop_reason
+        ));
+    }
+    if text(message).trim().is_empty() {
+        return Some(format!("gave no text: {message:?}"));
+    }
+    None
+}
+
 #[tokio::test]
 #[ignore = "live: calls the real APIs and costs money"]
 async fn every_model_answers() {
     let client = Anthropic::try_new(None).expect("ANTHROPIC_API_KEY");
+    let mut failures = Vec::new();
     // Listed by hand so a new variant is a conscious add.
     for model in [
         KnownModel::ClaudeOpus55,
@@ -39,41 +55,61 @@ async fn every_model_answers() {
         let messages = vec![MessageParam::user(PROMPT)];
 
         let params = MessageCreateParams::new(MAX_TOKENS, messages.clone(), Model::Known(model));
-        let message = match client.send(&params).await {
-            Ok(message) => message,
-            Err(err) => panic!("{model} send failed: {err} ({:?})", err.kind()),
-        };
-        assert!(
-            !text(&message).trim().is_empty(),
-            "{model} send gave no text: {message:?}"
-        );
-        assert!(
-            message.usage.output_tokens > 0,
-            "{model} send reported no output tokens: {:?}",
-            message.usage
-        );
+        match client.send(&params).await {
+            Ok(message) => {
+                if let Some(why) = unanswered(&message) {
+                    failures.push(format!("{model} send {why}"));
+                } else if message.usage.output_tokens == 0 {
+                    failures.push(format!(
+                        "{model} send reported no output tokens: {:?}",
+                        message.usage
+                    ));
+                }
+            }
+            Err(err) => failures.push(format!("{model} send failed: {err} ({:?})", err.kind())),
+        }
 
         let params = MessageCreateParams::new_streaming(MAX_TOKENS, messages, Model::Known(model));
         let events = match client.stream(&params).await {
             Ok(events) => events,
-            Err(err) => panic!("{model} stream failed: {err} ({:?})", err.kind()),
+            Err(err) => {
+                failures.push(format!("{model} stream failed: {err} ({:?})", err.kind()));
+                continue;
+            }
         };
         let (mut events, done) = AccumulatingStream::new(events);
+        let mut event_failed = false;
         while let Some(event) = events.next().await {
             if let Err(err) = event {
-                panic!("{model} stream event failed: {err} ({:?})", err.kind());
+                failures.push(format!(
+                    "{model} stream event failed: {err} ({:?})",
+                    err.kind()
+                ));
+                event_failed = true;
             }
         }
-        let message = match done.await {
-            Ok(Ok(message)) => message,
-            Ok(Err(err)) => panic!("{model} stream ended with: {err} ({:?})", err.kind()),
-            Err(_) => panic!("{model} stream ended without a final message"),
-        };
-        assert!(
-            !text(&message).trim().is_empty(),
-            "{model} stream gave no text: {message:?}"
-        );
+        if event_failed {
+            continue;
+        }
+        match done.await {
+            Ok(Ok(message)) => {
+                if let Some(why) = unanswered(&message) {
+                    failures.push(format!("{model} stream {why}"));
+                }
+            }
+            Ok(Err(err)) => failures.push(format!(
+                "{model} stream ended with: {err} ({:?})",
+                err.kind()
+            )),
+            Err(_) => failures.push(format!("{model} stream ended without a final message")),
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 #[tokio::test]

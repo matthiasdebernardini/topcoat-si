@@ -6,7 +6,7 @@
 //! | Target | Level | Message | Fields |
 //! |---|---|---|---|
 //! | `topcoat_si::client` | `DEBUG` | `request_completed` | `duration_seconds: f64`, `ok: bool` |
-//! | `topcoat_si::client` | `DEBUG` | `retry` | `backoff_seconds: f64` |
+//! | `topcoat_si::client` | `WARN` | `retry` | `error` (Display), `attempt: usize` (1 for the first retry), `backoff_seconds: f64` |
 //! | `topcoat_si::stream` | `TRACE` | `event` | (none) |
 //! | `topcoat_si::stream` | `TRACE` | `bytes` | `bytes: u64` |
 //! | `topcoat_si::stream` | `DEBUG` | `first_byte` | `ttfb_seconds: f64` |
@@ -27,15 +27,6 @@ pub(crate) fn request_completed(duration: Duration, ok: bool) {
         duration_seconds = duration.as_secs_f64(),
         ok,
         "request_completed"
-    );
-}
-
-/// One retry is about to sleep for `backoff`.
-pub(crate) fn retry(backoff: Duration) {
-    tracing::debug!(
-        target: "topcoat_si::client",
-        backoff_seconds = backoff.as_secs_f64(),
-        "retry"
     );
 }
 

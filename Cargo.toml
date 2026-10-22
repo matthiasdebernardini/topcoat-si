@@ -8,9 +8,6 @@ license = "Apache-2.0"
 repository = "https://github.com/matthiasdebernardini/topcoat-si"
 
 [features]
-default = ["rustls-tls"]
-
-rustls-tls = ["reqwest/rustls"]
 code-mode = ["dep:monty-pool", "dep:monty-types"]
 
 [dependencies]
@@ -18,7 +15,7 @@ tracing = "0.1"
 base64 = "0.22.1"
 bytes = "1.11.1"
 futures = "0.3.32"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 schemars = { version = "1.2.3", features = ["preserve_order"] }

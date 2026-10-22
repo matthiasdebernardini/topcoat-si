@@ -16,7 +16,7 @@ use reqwest::{Client as ReqwestClient, Method, Response, header, redirect};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tracing::{Instrument, Span, field};
-use url::{Url, form_urlencoded};
+use url::Url;
 
 use crate::backoff::{self, RetryPolicy};
 use crate::base_url;
@@ -24,6 +24,7 @@ use crate::error::{
     Error, ErrorCode, ErrorKind, RequestPhase, Result, Service, describe_json_error,
     map_reqwest_error,
 };
+use crate::http;
 use crate::observability;
 use crate::sse::process_message_stream_sse;
 use crate::types::{
@@ -236,13 +237,6 @@ fn message_betas(params: &MessageCreateParams) -> Vec<&'static str> {
     betas
 }
 
-/// The encoded query string of `pairs`.
-fn encode_query(pairs: Vec<(String, String)>) -> String {
-    form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(pairs)
-        .finish()
-}
-
 /// Base URLs of providers that authenticate via the standard HTTP
 /// `Authorization: Bearer ${API_KEY}` header rather than (or in addition to)
 /// Anthropic's `x-api-key` header. When the client's configured base URL
@@ -411,11 +405,7 @@ fn response_metadata(response: &Response) -> ResponseMetadata {
     let span = Span::current();
     let status = response.status().as_u16();
     span.record("http.status_code", status);
-    let request_id = response
-        .headers()
-        .get("request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(String::from);
+    let request_id = http::header_str(response.headers(), "request-id").map(String::from);
     if let Some(id) = &request_id {
         span.record("request_id", id.as_str());
     }
@@ -858,8 +848,8 @@ impl Anthropic {
             }
         }
         let mut url = self.build_url(path)?;
-        if let Some(query) = query.as_deref().filter(|query| !query.is_empty()) {
-            url.set_query(Some(query));
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
         }
         let client = match mode {
             ResponseMode::Buffered => &self.client,
@@ -892,7 +882,15 @@ impl Anthropic {
                 }
                 read(response).await
             },
-            |_, _, delay| observability::retry(delay),
+            |error, attempt, delay| {
+                tracing::warn!(
+                    target: "topcoat_si::client",
+                    error = %error,
+                    attempt = attempt + 1,
+                    backoff_seconds = delay.as_secs_f64(),
+                    "retry"
+                );
+            },
         )
         .await;
         Span::current().record("attempts", retried.attempts);
@@ -988,6 +986,11 @@ impl Anthropic {
     /// Reads the whole body of a successful response.
     async fn read_bytes(response: Response) -> Result<Bytes> {
         let request_id = response_metadata(&response).request_id;
+        Self::body_bytes(response, request_id).await
+    }
+
+    /// Reads the whole body of a response whose metadata was already read.
+    async fn body_bytes(response: Response, request_id: Option<String>) -> Result<Bytes> {
         response.bytes().await.map_err(|error| {
             map_reqwest_error(error, RequestPhase::Body).with_request_id(request_id)
         })
@@ -995,7 +998,7 @@ impl Anthropic {
 
     async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T> {
         let request_id = response_metadata(&response).request_id;
-        let body = Self::read_bytes(response).await?;
+        let body = Self::body_bytes(response, request_id.clone()).await?;
         tracing::trace!(target: "topcoat_si::wire", response = %String::from_utf8_lossy(&body));
         // serde's message can quote the body, so neither it nor the error itself is kept.
         serde_json::from_slice(&body).map_err(|error| {
@@ -1147,12 +1150,9 @@ impl Anthropic {
 
     /// Retrieve a Message Batch by ID.
     pub async fn get_message_batch(&self, message_batch_id: &str) -> Result<MessageBatch> {
-        let path = [
-            "messages",
-            "batches",
-            path_id("message_batch_id", message_batch_id)?,
-        ];
-        let call = Call::new("get_message_batch", Method::GET, &path);
+        let path = ["messages", "batches", message_batch_id];
+        let call = Call::new("get_message_batch", Method::GET, &path)
+            .and_check(path_id("message_batch_id", message_batch_id));
         self.execute(call, Self::decode_response).await
     }
 
@@ -1166,19 +1166,10 @@ impl Anthropic {
                 .as_ref()
                 .and_then(|params| params.betas.clone())
                 .unwrap_or_default(),
-            query: params.as_ref().map(|params| {
-                let mut query = form_urlencoded::Serializer::new(String::new());
-                if let Some(after_id) = &params.after_id {
-                    query.append_pair("after_id", after_id);
-                }
-                if let Some(before_id) = &params.before_id {
-                    query.append_pair("before_id", before_id);
-                }
-                if let Some(limit) = params.limit {
-                    query.append_pair("limit", &limit.to_string());
-                }
-                query.finish()
-            }),
+            query: params
+                .as_ref()
+                .map(MessageBatchListParams::query_pairs)
+                .unwrap_or_default(),
             ..Call::new(
                 "list_message_batches",
                 Method::GET,
@@ -1190,13 +1181,9 @@ impl Anthropic {
 
     /// Cancel a Message Batch that is currently processing.
     pub async fn cancel_message_batch(&self, message_batch_id: &str) -> Result<MessageBatch> {
-        let path = [
-            "messages",
-            "batches",
-            path_id("message_batch_id", message_batch_id)?,
-            "cancel",
-        ];
-        let call = Call::new("cancel_message_batch", Method::POST, &path);
+        let path = ["messages", "batches", message_batch_id, "cancel"];
+        let call = Call::new("cancel_message_batch", Method::POST, &path)
+            .and_check(path_id("message_batch_id", message_batch_id));
         self.execute(call, Self::decode_response).await
     }
 
@@ -1205,12 +1192,9 @@ impl Anthropic {
         &self,
         message_batch_id: &str,
     ) -> Result<DeletedMessageBatch> {
-        let path = [
-            "messages",
-            "batches",
-            path_id("message_batch_id", message_batch_id)?,
-        ];
-        let call = Call::new("delete_message_batch", Method::DELETE, &path);
+        let path = ["messages", "batches", message_batch_id];
+        let call = Call::new("delete_message_batch", Method::DELETE, &path)
+            .and_check(path_id("message_batch_id", message_batch_id));
         self.execute(call, Self::decode_response).await
     }
 
@@ -1219,16 +1203,12 @@ impl Anthropic {
         &self,
         message_batch_id: &str,
     ) -> Result<impl Stream<Item = Result<MessageBatchResult>> + use<>> {
-        let path = [
-            "messages",
-            "batches",
-            path_id("message_batch_id", message_batch_id)?,
-            "results",
-        ];
+        let path = ["messages", "batches", message_batch_id, "results"];
         let call = Call {
             stream: true,
             mode: ResponseMode::Streaming,
             ..Call::new("stream_message_batch_results", Method::GET, &path)
+                .and_check(path_id("message_batch_id", message_batch_id))
         };
         self.execute(call, |response| async move {
             let request_id = response_metadata(&response).request_id;
@@ -1253,7 +1233,8 @@ impl Anthropic {
                 .unwrap_or_default(),
             query: params
                 .as_ref()
-                .map(|params| encode_query(params.query_pairs())),
+                .map(ModelListParams::query_pairs)
+                .unwrap_or_default(),
             check: params
                 .as_ref()
                 .map_or(Ok(()), ModelListParams::check_known_values),
@@ -1269,7 +1250,7 @@ impl Anthropic {
     pub async fn usage_report(&self, params: UsageReportParams) -> Result<UsageReport> {
         let path = ["organizations", "usage_report", "messages"];
         let call = Call {
-            query: Some(params.to_query()),
+            query: params.query_pairs(),
             check: params.check_known_values(),
             ..Call::new("usage_report", Method::GET, &path)
         };
@@ -1282,7 +1263,7 @@ impl Anthropic {
     /// (`sk-ant-admin01-...`), which is sent in the same `x-api-key` header.
     pub async fn cost_report(&self, params: CostReportParams) -> Result<CostReport> {
         let call = Call {
-            query: Some(params.to_query()),
+            query: params.query_pairs(),
             ..Call::new(
                 "cost_report",
                 Method::GET,
@@ -1297,8 +1278,9 @@ impl Anthropic {
     /// Returns detailed information about the specified model, including its
     /// ID, creation date, display name, and type.
     pub async fn get_model(&self, model_id: &str) -> Result<ModelInfo> {
-        let path = ["models", path_id("model_id", model_id)?];
-        let call = Call::new("get_model", Method::GET, &path);
+        let path = ["models", model_id];
+        let call =
+            Call::new("get_model", Method::GET, &path).and_check(path_id("model_id", model_id));
         self.execute(call, Self::decode_response).await
     }
 
@@ -1356,7 +1338,8 @@ impl Anthropic {
         let call = Call {
             query: params
                 .as_ref()
-                .map(|params| encode_query(params.query_pairs())),
+                .map(FileListParams::query_pairs)
+                .unwrap_or_default(),
             ..Call::new("list_files", Method::GET, &["files"])
         };
         self.execute(call, Self::decode_response).await
@@ -1364,8 +1347,8 @@ impl Anthropic {
 
     /// Fetch the metadata of a file.
     pub async fn get_file(&self, file_id: &str) -> Result<FileInfo> {
-        let path = ["files", path_id("file_id", file_id)?];
-        let call = Call::new("get_file", Method::GET, &path);
+        let path = ["files", file_id];
+        let call = Call::new("get_file", Method::GET, &path).and_check(path_id("file_id", file_id));
         self.execute(call, Self::decode_response).await
     }
 
@@ -1373,32 +1356,33 @@ impl Anthropic {
     ///
     /// Only files created by code execution or skills are downloadable.
     pub async fn download_file(&self, file_id: &str) -> Result<Bytes> {
-        let path = ["files", path_id("file_id", file_id)?, "content"];
+        let path = ["files", file_id, "content"];
         let call = Call {
             mode: ResponseMode::Streaming,
-            ..Call::new("download_file", Method::GET, &path)
+            ..Call::new("download_file", Method::GET, &path).and_check(path_id("file_id", file_id))
         };
         self.execute(call, Self::read_bytes).await
     }
 
     /// Delete a file.
     pub async fn delete_file(&self, file_id: &str) -> Result<DeletedFile> {
-        let path = ["files", path_id("file_id", file_id)?];
-        let call = Call::new("delete_file", Method::DELETE, &path);
+        let path = ["files", file_id];
+        let call =
+            Call::new("delete_file", Method::DELETE, &path).and_check(path_id("file_id", file_id));
         self.execute(call, Self::decode_response).await
     }
 }
 
-/// Returns `id` for use as one path segment, rejecting the empty, `.` and `..` IDs that
+/// Checks `id` for use as one path segment, rejecting the empty, `.` and `..` IDs that
 /// [`Anthropic::build_url`] would drop or turn into another endpoint. `param` names the argument.
-fn path_id<'a>(param: &str, id: &'a str) -> Result<&'a str> {
+fn path_id(param: &str, id: &str) -> Result<()> {
     if matches!(id, "" | "." | "..") {
         return Err(Error::validation(
             format!("{param} must not be empty, `.` or `..`"),
             Some(param.to_string()),
         ));
     }
-    Ok(id)
+    Ok(())
 }
 
 /// One API call for [`Anthropic::execute`]: what to send and how its span is labelled.
@@ -1412,8 +1396,8 @@ struct Call<'a> {
     method: Method,
     /// Path segments after `/v1`, each percent-encoded on its own.
     path: &'a [&'a str],
-    /// The encoded query string.
-    query: Option<String>,
+    /// The query-string pairs, encoded when the URL is built.
+    query: Vec<(String, String)>,
     body: Option<Bytes>,
     /// Replaces the default `application/json` content type.
     content_type: Option<String>,
@@ -1436,7 +1420,7 @@ impl<'a> Call<'a> {
             stream: false,
             method,
             path,
-            query: None,
+            query: Vec::new(),
             body: None,
             content_type: None,
             accept: None,
@@ -1487,7 +1471,7 @@ impl<'a> Call<'a> {
 mod tests {
     use super::*;
     use crate::test_support::{
-        Canned, Recorded, read_request, record_targets, serve, uses_proxies,
+        Canned, Recorded, read_request, record_events, record_targets, serve, uses_proxies,
     };
     use crate::{
         KnownModel, McpToolset, MessageBatchCreateParams, MessageBatchCreateRequest,
@@ -2478,6 +2462,7 @@ Connection: close\r\n\r\nevent: ping\n",
     async fn dot_and_empty_ids_fail_before_sending() {
         let (base_url, recorded) = serve(Vec::new()).await;
         let client = files_client(base_url);
+        let (guard, events) = record_events("topcoat_si::client");
 
         for id in ["", ".", ".."] {
             let errors = [
@@ -2499,7 +2484,16 @@ Connection: close\r\n\r\nevent: ping\n",
                 "{id:?}"
             );
         }
+        drop(guard);
         assert!(recorded.lock().unwrap().is_empty());
+        let events = events.lock().unwrap();
+        let count = |message: &str| events.iter().filter(|e| e.message == message).count();
+        assert_eq!(
+            count("request_completed"),
+            12,
+            "a bad ID is reported like any other failure: {events:?}"
+        );
+        assert_eq!(count("API request failed"), 12, "{events:?}");
     }
 
     #[tokio::test]
@@ -2855,6 +2849,41 @@ Connection: close\r\n\r\nevent: ping\n",
     }
 
     #[tokio::test]
+    async fn stream_passes_events_through_without_accumulating() {
+        let start = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-haiku-5-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}
+
+"#;
+        let stop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let events = |body: String| async move {
+            let canned = Canned::json(200, body).with_content_type("text/event-stream");
+            let (base_url, _) = serve(vec![canned]).await;
+            let client = quiet_client(base_url);
+            let stream = client.stream(&streaming_params()).await.unwrap();
+            stream.collect::<Vec<_>>().await
+        };
+
+        let complete = events(format!("{start}{stop}")).await;
+        assert_eq!(complete.len(), 2, "{complete:?}");
+        assert!(
+            matches!(&complete[0], Ok(MessageStreamEvent::MessageStart(_))),
+            "{complete:?}"
+        );
+        assert!(
+            matches!(&complete[1], Ok(MessageStreamEvent::MessageStop(_))),
+            "{complete:?}"
+        );
+
+        let cut = events(start.to_string()).await;
+        assert!(
+            matches!(&cut[0], Ok(MessageStreamEvent::MessageStart(_))),
+            "{cut:?}"
+        );
+        let last = cut.last().unwrap().as_ref().unwrap_err();
+        assert_eq!(last.kind(), &ErrorKind::Interrupted, "{cut:?}");
+    }
+
+    #[tokio::test]
     async fn batch_result_items_keep_their_kind_with_or_without_a_request_id() {
         let mut kinds = Vec::new();
         for request_id in [Some("req_batch"), None] {
@@ -3122,5 +3151,36 @@ Connection: close\r\n\r\nevent: ping\n",
         let message = untimed_client(base_url).send(&send_params()).await.unwrap();
         assert_eq!(message.id, "msg_1");
         assert_eq!(recorded.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_logs_one_event_with_its_cause() {
+        let overloaded =
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let (base_url, _) = serve(vec![
+            Canned::json(529, overloaded),
+            Canned::json(200, reply_json()),
+        ])
+        .await;
+        let client = untimed_client(base_url);
+        let (guard, events) = record_events("topcoat_si::client");
+        client.send(&send_params()).await.unwrap();
+        drop(guard);
+
+        let events = events.lock().unwrap();
+        let retries: Vec<_> = events.iter().filter(|e| e.message == "retry").collect();
+        assert_eq!(retries.len(), 1, "{events:?}");
+        assert_eq!(retries[0].level, tracing::Level::WARN);
+        assert!(
+            retries[0]
+                .fields
+                .starts_with("error=Anthropic API error: Overloaded (HTTP 529 overloaded_error) attempt=1 backoff_seconds="),
+            "{retries:?}"
+        );
+        let completed = events
+            .iter()
+            .filter(|e| e.message == "request_completed")
+            .count();
+        assert_eq!(completed, 1, "{events:?}");
     }
 }

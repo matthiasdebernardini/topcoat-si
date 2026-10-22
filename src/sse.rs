@@ -1,6 +1,6 @@
 //! Server-Sent Events (SSE) framing and decoding for streaming responses.
 //!
-//! This module provides the hardened raw SSE parser used by Topcoat SI and
+//! This module provides the raw SSE parser used by Topcoat SI and
 //! protocol-specific decoding helpers for Anthropic message streams.
 
 use bytes::Bytes;
@@ -39,7 +39,7 @@ impl SseEvent {
     }
 }
 
-/// State for SSE processing with production hardening
+/// The parser state: buffered text, a split UTF-8 sequence carried over, and timing.
 struct SseState {
     buffer: String,
     pending_utf8: Vec<u8>,
@@ -66,7 +66,6 @@ where
         result.map_err(|error| crate::error::map_reqwest_error(error, RequestPhase::Body))
     });
 
-    // Initialize state with production hardening
     let state = SseState {
         buffer: String::new(),
         pending_utf8: Vec::new(),

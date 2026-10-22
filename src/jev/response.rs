@@ -158,12 +158,19 @@ impl JevResponse {
     /// The answer is yes when `p >= 0.5`. Certainty measures how far `p` is from a coin flip,
     /// not whether the answer is correct.
     pub fn yes_no(&self, name: &str, min_certainty: f64) -> Result<Outcome<bool>> {
+        self.yes_no_certainty(name, min_certainty)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// [`JevResponse::yes_no`] with the certainty, which [`Outcome::Answered`] leaves out.
+    pub(crate) fn yes_no_certainty(
+        &self,
+        name: &str,
+        min_certainty: f64,
+    ) -> Result<(Outcome<bool>, f64)> {
         let p = self.noul(name)?;
-        Ok(outcome::gate(
-            p >= 0.5,
-            (2.0 * p - 1.0).abs(),
-            min_certainty,
-        ))
+        let certainty = (2.0 * p - 1.0).abs();
+        Ok((outcome::gate(p >= 0.5, certainty, min_certainty), certainty))
     }
 
     /// The answer to choice question `name`.

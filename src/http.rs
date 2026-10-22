@@ -11,25 +11,24 @@ use crate::types::retry_after_from_headers;
 
 /// Builds the sensitive `Authorization: Bearer` value for `api_key`.
 ///
-/// Fails when the key is empty after trimming, holds characters not allowed in an HTTP header
-/// (keeping the header error as the source), or is not printable ASCII without whitespace.
+/// Fails when the key is empty after trimming or is not printable ASCII without whitespace.
 pub(crate) fn bearer(service: Service, api_key: &str) -> Result<HeaderValue> {
     let invalid = |message: String| Error::validation(message, Some("api_key".to_string()));
     let api_key = api_key.trim();
     if api_key.is_empty() {
         return Err(invalid(format!("{service} API key is empty")));
     }
-    let mut authorization = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+    // Printable ASCII is always a valid header value, so `from_str` cannot fail past this check.
+    let not_printable = || {
         invalid(format!(
-            "{service} API key contains characters not allowed in an HTTP header"
+            "{service} api_key must be printable ASCII without whitespace"
         ))
-        .with_source(e)
-    })?;
+    };
     if !api_key.chars().all(|c| c.is_ascii_graphic()) {
-        return Err(invalid(format!(
-            "{service} API key must be printable ASCII without whitespace"
-        )));
+        return Err(not_printable());
     }
+    let mut authorization =
+        HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|_| not_printable())?;
     authorization.set_sensitive(true);
     Ok(authorization)
 }

@@ -42,9 +42,10 @@ Topcoat SI is not on crates.io. Depend on it through git:
 git = "https://github.com/matthiasdebernardini/topcoat-si"
 ```
 
+TLS always goes through rustls.
+
 | Feature | What it does |
 |---|---|
-| `rustls-tls` | TLS through rustls. On by default. |
 | `code-mode` | Adds [code mode](#code-mode). Off by default. |
 
 ## A first request
@@ -860,7 +861,7 @@ The crate also emits plain tracing events. Aggregate them with any subscriber. D
 |---|---|---|---|
 | `topcoat_si::usage` | `INFO` | `usage` | see below |
 | `topcoat_si::client` | `DEBUG` | `request_completed` | `duration_seconds`, `ok` |
-| `topcoat_si::client` | `DEBUG` | `retry` | `backoff_seconds` |
+| `topcoat_si::client` | `WARN` | `retry` | `error`, `attempt`, `backoff_seconds` |
 | `topcoat_si::stream` | `TRACE` | `event` | |
 | `topcoat_si::stream` | `TRACE` | `bytes` | `bytes` |
 | `topcoat_si::stream` | `DEBUG` | `first_byte` | `ttfb_seconds` |
@@ -970,7 +971,7 @@ Other accessors: `request_id()` when a response carried one, `status()` and `ret
 | `UnsupportedSchema` | structured outputs cannot use this type, such as a recursive one | no |
 | `Connection` | the connection failed before any response arrived: DNS, refused, TLS, connect timeout, or a reset before the reply. Usually nothing reached the server; when the request was already written it may have, which Anthropic's SDKs also accept when they resend | yes |
 | `Timeout` | the request was sent, but no complete response arrived in time | yes |
-| `Api` | the service refused: an HTTP error status, or an `error` event in a stream, which has no status | 408, 409, 429, 5xx; a stream event that says `retryable`, else one of type `overloaded_error`, `api_error`, `rate_limit_error` or `timeout_error` |
+| `Api` | the service refused: an HTTP error status, an `error` event in a stream, or a Firecrawl 2xx body with `success: false`; the last two have no status | 408, 409, 429, 5xx; a stream event that says `retryable`, else one of type `overloaded_error`, `api_error`, `rate_limit_error` or `timeout_error` |
 | `Interrupted` | the response started, then stopped: the connection dropped mid-body, or a stream ended before `message_stop` | yes |
 | `Decode` | a success response is not what was expected | no |
 | `MaxTokens` | structured output was cut off; retry with more tokens | no |

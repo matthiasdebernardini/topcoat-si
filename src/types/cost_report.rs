@@ -82,25 +82,27 @@ impl CostReportParams {
         self
     }
 
-    /// Build the URL-encoded query string, repeating array keys with a `[]` suffix.
-    #[must_use]
-    pub fn to_query(&self) -> String {
-        let mut query = url::form_urlencoded::Serializer::new(String::new());
-        query.append_pair("starting_at", &usage_report::rfc3339(self.starting_at));
+    /// The query-string pairs for this request, repeating array keys with a `[]` suffix.
+    pub(crate) fn query_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        pairs.push((
+            "starting_at".to_string(),
+            usage_report::rfc3339(self.starting_at),
+        ));
         if let Some(ending_at) = self.ending_at {
-            query.append_pair("ending_at", &usage_report::rfc3339(ending_at));
+            pairs.push(("ending_at".to_string(), usage_report::rfc3339(ending_at)));
         }
-        query.append_pair("bucket_width", "1d");
+        pairs.push(("bucket_width".to_string(), "1d".to_string()));
         for group in &self.group_by {
-            query.append_pair("group_by[]", group.as_str());
+            pairs.push(("group_by[]".to_string(), group.as_str().to_string()));
         }
         if let Some(limit) = self.limit {
-            query.append_pair("limit", &limit.to_string());
+            pairs.push(("limit".to_string(), limit.to_string()));
         }
         if let Some(page) = &self.page {
-            query.append_pair("page", page);
+            pairs.push(("page".to_string(), page.clone()));
         }
-        query.finish()
+        pairs
     }
 }
 
@@ -278,6 +280,7 @@ pub struct CostReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::encode_query;
     use time::format_description::well_known::Rfc3339;
 
     const REPORT: &str = r#"{"data":[{"ending_at":"2025-08-02T00:00:00Z","results":[{"amount":"123.78912","context_window":"0-200k","cost_type":"tokens","currency":"USD","description":"Claude Opus 5.5 Usage - Input Tokens","inference_geo":"global","model":"claude-opus-5-5","service_tier":"standard","speed":"standard","token_type":"cache_creation.ephemeral_1h_input_tokens","workspace_id":"wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ"}],"starting_at":"2025-08-01T00:00:00Z"}],"has_more":true,"next_page":"page_MjAyNS0wNS0xNFQwMDowMDowMFo="}"#;
@@ -353,9 +356,9 @@ mod tests {
             .group_by(CostGroupBy::Description)
             .group_by(CostGroupBy::WorkspaceId)
             .with_limit(31)
-            .to_query();
+            .query_pairs();
         assert_eq!(
-            query,
+            encode_query(query),
             "starting_at=2025-08-01T00%3A00%3A00Z&bucket_width=1d\
              &group_by%5B%5D=description&group_by%5B%5D=workspace_id&limit=31"
         );

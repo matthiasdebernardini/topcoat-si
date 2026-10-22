@@ -73,7 +73,6 @@ mod thinking_delta;
 mod tool_choice;
 mod tool_param;
 mod tool_result_block;
-mod tool_text_editor_20250728;
 mod tool_union_param;
 mod tool_use_block;
 mod url_image_source;
@@ -206,7 +205,6 @@ pub use tool_search_tool::ToolSearchTool;
 pub use tool_search_tool_result_block::{
     ToolReference, ToolSearchToolResultBlock, ToolSearchToolResultContent,
 };
-pub use tool_text_editor_20250728::ToolTextEditor20250728;
 pub use tool_union_param::ToolUnionParam;
 pub use tool_use_block::ToolUseBlock;
 pub use url_image_source::UrlImageSource;
