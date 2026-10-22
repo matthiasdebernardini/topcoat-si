@@ -126,7 +126,7 @@ where
 
 const DEFAULT_API_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_API_VERSION: &str = "2026-10-21";
-/// Total deadline for non-streaming requests; streams use a separate read timeout.
+/// Total deadline for non-streaming requests and inactivity timeout for stream reads.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// A longer `retry-after` gives up at once instead of waiting.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
@@ -449,6 +449,15 @@ enum ResponseMode {
     Streaming,
 }
 
+/// How an HTTP client bounds its responses.
+#[derive(Clone, Copy)]
+enum Deadline {
+    /// A total deadline for the whole request.
+    Total,
+    /// An inactivity timeout between reads of the body.
+    Read(Duration),
+}
+
 /// Client for the Anthropic API.
 #[derive(Clone)]
 pub struct Anthropic {
@@ -457,6 +466,8 @@ pub struct Anthropic {
     stream_client: ReqwestClient,
     base_url: String,
     timeout: Duration,
+    /// Streaming inactivity timeout; `None` follows `timeout`.
+    read_timeout: Option<Duration>,
     max_retries: usize,
     /// Headers sent on every request, built once from the API key and base URL.
     cached_headers: HeaderMap,
@@ -472,6 +483,7 @@ impl fmt::Debug for Anthropic {
             .field("api_key", &"[REDACTED]")
             .field("cached_headers", &"[REDACTED]")
             .field("timeout", &self.timeout)
+            .field("read_timeout", &self.stream_read_timeout())
             .field("max_retries", &self.max_retries)
             .finish_non_exhaustive()
     }
@@ -479,10 +491,10 @@ impl fmt::Debug for Anthropic {
 
 impl Anthropic {
     /// Builds an HTTP client for `base_url`, which decides whether proxies are used (see
-    /// [`base_url::with_proxy_rule`]).
+    /// [`base_url::with_proxy_rule`]). The connect timeout follows `timeout` alone.
     fn build_http_client(
         timeout: Duration,
-        mode: ResponseMode,
+        deadline: Deadline,
         base_url: &str,
     ) -> Result<ReqwestClient> {
         let builder = ReqwestClient::builder()
@@ -491,14 +503,28 @@ impl Anthropic {
             .pool_max_idle_per_host(10)
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60));
-        let builder = if matches!(mode, ResponseMode::Streaming) {
-            builder.read_timeout(timeout.min(Duration::from_secs(60)))
-        } else {
-            builder.timeout(timeout)
+        let builder = match deadline {
+            Deadline::Read(read_timeout) => builder.read_timeout(read_timeout),
+            Deadline::Total => builder.timeout(timeout),
         };
         base_url::with_proxy_rule(builder, base_url)
             .build()
             .map_err(|e| Error::validation("Failed to build HTTP client", None).with_source(e))
+    }
+
+    fn stream_read_timeout(&self) -> Duration {
+        self.read_timeout.unwrap_or(self.timeout)
+    }
+
+    /// Rebuilds both HTTP clients from the current timeouts and base URL.
+    fn rebuild_http_clients(&mut self) -> Result<()> {
+        self.client = Self::build_http_client(self.timeout, Deadline::Total, &self.base_url)?;
+        self.stream_client = Self::build_http_client(
+            self.timeout,
+            Deadline::Read(self.stream_read_timeout()),
+            &self.base_url,
+        )?;
+        Ok(())
     }
 
     /// Resolve an API key value, handling file:// URLs
@@ -569,10 +595,11 @@ impl Anthropic {
 
         Ok(Self {
             api_key,
-            client: Self::build_http_client(timeout, ResponseMode::Buffered, &base_url)?,
-            stream_client: Self::build_http_client(timeout, ResponseMode::Streaming, &base_url)?,
+            client: Self::build_http_client(timeout, Deadline::Total, &base_url)?,
+            stream_client: Self::build_http_client(timeout, Deadline::Read(timeout), &base_url)?,
             base_url,
             timeout,
+            read_timeout: None,
             max_retries: 3,
             cached_headers,
             default_betas: Vec::new(),
@@ -616,23 +643,29 @@ impl Anthropic {
         let base_url = normalized_base_url("base_url", &base_url)?;
         self.cached_headers = Self::build_default_headers(&self.api_key, &base_url)?;
         // A loopback base URL bypasses proxies, so the HTTP clients depend on it too.
-        self.client = Self::build_http_client(self.timeout, ResponseMode::Buffered, &base_url)?;
-        self.stream_client =
-            Self::build_http_client(self.timeout, ResponseMode::Streaming, &base_url)?;
         self.base_url = base_url;
+        self.rebuild_http_clients()?;
         Ok(self)
     }
 
     /// Set a custom timeout for this client.
     ///
-    /// Sets the total deadline for non-streaming requests. Streaming reads use
-    /// an inactivity timeout of the smaller of this value and 60 seconds.
+    /// Sets the total deadline for non-streaming requests and the connect timeout (capped at 60
+    /// seconds). Streaming reads use it as their inactivity timeout unless
+    /// [`Self::with_read_timeout`] set one.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
         self.timeout = timeout;
-        self.stream_client =
-            Self::build_http_client(timeout, ResponseMode::Streaming, &self.base_url)?;
+        self.rebuild_http_clients()?;
+        Ok(self)
+    }
 
-        self.client = Self::build_http_client(timeout, ResponseMode::Buffered, &self.base_url)?;
+    /// Set the streaming read timeout for this client.
+    ///
+    /// A stream fails when no bytes arrive for this long. Defaults to 600 seconds, or the value
+    /// given to [`Self::with_timeout`]. Later calls to [`Self::with_timeout`] keep it.
+    pub fn with_read_timeout(mut self, read_timeout: Duration) -> Result<Self> {
+        self.read_timeout = Some(read_timeout);
+        self.rebuild_http_clients()?;
         Ok(self)
     }
 
@@ -2264,6 +2297,122 @@ Connection: close\r\n\r\nevent: ping\n",
         let mut stream = std::pin::pin!(client.stream(&params).await.unwrap());
         let first = stream.next().await.unwrap().unwrap();
         assert_eq!(first, MessageStreamEvent::Ping);
+    }
+
+    /// Serves one SSE response: `head` at once, then `tail` after `stall`.
+    async fn serve_stalled_stream(
+        head: &'static [u8],
+        stall: Duration,
+        tail: &'static [u8],
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Cache-Control: no-cache\r\n\
+Connection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.write_all(head).await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(stall).await;
+            socket.write_all(tail).await.unwrap();
+            socket.flush().await.unwrap();
+        });
+        base_url
+    }
+
+    #[tokio::test]
+    async fn streaming_read_timeout_outlasts_total_timeout() {
+        let base_url = serve_stalled_stream(
+            b"event: ping\n",
+            Duration::from_millis(120),
+            b"data: {}\n\n",
+        )
+        .await;
+
+        let client = Anthropic::try_new(Some("test_key".to_string()))
+            .unwrap()
+            .with_base_url(base_url)
+            .unwrap()
+            .with_timeout(Duration::from_millis(50))
+            .unwrap()
+            .with_read_timeout(Duration::from_secs(5))
+            .unwrap();
+        let params = MessageCreateParams::new_streaming(
+            16,
+            vec![MessageParam::user("ping")],
+            Model::Known(KnownModel::ClaudeHaiku55),
+        );
+
+        let mut stream = std::pin::pin!(client.stream(&params).await.unwrap());
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first, MessageStreamEvent::Ping);
+    }
+
+    #[tokio::test]
+    async fn with_timeout_keeps_configured_read_timeout() {
+        let base_url = serve_stalled_stream(
+            b"event: ping\n",
+            Duration::from_millis(120),
+            b"data: {}\n\n",
+        )
+        .await;
+
+        let client = Anthropic::try_new(Some("test_key".to_string()))
+            .unwrap()
+            .with_read_timeout(Duration::from_secs(5))
+            .unwrap()
+            .with_base_url(base_url)
+            .unwrap()
+            .with_timeout(Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(client.stream_read_timeout(), Duration::from_secs(5));
+        let params = MessageCreateParams::new_streaming(
+            16,
+            vec![MessageParam::user("ping")],
+            Model::Known(KnownModel::ClaudeHaiku55),
+        );
+
+        let mut stream = std::pin::pin!(client.stream(&params).await.unwrap());
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first, MessageStreamEvent::Ping);
+    }
+
+    /// Fails if streams go back to a 60 second read cap. The clock is paused only once the stream
+    /// is open, so the 61 second stall passes at once.
+    #[tokio::test]
+    async fn default_stream_read_timeout_outlasts_sixty_seconds() {
+        let base_url = serve_stalled_stream(
+            b"event: ping\ndata: {}\n\n",
+            Duration::from_secs(61),
+            b"event: ping\ndata: {}\n\n",
+        )
+        .await;
+
+        let client = Anthropic::try_new(Some("test_key".to_string()))
+            .unwrap()
+            .with_base_url(base_url)
+            .unwrap();
+        assert_eq!(client.stream_read_timeout(), DEFAULT_TIMEOUT);
+        let params = MessageCreateParams::new_streaming(
+            16,
+            vec![MessageParam::user("ping")],
+            Model::Known(KnownModel::ClaudeHaiku55),
+        );
+
+        let mut stream = std::pin::pin!(client.stream(&params).await.unwrap());
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first, MessageStreamEvent::Ping);
+        tokio::time::pause();
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(second, MessageStreamEvent::Ping);
     }
 
     /// A stall far longer than any test run, so only the client's timeout can end it.
