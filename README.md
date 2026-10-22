@@ -1037,7 +1037,7 @@ async fn cached(db: topcoat_si::surrealdb::Surreal<topcoat_si::surrealdb::engine
 
 ### The `surreal` pack
 
-With both `code-mode` and `surreal` on, `code_mode::packs::surreal(db.clone(), "myapp", "app", 200).await?` lets Claude read your database from Python. The arguments are the handle, its namespace and database, and `max_rows`:
+With both `code-mode` and `surreal` on, `let reader = Reader::try_new(db.clone(), "myapp", "app").await?;` and then `code_mode::packs::surreal(&reader, 200)` let Claude read your database from Python. `Reader` (from `topcoat_si::surreal`) takes the handle, its namespace and database; `200` is `max_rows`. One reader per app, like one pool: build it once and share it across conversations, since building it sets a new secret and concurrent builds would race. It holds a session that never expires.
 
 | Function | Does |
 |---|---|
@@ -1046,9 +1046,9 @@ With both `code-mode` and `surreal` on, `code_mode::packs::surreal(db.clone(), "
 | `describe(table)` | the fields and indexes of one table |
 | `rows`, `one`, `count` | Python helpers over `query` |
 
-The pack signs in as a record user on a session of its own, so SurrealDB's permission system, not this crate, decides what Claude can read. A table is visible only if its definition grants `select` to record users, for example `DEFINE TABLE orders ... PERMISSIONS FOR select FULL;`, or `FOR select WHERE season = 2026` to show some rows. Everything else does not exist for the pack, including this crate's own tables and other users' memory, and `tables()` lists only what is open. Record users cannot define, remove or alter anything, and cannot write unless a table grants it, which yours should not. Network functions are off because `surreal::open` keeps SurrealDB's default capabilities; an app that opens the database with network access allowed gives it to the pack too. A call returns after 20 seconds, but the local engine cannot cancel a query, so a slow one may run to completion in the engine. Query errors come back to Claude as Python exceptions with SurrealDB's message, so it can fix the query.
+The pack signs in as a record user on a session of its own, so SurrealDB's permission system, not this crate, decides what Claude can read. A table is visible only if its definition grants `select` to record users, for example `DEFINE TABLE orders ... PERMISSIONS FOR select FULL;`, or `FOR select WHERE season = 2026` to show some rows. Everything else does not exist for the pack, including this crate's own tables and other users' memory, and `tables()` lists only what is open. Record users cannot define, remove or alter anything, and cannot write unless a table grants it, which yours should not. Even where a table does grant writes, every call runs in a transaction that is always cancelled, so nothing a query writes stays. Network functions are off because `surreal::open` keeps SurrealDB's default capabilities; an app that opens the database with network access allowed gives it to the pack too. A call returns after 20 seconds, but the local engine cannot cancel a query, so a slow one may run to completion in the engine. Query errors come back to Claude as Python exceptions with SurrealDB's message, so it can fix the query.
 
-Three things a record user can still do, checked on 3.2.6: advance a `DEFINE SEQUENCE` with `sequence::nextval`, so a database open to the pack should not hand out ids from sequences; call `sleep()`, bounded only by the 20 second timeout; and start a `LIVE SELECT`, which stays registered on the pack's session until the process ends. None of them reads or changes your rows.
+Three things a record user can still do, checked on 3.2.6: advance a `DEFINE SEQUENCE` with `sequence::nextval`, so a database open to the pack should not hand out ids from sequences; call `sleep()`, bounded only by the 20 second timeout; and start a `LIVE SELECT`, which lasts only as long as that call's session, since every call runs on a clone of the reader. None of them reads or changes your rows.
 
 The evals binary can also keep its results in SurrealDB; see [evals/README.md](evals/README.md).
 

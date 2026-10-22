@@ -11,12 +11,14 @@
 
 mod memory;
 mod page_cache;
+mod reader;
 pub(crate) mod time;
 mod transcripts;
 mod usage_ledger;
 
 pub use memory::{Memory, MemoryHit, MemorySearch};
 pub use page_cache::{CachedPage, PageCache};
+pub use reader::Reader;
 pub use transcripts::{Batches, TrackedBatch, Transcript, Transcripts};
 pub use usage_ledger::{ModelTotal, UsageLedger};
 
