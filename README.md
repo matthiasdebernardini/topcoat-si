@@ -40,14 +40,11 @@ Topcoat SI is not on crates.io. Depend on it through git:
 ```toml
 [dependencies.topcoat-si]
 git = "https://github.com/matthiasdebernardini/topcoat-si"
-default-features = false
-features = ["rustls-tls"]
 ```
 
 | Feature | What it does |
 |---|---|
-| `native-tls` | TLS through the system library. On by default. |
-| `rustls-tls` | TLS through rustls, to avoid OpenSSL. |
+| `rustls-tls` | TLS through rustls. On by default. |
 | `code-mode` | Adds [code mode](#code-mode). Off by default. |
 
 ## A first request

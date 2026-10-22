@@ -18,7 +18,7 @@ jobs:
       - name: fmt
         run: cargo fmt --check
       - name: clippy
-        run: cargo clippy --all-targets --no-default-features --features rustls-tls --locked -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -28,9 +28,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: lib and integration tests
-        run: cargo nextest run --lib --tests --locked --no-default-features --features rustls-tls
+        run: cargo nextest run --lib --tests --locked
       - name: doc tests
-        run: cargo test --doc --locked --no-default-features --features rustls-tls
+        run: cargo test --doc --locked
 
   code-mode:
     runs-on: ubuntu-latest
@@ -44,8 +44,8 @@ jobs:
       - name: install the monty worker
         run: cargo install monty-runtime --version 1.2.0 --locked
       - name: clippy with code-mode
-        run: cargo clippy --all-targets --no-default-features --features rustls-tls,code-mode --locked -- -D warnings
+        run: cargo clippy --all-targets --features code-mode --locked -- -D warnings
       - name: code-mode tests
-        run: MONTY_BIN="$HOME/.cargo/bin/monty" cargo nextest run --lib --locked --no-default-features --features rustls-tls,code-mode code_mode
+        run: MONTY_BIN="$HOME/.cargo/bin/monty" cargo nextest run --lib --locked --features code-mode code_mode
       - name: code-mode doc test
-        run: cargo test --doc --locked --no-default-features --features rustls-tls,code-mode
+        run: cargo test --doc --locked --features code-mode

@@ -8,10 +8,9 @@ license = "Apache-2.0"
 repository = "https://github.com/matthiasdebernardini/topcoat-si"
 
 [features]
-default = ["native-tls"]
+default = ["rustls-tls"]
 
 rustls-tls = ["reqwest/rustls"]
-native-tls = ["reqwest/native-tls"]
 code-mode = ["dep:monty-pool", "dep:monty-types"]
 
 [dependencies]
