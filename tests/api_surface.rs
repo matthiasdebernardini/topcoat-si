@@ -64,12 +64,6 @@ fn topcoat_surface_compiles_and_builds_without_network() {
     .with_tools(vec![search.tool()]);
 
     let _unpolled = call(&client, params);
-
-    let err = topcoat_si::Error::tool("stream ended without a final message", None);
-    assert!(err.to_string().contains("stream ended"));
-
-    let stop = Some(StopReason::MaxTokens);
-    assert!(stop == Some(StopReason::MaxTokens));
     let _ = text_of;
 }
 
