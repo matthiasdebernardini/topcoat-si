@@ -15,6 +15,8 @@ pub(crate) mod time;
 mod transcripts;
 mod usage_ledger;
 
+pub use usage_ledger::{ModelTotal, UsageLedger};
+
 use std::path::Path;
 
 use surrealdb::Surreal;

@@ -3,6 +3,7 @@
 //! README.md in this directory.
 
 mod cases;
+mod db;
 mod grade;
 mod plan;
 mod report;
@@ -21,6 +22,7 @@ use time::macros::format_description;
 use topcoat_si::KnownModel;
 
 use crate::cases::{Case, Split};
+use crate::db::EvalDb;
 use crate::plan::{Arm, MICRO_CENTS_PER_CENT, PlannedRun, budget_reached};
 use crate::report::{Selection, Summary};
 use crate::run::{RunRecord, Services};
@@ -34,6 +36,7 @@ const DEFAULT_REPEAT: u32 = 3;
 const USAGE: &str = "\
 Usage: topcoat-evals code-mode --budget-cents N [options]
        topcoat-evals summarize <results.jsonl> [--save-baseline]
+       topcoat-evals summarize --db PATH [--run STAMP] [--save-baseline]
 
 Runs every selected case with the tool loop and with code mode, grades each answer, and writes
 evals/results/<UTC timestamp>-code-mode.{jsonl,md} and <timestamp>-spotcheck.md.
@@ -47,6 +50,8 @@ Options:
   --repeat N           Runs per case, arm and model. Default: 3.
   --split S            dev, holdout or all. Default: dev.
   --cases ID,ID        Only these case ids. Default: every case in the split.
+  --db PATH            Also store every run in the SurrealDB directory PATH, under the
+                       timestamp used for the file names. Ignored with --plan.
   --plan               Print the runs in execution order and their count; call nothing.
   --save-baseline      Also write the summary to evals/baselines/code-mode.json.
   -h, --help           Print this help.
@@ -56,6 +61,8 @@ Jev version) and MONTY_BIN, except with --plan.
 
 summarize prints the summary of a finished evals/results/<timestamp>-code-mode.jsonl, with the
 change from the baseline, and writes no results files. It calls nothing and needs no keys.
+Give either a results file or --db PATH. With --db, --run STAMP picks the run to summarize;
+without --run, summarize lists the stamps stored in PATH and exits.
   --save-baseline      Also write the summary to evals/baselines/code-mode.json.";
 
 /// Which splits to run.
@@ -91,6 +98,7 @@ struct Options {
     cases: Option<Vec<String>>,
     plan: bool,
     save_baseline: bool,
+    db: Option<PathBuf>,
 }
 
 /// What the command line asks for.
@@ -101,6 +109,13 @@ enum Command {
     /// Summarize the results file at `path`.
     Summarize {
         path: PathBuf,
+        save_baseline: bool,
+    },
+    /// Summarize the run `run` stored in the database at `db`, or list its runs when `run` is
+    /// `None`.
+    SummarizeDb {
+        db: PathBuf,
+        run: Option<String>,
         save_baseline: bool,
     },
 }
@@ -134,14 +149,37 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
 
 fn parse_summarize(args: &[String]) -> Result<Command, String> {
     let mut path = None;
+    let mut db = None;
+    let mut run = None;
     let mut save_baseline = false;
-    for arg in args {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let mut value = || {
+            args.next()
+                .cloned()
+                .ok_or_else(|| format!("{arg} needs a value"))
+        };
         match arg.as_str() {
             "--save-baseline" => save_baseline = true,
+            "--db" => db = Some(PathBuf::from(value()?)),
+            "--run" => run = Some(value()?),
             other if other.starts_with("--") => return Err(format!("unknown option {other:?}")),
             other if path.is_none() => path = Some(PathBuf::from(other)),
             other => return Err(format!("unexpected argument {other:?}")),
         }
+    }
+    if let Some(db) = db {
+        if path.is_some() {
+            return Err("give either a results file or --db, not both".to_string());
+        }
+        return Ok(Command::SummarizeDb {
+            db,
+            run,
+            save_baseline,
+        });
+    }
+    if run.is_some() {
+        return Err("--run needs --db".to_string());
     }
     let path = path.ok_or("summarize needs a results file")?;
     Ok(Command::Summarize {
@@ -160,6 +198,7 @@ fn parse_code_mode(rest: &[String]) -> Result<Command, String> {
         cases: None,
         plan: false,
         save_baseline: false,
+        db: None,
     };
     let mut rest = rest.iter();
     while let Some(flag) = rest.next() {
@@ -202,6 +241,7 @@ fn parse_code_mode(rest: &[String]) -> Result<Command, String> {
                         .collect(),
                 );
             }
+            "--db" => options.db = Some(PathBuf::from(value()?)),
             "--plan" => options.plan = true,
             "--save-baseline" => options.save_baseline = true,
             other => return Err(format!("unknown option {other:?}")),
@@ -298,6 +338,10 @@ async fn execute(options: &Options, cases: &[Case], runs: &[PlannedRun]) -> Resu
     let file = File::create_new(&records_path)
         .map_err(|error| format!("{}: {error}", records_path.display()))?;
     let mut writer = BufWriter::new(file);
+    let eval_db = match &options.db {
+        Some(path) => Some(EvalDb::open(path).await?),
+        None => None,
+    };
 
     let mut records: Vec<RunRecord> = Vec::new();
     let mut spent: u64 = 0;
@@ -337,6 +381,9 @@ async fn execute(options: &Options, cases: &[Case], runs: &[PlannedRun]) -> Resu
         writeln!(writer, "{line}")
             .and_then(|()| writer.flush())
             .map_err(|error| format!("{}: {error}", records_path.display()))?;
+        if let Some(eval_db) = &eval_db {
+            eval_db.insert(&stamp, &record).await?;
+        }
         records.push(record);
     }
 
@@ -486,8 +533,30 @@ fn summarize_file(path: &Path, save: bool) -> Result<(), String> {
         .map_err(|error| error.to_string())
         .and_then(|text| parse_records(&text))
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut selection = infer_selection(&records, &load_suite()?)?;
-    let problems = incomplete_runs(&records, &selection);
+    summarize_records(&records, save)
+}
+
+/// Prints the run stored under `run` in the database at `path`, or lists the stored runs when
+/// `run` is `None`.
+async fn summarize_db(path: &Path, run: Option<&str>, save: bool) -> Result<(), String> {
+    let eval_db = EvalDb::open(path).await?;
+    let Some(run) = run else {
+        for stamp in eval_db.runs().await? {
+            println!("{stamp}");
+        }
+        return Ok(());
+    };
+    let records = eval_db.records(run).await?;
+    if records.is_empty() {
+        return Err(format!("{}: no run {run}", path.display()));
+    }
+    summarize_records(&records, save)
+}
+
+/// Prints the summary of `records`, and saves it as the baseline if asked.
+fn summarize_records(records: &[RunRecord], save: bool) -> Result<(), String> {
+    let mut selection = infer_selection(records, &load_suite()?)?;
+    let problems = incomplete_runs(records, &selection);
     if problems.is_empty() {
         eprintln!("Complete: all {} runs present once.", records.len());
     } else {
@@ -503,7 +572,7 @@ fn summarize_file(path: &Path, save: bool) -> Result<(), String> {
                 .join("; ")
         );
     }
-    let summary = report::summarize(&records, selection);
+    let summary = report::summarize(records, selection);
     let baseline = load_baseline(Path::new(BASELINE));
     println!("{}", report::markdown(&summary, baseline.as_ref()));
     if save {
@@ -526,6 +595,19 @@ async fn main() -> ExitCode {
             save_baseline,
         }) => {
             return match summarize_file(&path, save_baseline) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Ok(Command::SummarizeDb {
+            db,
+            run,
+            save_baseline,
+        }) => {
+            return match summarize_db(&db, run.as_deref(), save_baseline).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("error: {error}");
