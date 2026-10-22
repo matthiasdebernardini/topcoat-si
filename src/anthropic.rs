@@ -1147,7 +1147,11 @@ impl Anthropic {
 
     /// Retrieve a Message Batch by ID.
     pub async fn get_message_batch(&self, message_batch_id: &str) -> Result<MessageBatch> {
-        let path = ["messages", "batches", message_batch_id];
+        let path = [
+            "messages",
+            "batches",
+            path_id("message_batch_id", message_batch_id)?,
+        ];
         let call = Call::new("get_message_batch", Method::GET, &path);
         self.execute(call, Self::decode_response).await
     }
@@ -1186,7 +1190,12 @@ impl Anthropic {
 
     /// Cancel a Message Batch that is currently processing.
     pub async fn cancel_message_batch(&self, message_batch_id: &str) -> Result<MessageBatch> {
-        let path = ["messages", "batches", message_batch_id, "cancel"];
+        let path = [
+            "messages",
+            "batches",
+            path_id("message_batch_id", message_batch_id)?,
+            "cancel",
+        ];
         let call = Call::new("cancel_message_batch", Method::POST, &path);
         self.execute(call, Self::decode_response).await
     }
@@ -1196,7 +1205,11 @@ impl Anthropic {
         &self,
         message_batch_id: &str,
     ) -> Result<DeletedMessageBatch> {
-        let path = ["messages", "batches", message_batch_id];
+        let path = [
+            "messages",
+            "batches",
+            path_id("message_batch_id", message_batch_id)?,
+        ];
         let call = Call::new("delete_message_batch", Method::DELETE, &path);
         self.execute(call, Self::decode_response).await
     }
@@ -1206,7 +1219,12 @@ impl Anthropic {
         &self,
         message_batch_id: &str,
     ) -> Result<impl Stream<Item = Result<MessageBatchResult>> + use<>> {
-        let path = ["messages", "batches", message_batch_id, "results"];
+        let path = [
+            "messages",
+            "batches",
+            path_id("message_batch_id", message_batch_id)?,
+            "results",
+        ];
         let call = Call {
             stream: true,
             mode: ResponseMode::Streaming,
@@ -1279,7 +1297,7 @@ impl Anthropic {
     /// Returns detailed information about the specified model, including its
     /// ID, creation date, display name, and type.
     pub async fn get_model(&self, model_id: &str) -> Result<ModelInfo> {
-        let path = ["models", model_id];
+        let path = ["models", path_id("model_id", model_id)?];
         let call = Call::new("get_model", Method::GET, &path);
         self.execute(call, Self::decode_response).await
     }
@@ -1346,7 +1364,7 @@ impl Anthropic {
 
     /// Fetch the metadata of a file.
     pub async fn get_file(&self, file_id: &str) -> Result<FileInfo> {
-        let path = ["files", file_id];
+        let path = ["files", path_id("file_id", file_id)?];
         let call = Call::new("get_file", Method::GET, &path);
         self.execute(call, Self::decode_response).await
     }
@@ -1355,7 +1373,7 @@ impl Anthropic {
     ///
     /// Only files created by code execution or skills are downloadable.
     pub async fn download_file(&self, file_id: &str) -> Result<Bytes> {
-        let path = ["files", file_id, "content"];
+        let path = ["files", path_id("file_id", file_id)?, "content"];
         let call = Call {
             mode: ResponseMode::Streaming,
             ..Call::new("download_file", Method::GET, &path)
@@ -1365,10 +1383,22 @@ impl Anthropic {
 
     /// Delete a file.
     pub async fn delete_file(&self, file_id: &str) -> Result<DeletedFile> {
-        let path = ["files", file_id];
+        let path = ["files", path_id("file_id", file_id)?];
         let call = Call::new("delete_file", Method::DELETE, &path);
         self.execute(call, Self::decode_response).await
     }
+}
+
+/// Returns `id` for use as one path segment, rejecting the empty, `.` and `..` IDs that
+/// [`Anthropic::build_url`] would drop or turn into another endpoint. `param` names the argument.
+fn path_id<'a>(param: &str, id: &'a str) -> Result<&'a str> {
+    if matches!(id, "" | "." | "..") {
+        return Err(Error::validation(
+            format!("{param} must not be empty, `.` or `..`"),
+            Some(param.to_string()),
+        ));
+    }
+    Ok(id)
 }
 
 /// One API call for [`Anthropic::execute`]: what to send and how its span is labelled.
@@ -2442,6 +2472,34 @@ Connection: close\r\n\r\nevent: ping\n",
             request_line(&recorded.lock().unwrap()[0]),
             "GET /v1/files/..%2Fmodels HTTP/1.1"
         );
+    }
+
+    #[tokio::test]
+    async fn dot_and_empty_ids_fail_before_sending() {
+        let (base_url, recorded) = serve(Vec::new()).await;
+        let client = files_client(base_url);
+
+        for id in ["", ".", ".."] {
+            let errors = [
+                client.get_file(id).await.unwrap_err(),
+                client.delete_file(id).await.unwrap_err(),
+                client.get_message_batch(id).await.unwrap_err(),
+                client.get_model(id).await.unwrap_err(),
+            ];
+            let params: Vec<_> = errors
+                .iter()
+                .map(|error| match error.kind() {
+                    ErrorKind::Validation { param } => param.clone(),
+                    other => panic!("{id:?}: {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                params,
+                ["file_id", "file_id", "message_batch_id", "model_id"].map(|p| Some(p.to_string())),
+                "{id:?}"
+            );
+        }
+        assert!(recorded.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
