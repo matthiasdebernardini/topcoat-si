@@ -18,6 +18,7 @@ mod usage_ledger;
 pub use memory::{Memory, MemoryHit, MemorySearch};
 pub use page_cache::{CachedPage, PageCache};
 pub use transcripts::{Batches, TrackedBatch, Transcript, Transcripts};
+pub use usage_ledger::{ModelTotal, UsageLedger};
 
 use std::path::Path;
 

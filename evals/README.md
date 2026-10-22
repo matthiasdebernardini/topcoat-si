@@ -66,6 +66,7 @@ cargo run -p topcoat-evals -- code-mode --budget-cents 300 [options]
 | `--split S` | `dev` | `dev`, `holdout` or `all` |
 | `--cases ID,ID` | all in the split | only these case ids; an id that is unknown or outside `--split` is an error |
 | `--plan` | | print the runs in execution order and their count, then exit; calls no API and needs no keys |
+| `--db PATH` | | also store every run in the SurrealDB directory `PATH`, under the same timestamp as the file names, as it ends; ignored with `--plan`, which opens nothing |
 | `--save-baseline` | | also write this run's summary to `evals/baselines/code-mode.json`; refused when the budget cut the run short |
 
 Always run with `--plan` first to see how many runs a command makes.
@@ -121,3 +122,14 @@ Every cost in the summary is the **Anthropic cost** only: what Claude's response
 ```bash
 cargo run -p topcoat-evals -- summarize evals/results/<timestamp>-code-mode.jsonl [--save-baseline]
 ```
+
+## The results database
+
+With `--db PATH`, `code-mode` also stores each run's record in a SurrealDB (embedded database) directory, in the `eval_run` table: the same fields as a line of the `.jsonl` file, plus `run` (the timestamp in the file names) and `at` (when it was stored). The database holds many runs, so it can be queried across them. SurrealKV locks the directory, so one process at a time can open it.
+
+```bash
+cargo run -p topcoat-evals -- summarize --db PATH               # list the stored run stamps
+cargo run -p topcoat-evals -- summarize --db PATH --run <timestamp> [--save-baseline]
+```
+
+`summarize` takes either a results file or `--db`, not both; `--run` needs `--db`.
