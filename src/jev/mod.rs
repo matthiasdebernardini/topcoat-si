@@ -50,6 +50,6 @@ pub use error_code::JevErrorCode;
 pub use outcome::Outcome;
 pub use questions::Questions;
 pub use response::{JevResponse, JevUsage, NamedAnswer};
-pub use tool::JevTool;
 #[cfg(feature = "code-mode")]
-pub(crate) use tool::{ToolQuestion, answers, is_fatal};
+pub(crate) use tool::is_fatal;
+pub use tool::{JevTool, ToolOption, ToolQuestion, answers};

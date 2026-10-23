@@ -514,6 +514,8 @@ A request is sent again when its error is retryable (see [Errors and retries](#e
 
 `JevTool::new(client)` gives Claude Jev as a `jev` client tool. One call sends one state with any number of questions and costs one Jev request.
 
+Its input is a list of `ToolQuestion`s. Apps that take questions in the same shape can turn them into `Questions` with `Questions::from_tool` and render a response as the tool does with `jev::answers`.
+
 Problems the model or a retry can fix, such as bad input, 429, 5xx or a timeout, come back as `is_error` results. A rejected key (401) and other configuration problems are returned as `Err`, which stops the tool loop.
 
 ## Code mode
@@ -620,6 +622,29 @@ Host functions and Python helpers come in packs. The built-in packs live in `cod
 | `surreal` | `query`, `tables`, `describe`, `rows`, `one`, `count` | the `surreal` feature |
 
 `packs::firecrawl` takes your two Firecrawl tools and a credit budget. Their domain lists, result cap, scrape options and content cut apply exactly as in the tool loop. The budget, `max_credits`, covers the whole conversation; once it is used up, both functions raise `RuntimeError`.
+
+`packs::jev(client)` gives the four Jev functions with no limits. `JevPack` adds them:
+
+| Builder | Adds |
+|---|---|
+| `with_budget(Arc<JevBudget>)` | a cap on requests for the conversation; once reached, the functions raise `RuntimeError` and send nothing |
+| `with_max_concurrency(n)` | at most `n` requests in flight; further calls in a `gather` wait |
+| `with_observer(Arc<dyn JevObserver>)` | a `JevEvent` per step: `Asking`, then `Answered` (usage, request id, latency, attempts) or `Failed` |
+
+Every call counts as one request, whether or not it succeeds. `JevBudget::used()` returns a `JevUsed` snapshot to save with the conversation, and `JevBudget::new(max).with_used(saved)` restores it.
+
+```rust,no_run
+#[cfg(feature = "code-mode")]
+fn jev_pack(client: topcoat_si::jev::JevClient) -> topcoat_si::code_mode::Pack {
+    use std::sync::Arc;
+    use topcoat_si::code_mode::packs::{JevBudget, JevPack};
+
+    JevPack::new(client)
+        .with_budget(Arc::new(JevBudget::new(120)))
+        .with_max_concurrency(4)
+        .build()
+}
+```
 
 Packs that hold host functions keep per-conversation state, so build them for each `CodeMode`.
 

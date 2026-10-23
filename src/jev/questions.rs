@@ -147,6 +147,12 @@ impl Questions {
         self.score(name, instructions, T::LEVELS.iter().map(|level| level.text))
     }
 
+    /// How many questions there are.
+    #[cfg(feature = "code-mode")]
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
         let invalid =
             |message: String, param: &str| Err(Error::validation(message, Some(param.to_string())));

@@ -12,7 +12,7 @@ mod surreal;
 mod triage;
 
 pub use firecrawl::firecrawl;
-pub use jev::jev;
+pub use jev::{JevBudget, JevEvent, JevObserver, JevPack, JevUsed, jev};
 pub use reports::reports;
 pub use research::research;
 #[cfg(feature = "surreal")]

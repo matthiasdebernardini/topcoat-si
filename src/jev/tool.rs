@@ -165,33 +165,47 @@ struct ToolInput {
     questions: Vec<ToolQuestion>,
 }
 
-/// One question as the model writes it, in the `jev` tool's input.
-#[derive(Deserialize)]
+/// One question as the model writes it, in the `jev` tool's input or the `jev` pack's `ask`:
+/// a JSON object tagged by `type` (`noul`, `choice` or `score`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
-pub(crate) enum ToolQuestion {
+pub enum ToolQuestion {
+    /// A yes/no question.
     Noul {
+        /// The key for its answer.
         name: String,
+        /// The question in plain words.
         instructions: String,
     },
+    /// A pick-one question.
     Choice {
+        /// The key for its answer.
         name: String,
+        /// The question in plain words.
         instructions: String,
+        /// The options, in order.
         options: Vec<ToolOption>,
     },
+    /// A rating on ordered levels.
     Score {
+        /// The key for its answer.
         name: String,
+        /// The question in plain words.
         instructions: String,
+        /// The levels, lowest first.
         levels: Vec<String>,
     },
 }
 
 /// One choice option as the model writes it.
-#[derive(Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ToolOption {
-    label: String,
+pub struct ToolOption {
+    /// The label Jev picks.
+    pub label: String,
+    /// What the label means, if it needs saying.
     #[serde(default)]
-    description: Option<String>,
+    pub description: Option<String>,
 }
 
 // Only these failures are the developer's to fix; everything else goes back to the model. A
@@ -221,7 +235,7 @@ pub(crate) fn is_fatal(error: &Error) -> bool {
 impl Questions {
     /// The model's questions as [`Questions`], in order.
     #[must_use]
-    pub(crate) fn from_tool(items: &[ToolQuestion]) -> Self {
+    pub fn from_tool(items: &[ToolQuestion]) -> Self {
         let mut questions = Self::new();
         for question in items {
             questions = match question {
@@ -258,9 +272,10 @@ fn render(response: &JevResponse, questions: &[ToolQuestion]) -> String {
     json!({"model": response.model, "answers": answers(response, questions)}).to_string()
 }
 
-/// Every answer by question name, with its probabilities; a score also names its most likely
-/// level.
-pub(crate) fn answers(
+/// Every answer by question name, with its probabilities, as the `jev` tool returns them; a
+/// score also names its most likely level from `questions`.
+#[must_use]
+pub fn answers(
     response: &JevResponse,
     questions: &[ToolQuestion],
 ) -> serde_json::Map<String, Value> {

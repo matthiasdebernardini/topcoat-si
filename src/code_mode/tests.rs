@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use monty_pool::PoolConfig;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 
 use super::pack::untyped;
 use super::tool::{CANCELLED, RESTARTED, TOOL_NAME, definition};
@@ -15,7 +17,7 @@ use crate::client_tool::ClientTool;
 use crate::error::{Error, ErrorKind};
 use crate::firecrawl::FirecrawlClient;
 use crate::jev::JevClient;
-use crate::test_support::{Canned, serve};
+use crate::test_support::{Canned, read_request, serve};
 use crate::types::{KnownModel, MessageCreateParams, MessageParam, Model, ToolResultBlockContent};
 use crate::types::{ToolResultBlock, ToolUnionParam, ToolUseBlock};
 use crate::{Anthropic, FirecrawlFetchPage, FirecrawlWebSearch};
@@ -658,7 +660,7 @@ async fn values_cross_both_ways() {
     assert_eq!(run(&code, "{1, 2}").await, ("=> {1, 2}".to_string(), false));
 }
 
-// 7. Firecrawl policy.
+// 7. Firecrawl and Jev policy.
 
 #[tokio::test]
 async fn firecrawl_pack_keeps_the_tool_policy() {
@@ -721,6 +723,164 @@ async fn firecrawl_credit_budget_stops_calls() {
         "{text}"
     );
     assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+fn jev_client(url: &str) -> JevClient {
+    JevClient::try_new("ts-key", "jev-1.13.0")
+        .unwrap()
+        .with_base_url(url)
+        .unwrap()
+        .with_max_retries(0)
+}
+
+/// A yes answer to the shortcuts' one question, with usage and a request id.
+fn jev_yes() -> Canned {
+    ok(json!({
+        "model": "jev-1.13.0",
+        "answers": {"answer": {"type": "noul", "noul": 0.99}},
+        "usage": {"input_tokens": 12, "output_tokens": 3}
+    }))
+    .with_header("x-typesafe-request-id", "req_1")
+}
+
+#[tokio::test]
+async fn jev_request_budget_stops_calls() {
+    let (url, recorded) = serve(vec![jev_yes()]).await;
+    let budget = Arc::new(packs::JevBudget::new(1));
+    let pack = packs::JevPack::new(jev_client(&url))
+        .with_budget(budget.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "(await yes_no(state='s', question='q'))['answer']";
+    assert_eq!(run(&code, snippet).await, ("=> True".to_string(), false));
+    let refused = "RuntimeError: Jev request budget of 1 used up; finish with what you have";
+    let (text, is_error) = run(&code, snippet).await;
+    assert!(is_error);
+    assert!(text.contains(refused), "{text}");
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+    assert_eq!(budget.used(), packs::JevUsed::new(1));
+    code.finish().await.unwrap();
+
+    // A restored budget is already used up, so nothing is sent.
+    let restored = Arc::new(packs::JevBudget::new(1).with_used(budget.used()));
+    let pack = packs::JevPack::new(jev_client(&url))
+        .with_budget(restored)
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let (text, is_error) = run(&code, snippet).await;
+    assert!(is_error);
+    assert!(text.contains(refused), "{text}");
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+/// Answers every request with [`jev_yes`] after 200 ms, recording the most requests in flight
+/// at once.
+async fn slow_jev() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let most = peak.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (in_flight, peak) = (in_flight.clone(), peak.clone());
+            tokio::spawn(async move {
+                read_request(&mut socket).await;
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let body = json!({
+                    "model": "jev-1.13.0",
+                    "answers": {"answer": {"type": "noul", "noul": 0.99}}
+                })
+                .to_string();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(body.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+        }
+    });
+    (format!("http://{address}"), most)
+}
+
+#[tokio::test]
+async fn jev_max_concurrency_bounds_requests_in_flight() {
+    let (url, peak) = slow_jev().await;
+    let pack = packs::JevPack::new(jev_client(&url))
+        .with_max_concurrency(2)
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "len(await asyncio.gather(*[yes_no(state=str(i), question='q') for i in \
+                   range(5)]))";
+    assert_eq!(run(&code, snippet).await, ("=> 5".to_string(), false));
+    assert_eq!(peak.load(Ordering::SeqCst), 2);
+}
+
+#[derive(Default)]
+struct JevEvents(Mutex<Vec<packs::JevEvent>>);
+
+impl packs::JevObserver for JevEvents {
+    fn event(&self, event: packs::JevEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+#[tokio::test]
+async fn jev_observer_sees_usage_and_request_id() {
+    let (url, _) = serve(vec![
+        jev_yes(),
+        Canned::json(400, json!({"detail": "bad state"}).to_string()),
+    ])
+    .await;
+    let events = Arc::new(JevEvents::default());
+    let pack = packs::JevPack::new(jev_client(&url))
+        .with_observer(events.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "(await yes_no(state='s', question='q'))['answer']";
+    assert_eq!(run(&code, snippet).await, ("=> True".to_string(), false));
+    let (text, is_error) = run(&code, snippet).await;
+    assert!(
+        is_error && text.contains("RuntimeError: Jev failed"),
+        "{text}"
+    );
+
+    let events = events.0.lock().unwrap();
+    assert_eq!(events.len(), 4, "{events:?}");
+    assert!(matches!(
+        events[0],
+        packs::JevEvent::Asking { questions: 1 }
+    ));
+    let packs::JevEvent::Answered {
+        usage,
+        request_id,
+        attempts,
+        ..
+    } = &events[1]
+    else {
+        panic!("expected Answered, got {:?}", events[1]);
+    };
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens),
+        (Some(12), Some(3))
+    );
+    assert_eq!(request_id.as_deref(), Some("req_1"));
+    assert_eq!(*attempts, 1);
+    assert!(matches!(
+        events[2],
+        packs::JevEvent::Asking { questions: 1 }
+    ));
+    let packs::JevEvent::Failed { error } = &events[3] else {
+        panic!("expected Failed, got {:?}", events[3]);
+    };
+    assert_eq!(error.status(), Some(400));
 }
 
 // 8. Output.
