@@ -857,7 +857,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_deadline_is_ignored_once_a_cancel_is_sent() {
+    async fn the_deadline_is_ignored_once_a_cancel_is_accepted() {
         let (base_url, recorded) = serve(vec![
             Canned::json(200, batch("in_progress")),
             Canned::json(200, batch("canceling")),
