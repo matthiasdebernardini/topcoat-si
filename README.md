@@ -380,6 +380,39 @@ Both return each page's main content as markdown. Their other defaults:
 
 `FirecrawlClient::from_env()` reads `FIRECRAWL_API_KEY`. `FirecrawlClient::try_new(key)` takes the key directly.
 
+`FirecrawlClient` also has calls the tools do not use:
+
+| Method | Endpoint | What it returns |
+|---|---|---|
+| `search` | `POST /v2/search` | results by source; each web result has `highlights`, the passages that best answer the query |
+| `gov_search` | `POST /v2/search/gov` | Government Index hits (statutes, regulations, codes, court opinions): url, title, matched passage, position |
+| `map` | `POST /v2/map` | a site's links with titles and descriptions, 1 credit per call |
+| `credit_usage` | `GET /v2/team/credit-usage` | remaining credits, plan credits and the billing period |
+
+`SearchRequest::with_country("US")` sets where the search runs from, and `with_highlights(false)` asks for plain snippets. A response whose `data` is one flat array is read as web results.
+
+`GovSearchRequest` filters by `k` (1 to 100), `jurisdiction` (`"us"` or a state such as `"us-tn"`; there is no city or county filter), `court`, `court_type`, `cites` and `domain`. The filters only match pages Firecrawl has labeled, so no results does not mean no law. `MapRequest` takes `search` to order links by relevance, `limit`, `sitemap` and `location`.
+
+```rust,no_run
+use topcoat_si::firecrawl::{GovSearchRequest, MapRequest};
+use topcoat_si::FirecrawlClient;
+
+async fn find(firecrawl: &FirecrawlClient) -> topcoat_si::Result<()> {
+    let code = GovSearchRequest::new("side setback variance").with_jurisdiction("us-tn");
+    for hit in firecrawl.gov_search(&code).await?.data.web {
+        println!("{:?}: {:?}", hit.url, hit.description);
+    }
+    let agendas = MapRequest::new("https://www.nashville.gov")
+        .with_search("planning commission agenda")
+        .with_limit(50);
+    for link in firecrawl.map(&agendas).await?.links {
+        println!("{:?}", link.url);
+    }
+    println!("{} credits left", firecrawl.credit_usage().await?.remaining_credits);
+    Ok(())
+}
+```
+
 **Domain lists.** Set them on either tool with `with_allowed_domains` and `with_blocked_domains`. Entries are hostnames and cover their subdomains, and a blocked domain always wins.
 
 - On `web_search`, Claude can narrow the allowed domains and add blocked ones, but never widen them.
@@ -393,7 +426,7 @@ Both return each page's main content as markdown. Their other defaults:
 
 Every other failure is an `is_error` result the model can react to.
 
-The Firecrawl client resends a request after a connection failure or a 408, 409, 429 or any 5xx response, including one whose body failed to arrive. A 408 from the server is an `Api` error, not `Timeout`. A client-side timeout is not resent, and neither is `Interrupted` (the response started, then stopped), because Firecrawl has already answered. See [Errors and retries](#errors-and-retries).
+The Firecrawl client resends a request after a connection failure or a 408, 409, 429 or any 5xx response, including one whose body failed to arrive. A 408 from the server is an `Api` error, not `Timeout`. A client-side timeout is not resent, and neither is `Interrupted` (the response started, then stopped), because Firecrawl has already answered. `credit_usage` bills nothing, so it is also resent after those. See [Errors and retries](#errors-and-retries).
 
 Both tools work with `run_tools`. You can also drive web search by hand:
 

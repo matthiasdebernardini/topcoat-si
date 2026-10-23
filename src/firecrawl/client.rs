@@ -5,11 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, HeaderValue};
-use reqwest::{Client as ReqwestClient, ClientBuilder};
+use reqwest::{Client as ReqwestClient, ClientBuilder, Method};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::{FirecrawlCache, ScrapeRequest, ScrapeResponse, SearchRequest, SearchResponse};
+use super::credit_usage::CreditUsageResponse;
+use super::{
+    CreditUsage, FirecrawlCache, GovSearchRequest, GovSearchResponse, MapRequest, MapResponse,
+    ScrapeRequest, ScrapeResponse, SearchRequest, SearchResponse,
+};
 use crate::backoff::{self, RetryPolicy};
 use crate::error::{Error, ErrorCode, ErrorKind, Result, Service, describe_json_error};
 use crate::http;
@@ -24,7 +28,7 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 // Slack between Firecrawl's server-side scrape timeout and the client-side request timeout.
 const SCRAPE_TIMEOUT_MARGIN: Duration = Duration::from_secs(30);
 
-/// Client for Firecrawl's search and scrape APIs.
+/// Client for Firecrawl's search, scrape, map and credit usage APIs.
 ///
 /// The API key is only kept as a sensitive header value and is redacted from `Debug`.
 #[derive(Clone)]
@@ -174,23 +178,76 @@ impl FirecrawlClient {
         }
     }
 
+    /// Search Firecrawl's Government Index of statutes, regulations, codes and court opinions.
+    ///
+    /// The request is validated before anything is sent and retried like
+    /// [`FirecrawlClient::search`], so an upstream 502 or 504 is resent. No results does not
+    /// mean no law: filters only match pages Firecrawl has labeled.
+    pub async fn gov_search(&self, request: &GovSearchRequest) -> Result<GovSearchResponse> {
+        request.validate()?;
+        self.post("/v2/search/gov", &request.wire(), None).await
+    }
+
+    /// List the URLs of a site, from its sitemap and links. One credit per call, however many
+    /// URLs come back.
+    ///
+    /// The request is validated before anything is sent and retried like
+    /// [`FirecrawlClient::search`]. Map is fast and may miss links.
+    pub async fn map(&self, request: &MapRequest) -> Result<MapResponse> {
+        request.validate()?;
+        self.post("/v2/map", &request.wire(), None).await
+    }
+
+    /// The team's remaining credits and current billing period. Costs no credits.
+    ///
+    /// Retried like [`FirecrawlClient::search`], and also after a timeout or a response that
+    /// stopped partway, because reading the balance bills nothing.
+    pub async fn credit_usage(&self) -> Result<CreditUsage> {
+        let response: CreditUsageResponse = self
+            .send(Method::GET, "/v2/team/credit-usage", None::<&()>, None)
+            .await?;
+        response.data.ok_or_else(|| {
+            Error::new(
+                ErrorKind::Decode,
+                "Firecrawl credit usage response has no data",
+            )
+        })
+    }
+
     /// Posts `body` to `path`, retrying transient failures.
     async fn post<B, T>(&self, path: &str, body: &B, timeout: Option<Duration>) -> Result<T>
     where
         B: Serialize + ?Sized,
         T: DeserializeOwned + Succeeded,
     {
+        self.send(Method::POST, path, Some(body), timeout).await
+    }
+
+    /// Sends `body`, if any, to `path`, retrying transient failures.
+    async fn send<B, T>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+        timeout: Option<Duration>,
+    ) -> Result<T>
+    where
+        B: Serialize + ?Sized,
+        T: DeserializeOwned + Succeeded,
+    {
         let url = format!("{}{path}", self.base_url);
+        // A GET reads without billing, so it is safe to resend after any failure.
+        let idempotent = method == Method::GET;
         let policy = RetryPolicy {
             max_retries: self.max_retries,
             max_retry_after: MAX_RETRY_AFTER,
             budget: None,
-            resend_timeouts: false,
-            resend_interrupted: false,
+            resend_timeouts: idempotent,
+            resend_interrupted: idempotent,
         };
         let retried = backoff::retry(
             &policy,
-            |_, _| self.send_once(&url, body, timeout),
+            |_, _| self.send_once(method.clone(), &url, body, timeout),
             |error, attempt, delay| {
                 tracing::warn!(
                     target: "topcoat_si::firecrawl",
@@ -206,16 +263,24 @@ impl FirecrawlClient {
         retried.result
     }
 
-    async fn send_once<B, T>(&self, url: &str, body: &B, timeout: Option<Duration>) -> Result<T>
+    async fn send_once<B, T>(
+        &self,
+        method: Method,
+        url: &str,
+        body: Option<&B>,
+        timeout: Option<Duration>,
+    ) -> Result<T>
     where
         B: Serialize + ?Sized,
         T: DeserializeOwned + Succeeded,
     {
         let mut request = self
             .http
-            .post(url)
-            .header(AUTHORIZATION, self.authorization.clone())
-            .json(body);
+            .request(method, url)
+            .header(AUTHORIZATION, self.authorization.clone());
+        if let Some(body) = body {
+            request = request.json(body);
+        }
         if let Some(timeout) = timeout {
             request = request.timeout(timeout);
         }
@@ -291,6 +356,24 @@ impl Succeeded for SearchResponse {
 }
 
 impl Succeeded for ScrapeResponse {
+    fn succeeded(&self) -> bool {
+        self.success
+    }
+}
+
+impl Succeeded for GovSearchResponse {
+    fn succeeded(&self) -> bool {
+        self.success
+    }
+}
+
+impl Succeeded for MapResponse {
+    fn succeeded(&self) -> bool {
+        self.success
+    }
+}
+
+impl Succeeded for CreditUsageResponse {
     fn succeeded(&self) -> bool {
         self.success
     }

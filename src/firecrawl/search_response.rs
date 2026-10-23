@@ -1,6 +1,6 @@
 //! The search response.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::ResultMetadata;
 
@@ -20,8 +20,8 @@ pub struct SearchResponse {
     /// Non-fatal problem Firecrawl reported, such as a partially failed scrape.
     #[serde(default)]
     pub warning: Option<String>,
-    /// Results grouped by source.
-    #[serde(default)]
+    /// Results grouped by source. A flat `data` array of results is read as web results.
+    #[serde(default, deserialize_with = "grouped_or_flat")]
     pub data: Option<SearchData>,
 }
 
@@ -56,6 +56,10 @@ pub struct WebResult {
     /// Rank within the results.
     #[serde(default)]
     pub position: Option<u32>,
+    /// Passages from the page that best answer the query. A single string is read as one
+    /// passage; anything else that is not a list of strings is `None`.
+    #[serde(default, deserialize_with = "passages")]
+    pub highlights: Option<Vec<String>>,
     /// Category the result matched.
     #[serde(default)]
     pub category: Option<String>,
@@ -117,4 +121,41 @@ pub struct ImageResult {
     /// Rank within the results.
     #[serde(default)]
     pub position: Option<u32>,
+}
+
+/// The results as an object of arrays by source, or as one flat array of web results.
+fn grouped_or_flat<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<SearchData>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        // Tried first: a struct also accepts an array, by position.
+        Flat(Vec<WebResult>),
+        Grouped(SearchData),
+    }
+    Ok(
+        Option::<Wire>::deserialize(deserializer)?.map(|wire| match wire {
+            Wire::Flat(web) => SearchData {
+                web: Some(web),
+                ..SearchData::default()
+            },
+            Wire::Grouped(data) => data,
+        }),
+    )
+}
+
+/// A list of strings, or one string as a list of one. Never fails.
+fn passages<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<String>>, D::Error> {
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(text) => Some(vec![text]),
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .map(|item| match item {
+                serde_json::Value::String(text) => Some(text),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    })
 }
