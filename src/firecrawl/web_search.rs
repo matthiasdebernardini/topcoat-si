@@ -11,6 +11,8 @@ use super::{
     FirecrawlClient, ScrapeOptions, SearchRequest, SearchResponse, SearchSource, TimeRange,
     tool_result,
 };
+#[cfg(feature = "code-mode")]
+use super::{GovResult, GovSearchRequest, SearchCategory, WebResult};
 use crate::client_tool::ClientTool;
 use crate::error::{Error, ErrorKind, Result};
 use crate::types::{Content, TextBlock, ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock};
@@ -219,58 +221,121 @@ impl FirecrawlWebSearch {
         )
     }
 
-    /// Search for the sandbox's `search(...)`: the same checks and error mapping as
-    /// [`FirecrawlWebSearch::execute`], returning web results as data; `markdown` is only set
-    /// when `scrape`. A `limit` over 10 is capped at 10. The inner `Err` is a message the model
-    /// can act on; `Err` is fatal.
+    /// Checks a sandbox `search(...)` call and plans its request, without sending anything:
+    /// the same checks as [`FirecrawlWebSearch::execute`]. A `limit` over 10 is capped at 10.
+    /// The inner `Err` is a message the model can act on; `Err` is fatal.
     #[cfg(feature = "code-mode")]
-    pub(crate) async fn search_values(
+    pub(crate) fn prepare_search(
         &self,
-        query: String,
-        limit: Option<u32>,
-        scrape: bool,
-        include_domains: Option<Vec<String>>,
-        exclude_domains: Option<Vec<String>>,
-    ) -> Result<std::result::Result<(Vec<SearchHit>, Option<u64>), String>> {
+        query: SearchQuery,
+    ) -> Result<std::result::Result<PreparedSearch, String>> {
         let filter = self.checked_config()?;
-        if scrape && self.scrape_options.is_none() {
+        if query.scrape && self.scrape_options.is_none() {
             return Ok(Err(
                 "scrape=True is not available: this search does not scrape pages.".to_string(),
             ));
         }
         let input = ModelInput {
-            query,
-            limit: limit.map(|limit| limit.min(MAX_MODEL_LIMIT)),
+            query: query.query,
+            limit: query.limit.map(|limit| limit.min(MAX_MODEL_LIMIT)),
             recency: None,
             sources: None,
-            include_domains,
-            exclude_domains,
-            country: None,
+            include_domains: query.include_domains,
+            exclude_domains: query.exclude_domains,
+            country: query.country,
         };
-        let scrape_options = self.scrape_options.as_ref().filter(|_| scrape);
-        let (response, filter, total) = match self.search(&input, filter, scrape_options).await? {
-            Ok(searched) => searched,
+        let scrape_options = self.scrape_options.as_ref().filter(|_| query.scrape);
+        let (mut request, filter, total) = match self.plan(&input, filter, scrape_options) {
+            Ok(planned) => planned,
             Err(message) => return Ok(Err(message)),
         };
-        let results = response
-            .data
-            .and_then(|data| data.web)
-            .unwrap_or_default()
+        request.time_range = query.time_range;
+        request.sort_by_date = query.sort_by_date;
+        request.categories = query.categories;
+        if let Err(error) = request.validate() {
+            return Ok(Err(error.to_string()));
+        }
+        Ok(Ok(PreparedSearch {
+            request,
+            filter,
+            total,
+        }))
+    }
+
+    /// Sends a search [`FirecrawlWebSearch::prepare_search`] planned. Returns the web results
+    /// the domain lists permit, markdown cut to the tool's limit and only when scraped, and the
+    /// credits the search cost. The inner `Err` is a message the model can act on; `Err` is
+    /// fatal (401, 402).
+    #[cfg(feature = "code-mode")]
+    pub(crate) async fn send_search(
+        &self,
+        prepared: PreparedSearch,
+    ) -> Result<std::result::Result<Searched, String>> {
+        let response = match self.send(&prepared.request).await? {
+            Ok(response) => response,
+            Err(message) => return Ok(Err(message)),
+        };
+        let web = response.data.and_then(|data| data.web).unwrap_or_default();
+        let scraped = web
+            .iter()
+            .filter(|result| result.markdown.is_some())
+            .count();
+        // Firecrawl bills 2 credits per 10 results and 1 for each scraped one.
+        let estimate = 2 * u64::try_from(web.len().div_ceil(10)).unwrap_or(u64::MAX)
+            + u64::try_from(scraped).unwrap_or(u64::MAX);
+        let results = web
             .into_iter()
-            .filter_map(|web| {
-                Some(SearchHit {
-                    url: web.url.filter(|u| filter.permits(u))?,
-                    title: web.title,
-                    description: web.description,
-                    markdown: web
-                        .markdown
-                        .map(|m| tool_result::truncate(&m, self.max_content_chars)),
-                    status: web.metadata.and_then(|m| m.status_code),
-                })
+            .filter(|web| {
+                web.url
+                    .as_deref()
+                    .is_some_and(|u| prepared.filter.permits(u))
             })
-            .take(usize::try_from(total).unwrap_or(usize::MAX))
+            .map(|mut web| {
+                web.markdown = web
+                    .markdown
+                    .map(|m| tool_result::truncate(&m, self.max_content_chars));
+                web
+            })
+            .take(usize::try_from(prepared.total).unwrap_or(usize::MAX))
             .collect();
-        Ok(Ok((results, response.credits_used)))
+        Ok(Ok(Searched {
+            results,
+            credits: response.credits_used.unwrap_or(estimate),
+        }))
+    }
+
+    /// Checks a sandbox `gov_search(...)` call without sending anything. The inner `Err` is a
+    /// message the model can act on; `Err` is fatal.
+    #[cfg(feature = "code-mode")]
+    pub(crate) fn prepare_gov_search(
+        &self,
+        request: GovSearchRequest,
+    ) -> Result<std::result::Result<GovSearchRequest, String>> {
+        self.checked_config()?;
+        Ok(request
+            .validate()
+            .map(|()| request)
+            .map_err(|e| e.to_string()))
+    }
+
+    /// Sends a Government Index search, keeping the results the domain lists permit. The inner
+    /// `Err` is a message the model can act on; `Err` is fatal (401, 402).
+    #[cfg(feature = "code-mode")]
+    pub(crate) async fn send_gov_search(
+        &self,
+        request: &GovSearchRequest,
+    ) -> Result<std::result::Result<Vec<GovResult>, String>> {
+        let filter = self.checked_config()?;
+        match self.client.gov_search(request).await {
+            Ok(response) => Ok(Ok(response
+                .data
+                .web
+                .into_iter()
+                .filter(|result| result.url.as_deref().is_some_and(|u| filter.permits(u)))
+                .collect())),
+            Err(error) if matches!(error.status(), Some(401 | 402)) => Err(error),
+            Err(error) => Ok(Err(format!("Gov search failed: {error}"))),
+        }
     }
 
     /// Runs one search. The inner `Err` is a message the model can act on; `Err` is fatal
@@ -281,21 +346,43 @@ impl FirecrawlWebSearch {
         filter: Filter,
         scrape_options: Option<&ScrapeOptions>,
     ) -> Result<std::result::Result<(SearchResponse, Filter, u32), String>> {
+        let (request, filter, total) = match self.plan(input, filter, scrape_options) {
+            Ok(planned) => planned,
+            Err(message) => return Ok(Err(message)),
+        };
+        Ok(self
+            .send(&request)
+            .await?
+            .map(|response| (response, filter, total)))
+    }
+
+    /// Checks the model's input and builds the request, the filter to apply to the results and
+    /// how many results to keep.
+    fn plan(
+        &self,
+        input: &ModelInput,
+        filter: Filter,
+        scrape_options: Option<&ScrapeOptions>,
+    ) -> std::result::Result<(SearchRequest, Filter, u32), String> {
         if input
             .limit
             .is_some_and(|limit| !(1..=MAX_MODEL_LIMIT).contains(&limit))
         {
-            return Ok(Err(format!(
-                "limit must be between 1 and {MAX_MODEL_LIMIT}."
-            )));
+            return Err(format!("limit must be between 1 and {MAX_MODEL_LIMIT}."));
         }
-        let (mut request, filter, total) = match self.request(input, filter) {
-            Ok(planned) => planned,
-            Err(message) => return Ok(Err(message)),
-        };
+        let (mut request, filter, total) = self.request(input, filter)?;
         request.scrape_options = scrape_options.cloned();
-        match self.client.search(&request).await {
-            Ok(response) => Ok(Ok((response, filter, total))),
+        Ok((request, filter, total))
+    }
+
+    /// Sends one search. The inner `Err` is a message the model can act on; `Err` is fatal
+    /// (401, 402).
+    async fn send(
+        &self,
+        request: &SearchRequest,
+    ) -> Result<std::result::Result<SearchResponse, String>> {
+        match self.client.search(request).await {
+            Ok(response) => Ok(Ok(response)),
             Err(error) if matches!(error.status(), Some(401 | 402)) => Err(error),
             Err(error) if matches!(error.kind(), ErrorKind::Validation { .. }) => {
                 Ok(Err(error.to_string()))
@@ -491,16 +578,51 @@ impl ClientTool for FirecrawlWebSearch {
     }
 }
 
-/// One web result as the sandbox's `search(...)` returns it.
+/// A sandbox `search(...)` call, before its checks.
 #[cfg(feature = "code-mode")]
-#[derive(serde::Serialize)]
-pub(crate) struct SearchHit {
-    url: String,
-    title: Option<String>,
-    description: Option<String>,
-    /// The page as markdown, cut to the tool's limit; only when scraped.
-    markdown: Option<String>,
-    status: Option<u16>,
+pub(crate) struct SearchQuery {
+    pub(crate) query: String,
+    pub(crate) limit: Option<u32>,
+    pub(crate) scrape: bool,
+    pub(crate) include_domains: Option<Vec<String>>,
+    pub(crate) exclude_domains: Option<Vec<String>>,
+    pub(crate) time_range: Option<TimeRange>,
+    pub(crate) sort_by_date: bool,
+    pub(crate) categories: Vec<SearchCategory>,
+    pub(crate) country: Option<String>,
+}
+
+/// A search that passed every check, ready to send.
+#[cfg(feature = "code-mode")]
+pub(crate) struct PreparedSearch {
+    request: SearchRequest,
+    filter: Filter,
+    total: u32,
+}
+
+#[cfg(feature = "code-mode")]
+impl PreparedSearch {
+    /// The credits the search costs at most: 2 per 10 results asked for, and 1 for each result
+    /// it scrapes.
+    pub(crate) fn estimated_credits(&self) -> u64 {
+        let total = u64::from(self.total);
+        let scraped = if self.request.scrape_options.is_some() {
+            total
+        } else {
+            0
+        };
+        2 * total.div_ceil(10) + scraped
+    }
+}
+
+/// What a sandbox search found.
+#[cfg(feature = "code-mode")]
+pub(crate) struct Searched {
+    /// Web results the domain lists permit, each with a URL; markdown cut to the tool's limit.
+    pub(crate) results: Vec<WebResult>,
+    /// Firecrawl's `creditsUsed` (0 for a cache hit), else 2 per 10 results returned plus 1 for
+    /// each scraped one.
+    pub(crate) credits: u64,
 }
 
 #[derive(Deserialize)]

@@ -7,7 +7,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::filter::Filter;
-use super::{FirecrawlClient, ScrapeOptions, ScrapeRequest, ScrapeResponse, tool_result};
+use super::{FirecrawlClient, ScrapeData, ScrapeOptions, ScrapeRequest, tool_result};
+#[cfg(feature = "code-mode")]
+use super::{MapLink, MapRequest};
 use crate::client_tool::ClientTool;
 use crate::error::{Error, Result};
 use crate::types::{TextBlock, ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock};
@@ -114,76 +116,124 @@ impl FirecrawlFetchPage {
         })
     }
 
-    /// Fetch for the sandbox's `scrape(...)`: the same checks and error mapping as the tool,
-    /// returning the page as data. The inner `Err` is a message the model can act on; `Err` is
-    /// fatal.
+    /// The options pages are scraped with.
     #[cfg(feature = "code-mode")]
-    pub(crate) async fn page_value(
+    pub(crate) fn scrape_options(&self) -> &ScrapeOptions {
+        &self.scrape_options
+    }
+
+    /// Characters of page markdown kept.
+    #[cfg(feature = "code-mode")]
+    pub(crate) fn max_content_chars(&self) -> usize {
+        self.max_content_chars
+    }
+
+    /// Checks a sandbox `scrape(...)` call without sending anything: the same checks as the
+    /// tool, with `options` in place of the tool's. The inner `Err` is a message the model can
+    /// act on; `Err` is fatal.
+    #[cfg(feature = "code-mode")]
+    pub(crate) fn prepare_page(
         &self,
         url: &str,
-    ) -> Result<std::result::Result<PageData, String>> {
+        options: ScrapeOptions,
+    ) -> Result<std::result::Result<ScrapeRequest, String>> {
         let filter = self.checked_config()?;
-        let url = url.trim();
-        Ok(self.fetch(url, &filter).await?.map(|page| PageData {
-            url: page.source,
-            status: page.status,
-            title: page.title,
-            markdown: page.markdown,
-        }))
+        Ok(checked_request(url.trim(), options, &filter))
+    }
+
+    /// Scrapes a page [`FirecrawlFetchPage::prepare_page`] checked, and checks where it landed
+    /// and its status. Returns the URL it ended on and the page, its markdown uncut. The inner
+    /// `Err` is a message the model can act on; `Err` is fatal (401, 402).
+    #[cfg(feature = "code-mode")]
+    pub(crate) async fn send_page(
+        &self,
+        request: &ScrapeRequest,
+    ) -> Result<std::result::Result<(String, ScrapeData), String>> {
+        let filter = self.checked_config()?;
+        self.send(request, &filter).await
+    }
+
+    /// Checks a sandbox `map_site(...)` call without sending anything: the site must be one
+    /// this tool may fetch. The inner `Err` is a message the model can act on; `Err` is fatal.
+    #[cfg(feature = "code-mode")]
+    pub(crate) fn prepare_map(
+        &self,
+        request: MapRequest,
+    ) -> Result<std::result::Result<MapRequest, String>> {
+        let filter = self.checked_config()?;
+        let url = request.url.trim().to_string();
+        if let Err(error) = request.validate() {
+            return Ok(Err(format!("Could not map {url}: {error}")));
+        }
+        if !filter.permits(&url) {
+            return Ok(Err(format!(
+                "Could not map {url}: this tool may not fetch pages on that domain."
+            )));
+        }
+        Ok(Ok(request))
+    }
+
+    /// Maps a site, keeping the links this tool may fetch. The inner `Err` is a message the
+    /// model can act on; `Err` is fatal (401, 402).
+    #[cfg(feature = "code-mode")]
+    pub(crate) async fn send_map(
+        &self,
+        request: &MapRequest,
+    ) -> Result<std::result::Result<Vec<MapLink>, String>> {
+        let filter = self.checked_config()?;
+        match self.client.map(request).await {
+            Ok(response) => Ok(Ok(response
+                .links
+                .into_iter()
+                .filter(|link| link.url.as_deref().is_some_and(|u| filter.permits(u)))
+                .collect())),
+            Err(error) if matches!(error.status(), Some(401 | 402)) => Err(error),
+            Err(error) => Ok(Err(format!(
+                "Could not map {}: {error}",
+                request.url.trim()
+            ))),
+        }
     }
 
     /// Fetches one page and checks where it landed and its status. The inner `Err` is a
     /// message the model can act on; `Err` is fatal (401, 402).
     async fn fetch(&self, url: &str, filter: &Filter) -> Result<std::result::Result<Page, String>> {
-        let request = ScrapeRequest::new(url).with_options(self.scrape_options.clone());
-        if let Err(error) = request.validate() {
-            return Ok(Err(format!("Could not fetch {url}: {error}")));
-        }
-        if !filter.permits(url) {
-            return Ok(Err(format!(
-                "Could not fetch {url}: this tool may not fetch pages on that domain."
-            )));
-        }
-        match self.client.scrape(&request).await {
-            Ok(response) => Ok(self.page(url, response, filter)),
+        let request = match checked_request(url, self.scrape_options.clone(), filter) {
+            Ok(request) => request,
+            Err(message) => return Ok(Err(message)),
+        };
+        Ok(self
+            .send(&request, filter)
+            .await?
+            .map(|(source, data)| self.page(source, data)))
+    }
+
+    /// Scrapes `request` and checks where it landed and its status, returning the URL it ended
+    /// on and the page. The inner `Err` is a message the model can act on; `Err` is fatal (401,
+    /// 402).
+    async fn send(
+        &self,
+        request: &ScrapeRequest,
+        filter: &Filter,
+    ) -> Result<std::result::Result<(String, ScrapeData), String>> {
+        let url = request.url.trim();
+        match self.client.scrape(request).await {
+            Ok(response) => Ok(landed(url, response.data, filter)),
             Err(error) if matches!(error.status(), Some(401 | 402)) => Err(error),
             Err(error) => Ok(Err(format!("Could not fetch {url}: {error}"))),
         }
     }
 
-    fn page(
-        &self,
-        url: &str,
-        response: ScrapeResponse,
-        filter: &Filter,
-    ) -> std::result::Result<Page, String> {
-        let data = response.data;
+    fn page(&self, source: String, data: ScrapeData) -> Page {
         let metadata = data.metadata.unwrap_or_default();
-        // Firecrawl can report an empty or relative URL; only an absolute http(s) one counts.
-        let landed = metadata.url.filter(|u| is_absolute_http(u));
-        if let Some(landed) = landed.as_deref().filter(|u| !filter.permits(u)) {
-            return Err(format!(
-                "Could not fetch {url}: it redirected to {landed}, a domain this tool may not \
-                 fetch."
-            ));
-        }
-        if let Some(status) = metadata.status_code.filter(|s| !is_success(*s)) {
-            return Err(format!(
-                "Could not fetch {url}: the page returned HTTP {status}."
-            ));
-        }
         let pdf_note = match (metadata.num_pages, metadata.total_pages) {
             (Some(read), Some(total)) if read < total => {
                 Some(format!("Only pages 1 to {read} of {total} were read."))
             }
             _ => None,
         };
-        Ok(Page {
-            source: landed
-                .or(metadata.source_url.filter(|u| is_absolute_http(u)))
-                .unwrap_or_else(|| url.to_string()),
-            #[cfg(feature = "code-mode")]
-            status: metadata.status_code,
+        Page {
+            source,
             title: metadata.title,
             markdown: data
                 .markdown
@@ -194,7 +244,7 @@ impl FirecrawlFetchPage {
                 .warning
                 .filter(|w| !w.trim().is_empty())
                 .map(|w| format!("Firecrawl warning: {w}")),
-        })
+        }
     }
 
     fn result(&self, id: String, url: &str, page: Page) -> ToolResultBlock {
@@ -218,23 +268,9 @@ impl FirecrawlFetchPage {
     }
 }
 
-/// One page as the sandbox's `scrape(...)` returns it.
-#[cfg(feature = "code-mode")]
-#[derive(serde::Serialize)]
-pub(crate) struct PageData {
-    /// Where the page ended up after redirects.
-    url: String,
-    status: Option<u16>,
-    title: Option<String>,
-    /// Cut to the tool's limit.
-    markdown: Option<String>,
-}
-
 /// A fetched page that passed every check.
 struct Page {
     source: String,
-    #[cfg(feature = "code-mode")]
-    status: Option<u16>,
     title: Option<String>,
     /// Non-empty markdown, cut to the tool's limit.
     markdown: Option<String>,
@@ -244,6 +280,59 @@ struct Page {
 
 fn is_success(status: u16) -> bool {
     (200..300).contains(&status) || status == 304
+}
+
+/// The scrape of `url` with `options`, when it is valid and on a domain `filter` permits.
+fn checked_request(
+    url: &str,
+    options: ScrapeOptions,
+    filter: &Filter,
+) -> std::result::Result<ScrapeRequest, String> {
+    let request = ScrapeRequest::new(url).with_options(options);
+    if let Err(error) = request.validate() {
+        return Err(format!("Could not fetch {url}: {error}"));
+    }
+    if !filter.permits(url) {
+        return Err(format!(
+            "Could not fetch {url}: this tool may not fetch pages on that domain."
+        ));
+    }
+    Ok(request)
+}
+
+/// Checks where a scrape of `url` landed and its status: the URL it ended on, which a redirect
+/// must not take off `filter`, and the page.
+fn landed(
+    url: &str,
+    data: ScrapeData,
+    filter: &Filter,
+) -> std::result::Result<(String, ScrapeData), String> {
+    let metadata = data.metadata.as_ref();
+    // Firecrawl can report an empty or relative URL; only an absolute http(s) one counts.
+    let landed = metadata
+        .and_then(|m| m.url.clone())
+        .filter(|u| is_absolute_http(u));
+    if let Some(landed) = landed.as_deref().filter(|u| !filter.permits(u)) {
+        return Err(format!(
+            "Could not fetch {url}: it redirected to {landed}, a domain this tool may not fetch."
+        ));
+    }
+    if let Some(status) = metadata
+        .and_then(|m| m.status_code)
+        .filter(|s| !is_success(*s))
+    {
+        return Err(format!(
+            "Could not fetch {url}: the page returned HTTP {status}."
+        ));
+    }
+    let source = landed
+        .or_else(|| {
+            metadata
+                .and_then(|m| m.source_url.clone())
+                .filter(|u| is_absolute_http(u))
+        })
+        .unwrap_or_else(|| url.to_string());
+    Ok((source, data))
 }
 
 impl ClientTool for FirecrawlFetchPage {

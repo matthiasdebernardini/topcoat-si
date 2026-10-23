@@ -38,4 +38,6 @@ pub use scrape_request::ScrapeRequest;
 pub use scrape_response::{PdfPage, ScrapeData, ScrapeResponse};
 pub use search_request::{SearchCategory, SearchRequest, SearchSource, TimeRange};
 pub use search_response::{ImageResult, NewsResult, SearchData, SearchResponse, WebResult};
+#[cfg(feature = "code-mode")]
+pub(crate) use web_search::SearchQuery;
 pub use web_search::{FirecrawlWebSearch, WEB_SEARCH_TOOL_NAME};

@@ -60,7 +60,7 @@ pub mod code_mode {
     pub enum PyError { ValueError, TypeError, KeyError, LookupError, RuntimeError }
     pub struct Example { pub code: &'static str, pub expect: &'static str }
     pub struct Limits { /* see Defaults */ }
-    pub mod packs { /* firecrawl, jev, research, triage, reports */ }
+    pub mod packs { /* firecrawl, FirecrawlPack, jev, JevPack, research, triage, reports */ }
     pub mod testing { /* check_pack */ }
 }
 ```
@@ -214,9 +214,11 @@ The value of the last expression is returned; print() output is returned too.
 No network, files or third-party packages. No class inheritance, generators or `del`.
 Call `help("name")` for a function's full signature and examples.
 
-firecrawl: web search and page scraping
-  search(*, query, limit=5, scrape=False, ...) -> list[dict]: search the web
-  scrape(*, url) -> dict: one page as markdown
+firecrawl: web search, page scraping, the Government Index and site maps
+  search(*, query, limit=8, ...) -> list[dict]: search the web, ...
+  scrape(*, url, max_pages=30, ...) -> dict: one page or PDF as markdown; ...
+  gov_search(*, query, k=10, ...) -> list[dict]: search the Government Index ...
+  map_site(*, url, search=None, limit=100) -> list[dict]: list a site's URLs ...
 ...
 ```
 
@@ -371,24 +373,81 @@ Constructors live in `code_mode::packs`.
 
 Built from the existing tools, not a bare `FirecrawlClient`, so the app's allowed and blocked
 domains, the 10-result cap, scrape options and content cut all apply exactly as they do in the
-tool loop. Each tool gets a `pub(crate)` typed entry point that runs the same checks and error
-mapping as `execute` (401 and 402 are fatal) and returns results as data instead of a
-`ToolResultBlock`.
+tool loop. Each tool has `pub(crate)` entry points that run the same checks and error mapping as
+`execute` (401 and 402 are fatal) in two steps, checking a call and then sending it, and return
+results as data instead of a `ToolResultBlock`.
 
-`max_credits` is a per-conversation Firecrawl credit budget: a search counts its
-`credits_used`, or 1 when the response reports none; a successful scrape counts 1 (its response
-reports none). Once reached, both
-functions raise `RuntimeError: Firecrawl credit budget of N used up; finish with what you have`.
-Calls already running in one `gather` finish, so the total can overshoot by those. The call
-budget alone doesn't bound credits: one `search(limit=10, scrape=True)` costs about 10.
+It is a thin wrapper over the same path as `FirecrawlPack`: `search` and `scrape` with the
+signatures below, the tools' own default limit, country and scrape options, a 402 that ends the
+run, and a `FirecrawlBudget` with only `max_credits` set. Once that is reached, both functions
+raise `RuntimeError: Firecrawl credit budget of N used up; finish with what you have`. The call
+budget alone doesn't bound credits: one `search(limit=10, scrape=True)` costs about 12.
 
 | Function | Returns |
 |---|---|
-| `search(*, query: str, limit: int = 5, scrape: bool = False, include_domains: list[str] \| None = None, exclude_domains: list[str] \| None = None) -> list[dict]` | web results: `url`, `title`, `description`, `markdown` (when `scrape`), `status` |
-| `scrape(*, url: str) -> dict` | `url` (final), `status`, `title`, `markdown` (cut to the tool's limit) |
+| `search(*, query: str, limit: int = 5, scrape: bool = False, include_domains: list[str] \| None = None, exclude_domains: list[str] \| None = None) -> list[dict]` | web results: `url`, `title`, `description`, `position`, and with `scrape` `markdown` and `status` |
+| `scrape(*, url: str) -> dict` | the dict `FirecrawlPack`'s `scrape` returns, below |
 
 Errors map as the tools already map them: `Raise` where they return `is_error`, `Fatal` where
 they return `Err`.
+
+### `FirecrawlPack::new(client: FirecrawlClient)` and `FirecrawlPack::from_tools(search, fetch)`
+
+`from_tools` keeps the tools' domain lists: the search tool also filters `gov_search` results,
+and the fetch tool also checks `map_site`'s site and filters its links. `new(client)` is
+`from_tools` over the two tools' defaults.
+
+| Function | Returns |
+|---|---|
+| `search(*, query: str, limit: int = 8, include_domains: list[str] \| None = None, exclude_domains: list[str] \| None = None, recency: str \| None = None, sort_by_date: bool = False, categories: list[str] \| None = None, country: str = "US", scrape: bool = False) -> list[dict]` | at most 10 web results: `url`, `title`, `description` (Firecrawl puts the passage that best answers the query there), `position`; `scrape=True` adds `markdown` (cut) and `status` |
+| `scrape(*, url: str, max_pages: int = 30, pdf_mode: str = "auto", page_markers: bool = True, links: bool = False) -> dict` | `url` (final), `requested_url`, `status`, `title`, `markdown` (cut), `pages`, `links`, `num_pages`, `total_pages`, `chars` (before the cut), `truncated`, `clamped_to`, `credits` |
+| `gov_search(*, query: str, k: int = 10, jurisdiction: str \| None = None, domain: str \| None = None) -> list[dict]` | Government Index results: `url`, `title`, `description`, `position` |
+| `map_site(*, url: str, search: str \| None = None, limit: int = 100) -> list[dict]` | links: `url`, `title`, `description` |
+
+- `recency` is `"hour"`, `"day"`, `"week"`, `"month"` or `"year"`, sent as `TimeRange::PastHour`
+  to `PastYear` (`tbs` `qdr:h`, `qdr:d`, `qdr:w`, `qdr:m`, `qdr:y`), or `"YYYY-MM-DD..YYYY-MM-DD"`,
+  sent as `TimeRange::Custom` (`cdr:1,cd_min:MM/DD/YYYY,cd_max:MM/DD/YYYY`). `sort_by_date`
+  appends `sbd:1`. Anything else raises `TypeError` naming `recency`.
+- `categories` takes `"gov"`, `"pdf"`, `"research"`, `"developer"`; gov and developer cannot be
+  combined with others (`RuntimeError`). `country=None` sends no country.
+- `scrape` applies `max_pages` (clamped by `with_max_pdf_pages`), `pdf_mode` (`"fast"`, `"auto"`,
+  `"ocr"`), `page_markers` and `links` on top of the scrape defaults. `pages` is
+  `[{"page": n, "markdown": text}]` only when the defaults ask for `with_pdf_pages(true)`;
+  `markdown` and `pages` are each cut to the content limit, the pages together. Links and pages
+  only come from `scrape`, never from `search(scrape=True)`.
+
+The builder adds, per conversation:
+
+- `with_budget(Arc<FirecrawlBudget>)`: caps set with `with_max_searches`, `with_max_scrapes`,
+  `with_max_maps`, `with_max_gov_searches` and `with_max_credits`. A call counts once it is sent,
+  whether or not it succeeds; a call that fails its checks is not counted. Past a cap the
+  functions it covers raise `RuntimeError: Firecrawl {search, scrape, map, gov search, credit}
+  budget of N used up; finish with what you have` and send nothing. Counts and credit
+  reservations are taken with atomic `try_update`, so a `gather` cannot race past a cap.
+  `FirecrawlBudget::used()` returns a `FirecrawlUsed { searches, scrapes, maps, gov_searches,
+  credits }` snapshot (serde) and `FirecrawlBudget::with_used` restores one.
+- Credits: a call reserves its most likely cost before sending and is settled to what it cost
+  after. Scrape: reserves 1 plus 4 per paid format, settled to `ScrapeData::credits(&options)`
+  (Firecrawl's `creditsUsed`, 0 for a local cache hit, else 1 + (PDF pages - 1) + paid formats).
+  Search: reserves 2 per 10 results asked for plus 1 per result when scraping, settled to the
+  response's `credits_used` (0 for a cache hit), else 2 per 10 results returned plus 1 per scraped
+  one. Map: 1. Gov search: free, so it only counts against its own cap and the credit cap never
+  stops it. A sent request that fails keeps its reservation. A call is let through while the
+  credits charged are under the cap, so the last one can overshoot by its own cost.
+- `with_scrape_defaults(ScrapeOptions)`, `with_max_pdf_pages(n)`, `with_content_chars(n)` (for
+  `scrape` and `search(scrape=True)`).
+- `with_observer(Arc<dyn FirecrawlObserver>)`: a `FirecrawlEvent` per step, each with
+  `function: &'static str`: `Searching { query }` (search and gov search), `Scraping { url }` or
+  `Mapping { url }` before sending, then `Searched { query, hits, credits }`,
+  `GovSearched { query, hits }`, `Scraped { requested, page, credits }` (the page as the script
+  gets it, after the cut) or `Mapped { url, links, credits }`, or `Failed { arg, message }`;
+  `Failed` alone for a call that fails its checks; `Refused { reason }` when a cap is reached.
+- `with_out_of_credits(OutOfCredits)`: a 402 ends the run under `Fatal` (the default) and raises
+  `RuntimeError` under `Raise`. A 401 always ends the run.
+
+Each call checks its arguments, takes its share of the budget, then sends. The pack has no
+semaphore of its own: `FirecrawlClient::with_max_concurrency` covers every request, so a call
+waiting there for a slot has already been counted.
 
 ### `packs::jev(client: JevClient)`
 
@@ -541,6 +600,15 @@ when it is unset. CI installs `monty-runtime` 1.2.0 with `--locked` and sets it.
     100 001 do not; nesting past 64 levels raises `ValueError`.
 11. Firecrawl policy in code mode: a blocked domain in search results is dropped, and a scrape
     redirected to a blocked domain is refused.
+12. `FirecrawlPack`: its examples pass against a mock server; each cap raises `RuntimeError` with
+    its wording and sends nothing, and the free gov search still goes out once credits are used
+    up; scrape credits come from `ScrapeData::credits` (20 for 20 PDF pages, Firecrawl's 7 when
+    it sends one) and the PDF options, clamp and links reach the body; `with_used` restores
+    every count; the observer sees every event in order, and an invalid call gives only `Failed`
+    and costs nothing; a 402 raises under `OutOfCredits::Raise` and ends the run under `Fatal`;
+    8 gathered scrapes against a cap of 3, and 6 against a credit cap of 2, send exactly 3 and 2
+    requests; `recency`, `sort_by_date`, `categories` and `country` reach the body, and a search
+    without `creditsUsed` costs 2 per 10 results.
 
 ## Verified against the 1.2.0 worker
 
