@@ -38,6 +38,7 @@ mod types;
 
 pub use accumulating_stream::AccumulatingStream;
 pub use anthropic::Anthropic;
+pub use batch_wait::{BatchOutcome, BatchWait, Control};
 pub use client_tool::ClientTool;
 pub use error::{Error, ErrorCode, ErrorKind, Result, Service};
 pub use firecrawl::{FirecrawlCache, FirecrawlClient, FirecrawlFetchPage, FirecrawlWebSearch};

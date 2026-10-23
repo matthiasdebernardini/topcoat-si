@@ -574,6 +574,22 @@ impl<'de> Deserialize<'de> for MessageBatchErrorResponse {
     }
 }
 
+/// The batch result's error as an [`ErrorKind::Api`](crate::ErrorKind::Api) error with no HTTP
+/// status, keeping its [`ErrorType`], so [`Error::is_retryable`](crate::Error::is_retryable) is
+/// true for the transient types: overloaded, API, rate-limit and timeout errors.
+impl From<MessageBatchErrorResponse> for crate::Error {
+    fn from(response: MessageBatchErrorResponse) -> Self {
+        let error = response.error;
+        crate::Error::api(
+            crate::Service::Anthropic,
+            None,
+            Some(error.r#type),
+            error.message,
+            None,
+        )
+    }
+}
+
 /// Error details for a failed request within a Message Batch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
@@ -947,6 +963,32 @@ mod tests {
                 "rust_type=ErrorType tag=brewing_error"
             ]
         );
+    }
+
+    #[test]
+    fn batch_errors_keep_their_type_and_retryability() {
+        let error = |error_type: &str| {
+            let response: MessageBatchErrorResponse = serde_json::from_value(json!({
+                "type": "error",
+                "error": {"type": error_type, "message": "failed"}
+            }))
+            .unwrap();
+            crate::Error::from(response)
+        };
+
+        let overloaded = error("overloaded_error");
+        assert!(overloaded.is_retryable());
+        assert_eq!(overloaded.status(), None);
+        assert!(matches!(
+            overloaded.kind(),
+            crate::ErrorKind::Api {
+                service: crate::Service::Anthropic,
+                error_type: Some(ErrorType::OverloadedError),
+                ..
+            }
+        ));
+        assert!(error("api_error").is_retryable());
+        assert!(!error("invalid_request_error").is_retryable());
     }
 
     #[test]

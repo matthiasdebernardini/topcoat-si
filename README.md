@@ -874,6 +874,40 @@ async fn run_batch(client: &Anthropic) -> topcoat_si::Result<()> {
 - `message_batch_results_by_id` reads every result into memory. For very large batches, use `stream_message_batch_results` instead.
 - `KnownModel::cost_micro_cents` applies the 50% batch rate when a result's service tier is `batch`. To price a result by hand, call `.batch()` on the model's `token_rates()`.
 
+### One request at a time
+
+`submit_one` sends one request as a batch of one. `await_one` waits for it and returns a `BatchOutcome`. They are separate calls, so you can save the batch id in between and resume the wait after a restart.
+
+```rust,no_run
+use std::time::Duration;
+
+use time::OffsetDateTime;
+use topcoat_si::{Anthropic, BatchOutcome, BatchWait, Control, KnownModel, MessageCreateParams};
+
+async fn ask(client: &Anthropic) -> topcoat_si::Result<()> {
+    let params = MessageCreateParams::simple("2+2?", KnownModel::ClaudeHaiku55);
+    let batch = client.submit_one("turn-1", params).await?;
+    // Save batch.id here.
+
+    let wait = BatchWait {
+        poll: Duration::from_secs(30),
+        deadline: Some(OffsetDateTime::now_utc() + Duration::from_secs(12 * 60 * 60)),
+        on_poll: &mut |_batch| Control::Continue,
+    };
+    match client.await_one(&batch.id, "turn-1", wait).await? {
+        BatchOutcome::Succeeded(message) => println!("{:?}", message.content),
+        BatchOutcome::Errored(error) if error.is_retryable() => println!("submit again: {error}"),
+        other => println!("{other:?}"),
+    }
+    Ok(())
+}
+```
+
+- `on_poll` runs after each poll that finds the batch still running. Return `Control::Cancel` to cancel the batch; `await_one` then waits for it to end, which is usually `BatchOutcome::Canceled`.
+- Past `deadline`, `await_one` returns `BatchOutcome::DeadlinePassed` and leaves the batch running. Cancel it yourself if you no longer want it.
+- `BatchOutcome::Errored` holds an `Error` that keeps the API's error type, so `is_retryable` is true for an overloaded or other transient failure. Its HTTP status is `None`.
+- Failed polls are retried as in `wait_for_message_batch`.
+
 ## Usage and cost
 
 `TokenRates` holds rates as integer nano-cents per token. Costs are in micro-cents, rounded up: 1 dollar is 100,000,000 micro-cents.

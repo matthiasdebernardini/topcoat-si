@@ -1,14 +1,59 @@
-//! Waiting for a message batch to end and collecting its results.
+//! Waiting for a message batch to end and collecting its results, and the one-request batch
+//! helper built on them.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
+use time::OffsetDateTime;
+
 use crate::{
-    Anthropic, Error, MessageBatch, MessageBatchProcessingStatus, MessageBatchResultVariant, Result,
+    Anthropic, Error, ErrorKind, Message, MessageBatch, MessageBatchCreateParams,
+    MessageBatchCreateRequest, MessageBatchProcessingStatus, MessageBatchResultVariant,
+    MessageCreateParams, Result,
 };
 
 /// How many polls in a row may fail with a retryable error before the wait gives up.
 const MAX_CONSECUTIVE_POLL_FAILURES: usize = 5;
+
+/// What [`BatchWait::on_poll`] tells [`Anthropic::await_one`] to do next.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Control {
+    /// Keep waiting.
+    Continue,
+    /// Cancel the batch, then wait for it to end.
+    Cancel,
+}
+
+/// How [`Anthropic::await_one`] waits.
+pub struct BatchWait<'a> {
+    /// The time between polls. Must be greater than zero.
+    pub poll: Duration,
+    /// When to stop waiting, as wall-clock time so it survives a restart. `None` waits until
+    /// the batch ends, which the API bounds at 24 hours.
+    pub deadline: Option<OffsetDateTime>,
+    /// Called after each poll that finds the batch still running. Returning
+    /// [`Control::Cancel`] cancels the batch once; it is not called again after that.
+    pub on_poll: &'a mut dyn FnMut(&MessageBatch) -> Control,
+}
+
+/// How a one-request batch ended.
+#[derive(Debug, Clone)]
+// `Message` carries the response fields the API added; there is one outcome per wait.
+#[allow(clippy::large_enum_variant)]
+#[non_exhaustive]
+pub enum BatchOutcome {
+    /// The request produced a message.
+    Succeeded(Message),
+    /// The request failed. The error keeps the API's error type, so
+    /// [`Error::is_retryable`] says whether submitting it again might work.
+    Errored(Error),
+    /// The batch was canceled before the request ran.
+    Canceled,
+    /// The batch expired before the request ran.
+    Expired,
+    /// The deadline passed while the batch was still running. The batch was not canceled.
+    DeadlinePassed,
+}
 
 impl Anthropic {
     /// Polls [`Anthropic::get_message_batch`] every `poll_interval` until the batch has ended, and
@@ -29,41 +74,142 @@ impl Anthropic {
         message_batch_id: &str,
         poll_interval: Duration,
     ) -> Result<MessageBatch> {
-        if poll_interval.is_zero() {
-            return Err(Error::validation(
-                "poll_interval must be greater than zero",
-                Some("poll_interval".to_string()),
-            ));
-        }
+        check_poll_interval(poll_interval)?;
         let mut failures = 0;
         loop {
-            match self.get_message_batch(message_batch_id).await {
-                Ok(batch) => {
-                    failures = 0;
-                    if batch.processing_status == MessageBatchProcessingStatus::Ended {
-                        return Ok(batch);
-                    }
+            if let Some(batch) = self
+                .poll_message_batch(message_batch_id, &mut failures)
+                .await?
+                && batch.processing_status == MessageBatchProcessingStatus::Ended
+            {
+                return Ok(batch);
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    /// Submits `params` as a batch of one request under `custom_id`.
+    ///
+    /// Pair it with [`Anthropic::await_one`]. They are separate calls so the batch id can be
+    /// saved in between, and the wait resumed after a restart.
+    ///
+    /// # Errors
+    ///
+    /// Any error from [`Anthropic::create_message_batch`], including a validation error for an
+    /// invalid `custom_id` or for `params` that stream.
+    pub async fn submit_one(
+        &self,
+        custom_id: impl Into<String>,
+        params: MessageCreateParams,
+    ) -> Result<MessageBatch> {
+        let request = MessageBatchCreateRequest::new(custom_id, params);
+        self.create_message_batch(MessageBatchCreateParams::new(vec![request]))
+            .await
+    }
+
+    /// Waits for the one-request batch `message_batch_id` to end and returns the result for
+    /// `custom_id`.
+    ///
+    /// Polls every `wait.poll`, retrying failed polls like [`Anthropic::wait_for_message_batch`].
+    /// After each poll that finds the batch still running it calls `wait.on_poll`; on
+    /// [`Control::Cancel`] it sends `/cancel` and keeps waiting for the batch to end. Once
+    /// `wait.deadline` has passed and the batch is still running, it returns
+    /// [`BatchOutcome::DeadlinePassed`] without cancelling.
+    ///
+    /// # Errors
+    ///
+    /// A validation error, before any request, when `wait.poll` is zero; the error from a poll,
+    /// the cancel or the results that ended the wait; and a decode error when the results hold
+    /// no result for `custom_id`, or one of a type this crate does not know.
+    pub async fn await_one(
+        &self,
+        message_batch_id: &str,
+        custom_id: &str,
+        wait: BatchWait<'_>,
+    ) -> Result<BatchOutcome> {
+        check_poll_interval(wait.poll)?;
+        let mut failures = 0;
+        let mut canceled = false;
+        loop {
+            if let Some(batch) = self
+                .poll_message_batch(message_batch_id, &mut failures)
+                .await?
+            {
+                if batch.processing_status == MessageBatchProcessingStatus::Ended {
+                    return self.one_result(message_batch_id, custom_id).await;
+                }
+                if !canceled && (wait.on_poll)(&batch) == Control::Cancel {
+                    self.cancel_message_batch(message_batch_id).await?;
+                    canceled = true;
+                }
+            }
+            if wait
+                .deadline
+                .is_some_and(|deadline| OffsetDateTime::now_utc() >= deadline)
+            {
+                return Ok(BatchOutcome::DeadlinePassed);
+            }
+            tokio::time::sleep(wait.poll).await;
+        }
+    }
+
+    /// Reads the result for `custom_id` from an ended batch.
+    async fn one_result(&self, message_batch_id: &str, custom_id: &str) -> Result<BatchOutcome> {
+        let mut results = self.message_batch_results_by_id(message_batch_id).await?;
+        match results.remove(custom_id) {
+            Some(MessageBatchResultVariant::Succeeded { message }) => {
+                Ok(BatchOutcome::Succeeded(message))
+            }
+            Some(MessageBatchResultVariant::Errored { error }) => {
+                Ok(BatchOutcome::Errored(error.into()))
+            }
+            Some(MessageBatchResultVariant::Canceled) => Ok(BatchOutcome::Canceled),
+            Some(MessageBatchResultVariant::Expired) => Ok(BatchOutcome::Expired),
+            Some(_) => Err(Error::new(
+                ErrorKind::Decode,
+                format!("batch {message_batch_id} has a result of an unknown type for {custom_id}"),
+            )),
+            None => Err(Error::new(
+                ErrorKind::Decode,
+                format!("batch {message_batch_id} has no result for {custom_id}"),
+            )),
+        }
+    }
+
+    /// Polls the batch once. A retryable failure gives `None` and counts toward the limit of
+    /// consecutive failures; reaching the limit, or any other failure, is the error. A
+    /// successful poll resets the count.
+    async fn poll_message_batch(
+        &self,
+        message_batch_id: &str,
+        failures: &mut usize,
+    ) -> Result<Option<MessageBatch>> {
+        match self.get_message_batch(message_batch_id).await {
+            Ok(batch) => {
+                *failures = 0;
+                if batch.processing_status != MessageBatchProcessingStatus::Ended {
                     tracing::debug!(
                         batch_id = %batch.id,
                         processing = batch.request_counts.processing,
                         "message batch still processing"
                     );
                 }
-                Err(error) if error.is_retryable() => {
-                    failures += 1;
-                    if failures >= MAX_CONSECUTIVE_POLL_FAILURES {
-                        return Err(error);
-                    }
-                    tracing::warn!(
-                        target: "topcoat_si::client",
-                        error = &error as &dyn std::error::Error,
-                        failures,
-                        "polling the message batch failed; polling again"
-                    );
-                }
-                Err(error) => return Err(error),
+                Ok(Some(batch))
             }
-            tokio::time::sleep(poll_interval).await;
+            Err(error) if error.is_retryable() => {
+                *failures += 1;
+                if *failures >= MAX_CONSECUTIVE_POLL_FAILURES {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    target: "topcoat_si::client",
+                    error = &error as &dyn std::error::Error,
+                    failures = *failures,
+                    "polling the message batch failed; polling again"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -94,10 +240,20 @@ impl Anthropic {
     }
 }
 
+/// Rejects a zero poll interval, which would poll without pause.
+fn check_poll_interval(poll_interval: Duration) -> Result<()> {
+    if poll_interval.is_zero() {
+        return Err(Error::validation(
+            "poll_interval must be greater than zero",
+            Some("poll_interval".to_string()),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ErrorKind;
     use crate::test_support::{Canned, serve};
 
     fn client(base_url: String) -> Anthropic {
@@ -272,5 +428,225 @@ mod tests {
                 .headers
                 .starts_with("GET /v1/messages/batches/msgbatch_1/results ")
         );
+    }
+
+    const MESSAGE: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
+
+    fn results(custom_id: &str, result: &str) -> Canned {
+        let body = format!("{{\"custom_id\":\"{custom_id}\",\"result\":{result}}}\n");
+        Canned::json(200, body).with_content_type("application/x-jsonl")
+    }
+
+    fn succeeded() -> String {
+        format!(r#"{{"type":"succeeded","message":{MESSAGE}}}"#)
+    }
+
+    fn params() -> MessageCreateParams {
+        MessageCreateParams::simple("2+2?", crate::KnownModel::ClaudeHaiku55)
+    }
+
+    async fn await_one(
+        client: &Anthropic,
+        deadline: Option<OffsetDateTime>,
+        on_poll: &mut dyn FnMut(&MessageBatch) -> Control,
+    ) -> Result<BatchOutcome> {
+        let wait = BatchWait {
+            poll: Duration::from_millis(1),
+            deadline,
+            on_poll,
+        };
+        client.await_one("msgbatch_1", "turn-1", wait).await
+    }
+
+    #[tokio::test]
+    async fn submit_then_await_returns_the_message() {
+        let (base_url, recorded) = serve(vec![
+            Canned::json(200, batch("in_progress")),
+            Canned::json(200, batch("in_progress")),
+            Canned::json(200, batch("ended")),
+            results("turn-1", &succeeded()),
+        ])
+        .await;
+        let client = client(base_url);
+
+        let submitted = client.submit_one("turn-1", params()).await.unwrap();
+        let mut polls = 0;
+        let outcome = await_one(&client, None, &mut |batch| {
+            assert_eq!(
+                batch.processing_status,
+                MessageBatchProcessingStatus::InProgress
+            );
+            polls += 1;
+            Control::Continue
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(submitted.id, "msgbatch_1");
+        assert!(matches!(outcome, BatchOutcome::Succeeded(message) if message.id == "msg_1"));
+        assert_eq!(polls, 1);
+        let requests = recorded.lock().unwrap();
+        let lines: Vec<_> = requests
+            .iter()
+            .map(|request| request.headers.lines().next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "POST /v1/messages/batches HTTP/1.1",
+                "GET /v1/messages/batches/msgbatch_1 HTTP/1.1",
+                "GET /v1/messages/batches/msgbatch_1 HTTP/1.1",
+                "GET /v1/messages/batches/msgbatch_1/results HTTP/1.1",
+            ]
+        );
+        let body: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+        assert_eq!(body["requests"].as_array().unwrap().len(), 1);
+        assert_eq!(body["requests"][0]["custom_id"], "turn-1");
+        assert!(body["requests"][0]["params"].get("stream").is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_streaming_params_without_a_request() {
+        let (base_url, recorded) = serve(Vec::new()).await;
+
+        let error = client(base_url)
+            .submit_one("turn-1", params().with_stream(true))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error.kind(), ErrorKind::Validation { .. }));
+        assert!(recorded.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_overloaded_result_is_a_retryable_error() {
+        let errored = r#"{"type":"errored","error":{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}}"#;
+        let (base_url, _) = serve(vec![
+            Canned::json(200, batch("ended")),
+            results("turn-1", errored),
+        ])
+        .await;
+
+        let outcome = await_one(&client(base_url), None, &mut |_| Control::Continue)
+            .await
+            .unwrap();
+
+        let BatchOutcome::Errored(error) = outcome else {
+            panic!("expected an errored outcome, got {outcome:?}");
+        };
+        assert!(error.is_retryable());
+        assert!(matches!(
+            error.kind(),
+            ErrorKind::Api {
+                error_type: Some(crate::ErrorType::OverloadedError),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_expired_result_is_expired() {
+        let (base_url, _) = serve(vec![
+            Canned::json(200, batch("ended")),
+            results("turn-1", r#"{"type":"expired"}"#),
+        ])
+        .await;
+
+        let outcome = await_one(&client(base_url), None, &mut |_| Control::Continue)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, BatchOutcome::Expired));
+    }
+
+    #[tokio::test]
+    async fn cancel_from_on_poll_sends_cancel_once() {
+        let (base_url, recorded) = serve(vec![
+            Canned::json(200, batch("in_progress")),
+            Canned::json(200, batch("canceling")),
+            Canned::json(200, batch("canceling")),
+            Canned::json(200, batch("ended")),
+            results("turn-1", r#"{"type":"canceled"}"#),
+        ])
+        .await;
+
+        let mut polls = 0;
+        let outcome = await_one(&client(base_url), None, &mut |_| {
+            polls += 1;
+            Control::Cancel
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, BatchOutcome::Canceled));
+        assert_eq!(polls, 1);
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(
+            requests[1]
+                .headers
+                .starts_with("POST /v1/messages/batches/msgbatch_1/cancel "),
+            "{}",
+            requests[1].headers
+        );
+        let cancels = requests
+            .iter()
+            .filter(|request| request.headers.contains("/cancel "))
+            .count();
+        assert_eq!(cancels, 1);
+    }
+
+    #[tokio::test]
+    async fn a_passed_deadline_returns_without_cancelling() {
+        let (base_url, recorded) = serve(vec![
+            Canned::json(200, batch("in_progress")),
+            Canned::json(200, batch("ended")),
+        ])
+        .await;
+
+        let deadline = OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let outcome = await_one(&client(base_url), Some(deadline), &mut |_| {
+            Control::Continue
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, BatchOutcome::DeadlinePassed));
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].headers.starts_with("GET "));
+    }
+
+    #[tokio::test]
+    async fn a_missing_result_is_a_decode_error() {
+        let (base_url, _) = serve(vec![
+            Canned::json(200, batch("ended")),
+            results("other", &succeeded()),
+        ])
+        .await;
+
+        let error = await_one(&client(base_url), None, &mut |_| Control::Continue)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), &ErrorKind::Decode);
+    }
+
+    #[tokio::test]
+    async fn await_rejects_zero_interval_without_a_request() {
+        let (base_url, recorded) = serve(Vec::new()).await;
+
+        let wait = BatchWait {
+            poll: Duration::ZERO,
+            deadline: None,
+            on_poll: &mut |_| Control::Continue,
+        };
+        let error = client(base_url)
+            .await_one("msgbatch_1", "turn-1", wait)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error.kind(), ErrorKind::Validation { .. }));
+        assert!(recorded.lock().unwrap().is_empty());
     }
 }
