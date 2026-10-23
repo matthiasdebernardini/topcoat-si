@@ -4,8 +4,8 @@ use std::time::Duration;
 
 // The pool's backstops kill a worker this long past a sandbox time limit at the latest.
 pub(super) const LIMIT_MARGIN: Duration = Duration::from_secs(5);
-// The pool's limit on one feed or resume round trip, and the default `python_call_timeout`.
-pub(super) const PYTHON_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+// The `request_timeout` `pool()` sets: the limit on one feed or resume round trip.
+pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Limits on one conversation's sandbox.
 #[derive(Debug, Clone)]
@@ -39,7 +39,7 @@ impl Default for Limits {
             max_host_calls: 50,
             max_output_chars: 20_000,
             host_call_timeout: Duration::from_secs(45),
-            python_call_timeout: PYTHON_CALL_TIMEOUT,
+            python_call_timeout: Duration::from_secs(120),
         }
     }
 }

@@ -969,7 +969,20 @@ async fn limits_past_a_configured_python_call_timeout_are_rejected() {
         matches!(error.kind(), ErrorKind::Validation { .. }),
         "{error}"
     );
-    assert!(CodeMode::try_new(pool, vec![], limits(Duration::from_secs(205))).is_ok());
+    let limits = Limits {
+        max_feed_duration: Duration::from_secs(100),
+        max_turn_duration: Duration::from_secs(100),
+        python_call_timeout: Duration::from_secs(100),
+        ..Limits::default()
+    };
+    assert!(CodeMode::try_new(pool.clone(), vec![], limits).is_err());
+    let limits = Limits {
+        max_feed_duration: Duration::from_secs(100),
+        max_turn_duration: Duration::from_secs(100),
+        python_call_timeout: Duration::from_secs(105),
+        ..Limits::default()
+    };
+    assert!(CodeMode::try_new(pool, vec![], limits).is_ok());
 }
 
 fn description(code: &CodeMode) -> String {
@@ -1000,7 +1013,7 @@ async fn definition_is_the_same_for_the_same_packs() {
 }
 
 #[tokio::test]
-async fn fresh_sessions_change_only_the_opening_sentence() {
+async fn fresh_sessions_add_only_one_sentence() {
     let pool = test_pool().await;
     let build = || CodeMode::try_new(pool.clone(), vec![packs::reports()], Limits::default());
     let kept = description(&build().unwrap());
@@ -1011,10 +1024,28 @@ async fn fresh_sessions_change_only_the_opening_sentence() {
     assert_eq!(
         fresh,
         format!(
-            "Each turn's python calls run in a fresh session; variables do not carry over to \
-             later turns.{rest}"
+            "{opening} Each turn's python calls run in a fresh session; variables do not carry \
+             over to later turns.{rest}"
         )
     );
+}
+
+#[tokio::test]
+async fn limits_past_the_pool_request_timeout_are_rejected() {
+    let limits = Limits {
+        max_feed_duration: Duration::from_secs(150),
+        max_turn_duration: Duration::from_secs(150),
+        python_call_timeout: Duration::from_secs(600),
+        ..Limits::default()
+    };
+    let error = CodeMode::try_new(test_pool().await, vec![], limits)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error.kind(), ErrorKind::Validation { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("round trip"), "{error}");
 }
 
 // A list holding one list twice, 30 deep: tiny in the sandbox, 2^30 items expanded.

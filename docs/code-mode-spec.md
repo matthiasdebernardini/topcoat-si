@@ -70,7 +70,9 @@ pub mod code_mode {
 feed or resume round trip, so a hung worker is always killed. The pool's own backstops already
 kill a worker shortly past `max_feed_duration` or `max_turn_duration`; `request_timeout` guards
 the requests those limits do not cover. `CodeMode::try_new` rejects limits where the shorter of
-`max_feed_duration` and `max_turn_duration`, plus 5 s, passes `python_call_timeout`.
+`max_feed_duration` and `max_turn_duration`, plus 5 s, passes `python_call_timeout` or 120 s,
+since the pool would kill the worker of a snippet that runs that long without a host call.
+`CodeMode` cannot read a pool's config, so it checks against the 120 s that `pool` sets.
 
 `PyError` has no `TimeoutError`: that exception is reserved for the sandbox's own time limit, which
 discards the session (Session lifecycle step 4), so a host function raising it would look the
@@ -145,7 +147,7 @@ impl CodeMode {
     /// Validates the packs; nothing is sent and no worker is checked out yet.
     pub fn try_new(pool: Arc<Pool>, packs: Vec<Pack>, limits: Limits) -> Result<Self>;
     /// Tells Claude that variables do not carry over to later turns, for an app that builds a
-    /// new `CodeMode` every turn. Changes only the opening sentence of the tool description.
+    /// new `CodeMode` every turn. Adds one sentence after the tool description's first.
     pub fn with_fresh_sessions(self) -> Self;
     /// Ends the session and returns its worker to the pool. Dropping a CodeMode without
     /// calling this kills the worker instead: safe, but the pool must spawn a replacement.
@@ -218,9 +220,9 @@ firecrawl: web search and page scraping
 ...
 ```
 
-`with_fresh_sessions()` replaces the first sentence, through "before an error.", with "Each
-turn's python calls run in a fresh session; variables do not carry over to later turns." The rest
-is unchanged.
+`with_fresh_sessions()` adds " Each turn's python calls run in a fresh session; variables do not
+carry over to later turns." after the first sentence, "...before an error." The rest is
+unchanged.
 
 One line per function: the signature with types removed and defaults kept, then the summary.
 Host functions are listed as `name(...)`, since the header already says they are async. A Python
@@ -511,7 +513,8 @@ when it is unset. CI installs `monty-runtime` 1.2.0 with `--locked` and sets it.
    `python_call_timeout`; a 50 s host call succeeds under a 60 s `host_call_timeout` and times
    out under the 45 s default; 130 s of host calls in one `python` call succeed under a 200 s
    `python_call_timeout` (both on a paused clock); two `CodeMode`s with the same packs give the
-   same definition, and `with_fresh_sessions` changes only its opening sentence.
+   same definition, and `with_fresh_sessions` adds only its one sentence; limits past the pool's
+   120 s round-trip timeout fail in `CodeMode::try_new` even with a longer `python_call_timeout`.
 10. Value sizes: a list doubled 30 times through shared references raises `ValueError` as an
     argument and renders truncated as the final value, both quickly; 100 000 items pass and
     100 001 do not; nesting past 64 levels raises `ValueError`.

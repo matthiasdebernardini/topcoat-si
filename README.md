@@ -713,6 +713,8 @@ To test a pack, call `check_pack` from `code_mode::testing` with the pool, a fun
 | `host_call_timeout` | 45 s | time one host function call may take; past it the call raises `RuntimeError` |
 | `python_call_timeout` | 120 s | time one `python` call may take, host calls included; past it the session restarts. At least the shorter of `max_feed_duration` and `max_turn_duration` plus 5 s |
 
+That shorter limit, plus 5 s, must also stay within 120 seconds, the time the pool gives the sandbox for one round trip before killing the worker.
+
 Raise both timeouts when your host functions are slow, such as scrapes with long server-side timeouts. When every worker is busy, a conversation waits up to 10 seconds, then gets a "no sandbox free" tool result.
 
 ### Advice for apps
