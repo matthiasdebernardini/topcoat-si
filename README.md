@@ -1324,13 +1324,13 @@ The live tests call the real APIs and are ignored by default. They need `ANTHROP
 cargo test --test live -- --ignored
 ```
 
-This checks every model, the three client tools (`web_search`, `fetch_page` and `jev`) and the Firecrawl endpoints `gov_search`, `map`, a three-page PDF scrape with page markers and `credit_usage`. It costs a few cents of Claude and under about 20 Firecrawl credits. Adding code mode also needs `MONTY_BIN`, the path of the `monty` worker:
+This checks every model, the three client tools (`web_search`, `fetch_page` and `jev`) and the Firecrawl endpoints `gov_search`, `map`, a three-page PDF scrape with page markers and `credit_usage`. It costs a few cents of Claude and about 8 Firecrawl credits: about 4 for the Firecrawl endpoints and about 3 for the client tools. Adding code mode also needs `MONTY_BIN`, the path of the `monty` worker:
 
 ```bash
 MONTY_BIN=/path/to/monty cargo test --test live --features code-mode -- --ignored
 ```
 
-That runs the same checks plus code mode with all five built-in packs, and `gov_search` and `map_site` through `FirecrawlPack`. It adds a multi-turn Sonnet run, about ten cents, and 1 more credit.
+That runs the same checks plus code mode with all five built-in packs, and `gov_search` and `map_site` through `FirecrawlPack`. It adds a multi-turn Sonnet run, about ten cents, and Firecrawl credits: 1 for the pack test and up to 20 for the code mode run, which its pack budget caps and which typically uses well under that. A full run uses at most about 28 credits.
 
 ## License
 

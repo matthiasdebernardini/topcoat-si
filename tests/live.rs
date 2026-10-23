@@ -11,9 +11,13 @@
 //! - `credit_usage`: 0;
 //! - code mode `gov_search` and `map_site`: 0 and 1.
 //!
-//! `firecrawl_endpoints_answer` costs about 4 credits and no Claude. `code_mode_firecrawl_pack_answers`
-//! adds about 1 credit and a few cents of Haiku. The other tests also spend credits on search and
-//! fetch, so a whole run stays under about 20.
+//! Credits per test, at most:
+//! - `firecrawl_endpoints_answer`: about 4, and no Claude;
+//! - `code_mode_firecrawl_pack_answers`: about 1, and a few cents of Haiku;
+//! - `client_tools_answer`: about 3, one search and one page;
+//! - `code_mode_answers`: capped at 20 by its pack budget, typically well under that.
+//!
+//! A full code mode run typically uses well under 20 credits, and at most about 28.
 
 use futures::StreamExt;
 use topcoat_si::firecrawl::{GovSearchRequest, MapRequest, ScrapeOptions, ScrapeRequest};
@@ -235,7 +239,7 @@ async fn firecrawl_endpoints_answer() {
         "a hit has no url: {hits:?}"
     );
 
-    let map = MapRequest::new("https://www.tn.gov")
+    let map = MapRequest::new("https://www.nashville.gov")
         .with_search("zoning")
         .with_limit(5);
     let links = firecrawl.map(&map).await.expect("map").links;
@@ -246,7 +250,7 @@ async fn firecrawl_endpoints_answer() {
         "a link has no url: {links:?}"
     );
 
-    // The IRS W-9 has 6 pages, so 3 are read and a marker precedes page 2 and 3.
+    // The IRS W-9 has 6 pages, so 3 are read and page markers are present.
     let options = ScrapeOptions::new()
         .with_pdf_max_pages(3)
         .with_pdf_pages(true)
@@ -256,10 +260,15 @@ async fn firecrawl_endpoints_answer() {
     let scraped = firecrawl.scrape(&request).await.expect("scrape").data;
     let markdown = scraped.markdown.as_deref().unwrap_or_default();
     assert!(!markdown.trim().is_empty(), "the PDF had no markdown");
-    assert!(
-        markdown.contains("<!-- page 2 -->"),
-        "no page marker in: {markdown:.300}"
-    );
+    // Firecrawl can skip a page number when a paragraph runs across a break, so check the shape.
+    let has_marker = markdown.match_indices("<!-- page ").any(|(at, marker)| {
+        let digits: String = markdown[at + marker.len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        !digits.is_empty() && markdown[at + marker.len() + digits.len()..].starts_with(" -->")
+    });
+    assert!(has_marker, "no page marker in: {markdown:.300}");
     let pages = scraped.pages.as_deref().unwrap_or_default();
     assert!(
         (2..=3).contains(&pages.len()),
@@ -310,7 +319,7 @@ async fn code_mode_firecrawl_pack_answers() {
         2048,
         vec![MessageParam::user(
             "Call gov_search(query=\"zoning variance\", k=3, jurisdiction=\"us-tn\") and \
-             map_site(url=\"https://www.tn.gov\", search=\"zoning\", limit=5). Print the \
+             map_site(url=\"https://www.nashville.gov\", search=\"zoning\", limit=5). Print the \
              number of results from each.",
         )],
         Model::Known(model),
@@ -328,6 +337,12 @@ async fn code_mode_firecrawl_pack_answers() {
     if let Err(err) = finished {
         panic!("finish failed: {err:?}");
     }
+
+    assert!(
+        run.text().is_some_and(|text| !text.trim().is_empty()),
+        "run ended without text: {:?}",
+        run.message
+    );
 
     let events = recorder.0.lock().expect("recorder lock");
     let gov = events.iter().find_map(|event| match event {
