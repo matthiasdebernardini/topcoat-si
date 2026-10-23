@@ -65,7 +65,8 @@ fn default_confidence() -> f64 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct JevUsed {
-    /// Requests sent, successful or not.
+    /// Requests sent, whether or not they succeeded. Calls refused before sending, for invalid
+    /// questions or state or by the cap, are not counted.
     pub requests: u32,
 }
 
@@ -79,8 +80,9 @@ impl JevUsed {
 
 /// A per-conversation cap on Jev requests, shared by every function of the pack.
 ///
-/// Every call of `ask`, `yes_no`, `choose` or `rate` counts as one request, whether or not it
-/// succeeds; client retries are not counted again. Once the cap is reached, the functions raise
+/// A call of `ask`, `yes_no`, `choose` or `rate` counts as one request once it is sent, whether
+/// or not it succeeds; client retries are not counted again. A call with invalid questions or
+/// state is refused before sending and not counted. Once the cap is reached, the functions raise
 /// `RuntimeError` without sending anything.
 #[derive(Debug)]
 pub struct JevBudget {
@@ -113,34 +115,42 @@ impl JevBudget {
         }
     }
 
-    /// Counts one request, or refuses when the cap is reached.
-    fn take(&self) -> std::result::Result<(), HostError> {
+    /// Counts one request, or gives the reason it is refused when the cap is reached.
+    fn take(&self) -> std::result::Result<(), String> {
         self.requests
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
                 (used < self.max_requests).then(|| used + 1)
             })
             .map(|_| ())
-            .map_err(|_| HostError::Raise {
-                kind: PyError::RuntimeError,
-                message: format!(
+            .map_err(|_| {
+                format!(
                     "Jev request budget of {} used up; finish with what you have",
                     self.max_requests
-                ),
+                )
             })
     }
 }
 
-/// What the pack did, in order, for one request.
+/// What the pack did for one call, in order.
+///
+/// A sent call gives `Asking`, then `Answered` or `Failed`. A call with invalid questions or
+/// state gives only `Failed`, and one stopped by the budget only `Refused`. A call dropped by the
+/// host-call timeout while its request is in flight may give `Asking` with nothing after it.
+/// `function` is the Python function called: `"ask"`, `"yes_no"`, `"choose"` or `"rate"`.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum JevEvent {
-    /// A request is about to be sent, after the budget and concurrency checks.
+    /// A request is about to be sent, after the checks, the concurrency limit and the budget.
     Asking {
+        /// The Python function called.
+        function: &'static str,
         /// How many questions it asks.
         questions: usize,
     },
     /// Jev answered.
     Answered {
+        /// The Python function called.
+        function: &'static str,
         /// Tokens consumed.
         usage: JevUsage,
         /// `x-typesafe-request-id`, or `cf-ray` when that is missing.
@@ -150,10 +160,19 @@ pub enum JevEvent {
         /// Attempts made, 1 when the first succeeded.
         attempts: usize,
     },
-    /// The request failed.
+    /// The call failed: its questions or state were invalid, or the request failed.
     Failed {
+        /// The Python function called.
+        function: &'static str,
         /// Why.
         error: Error,
+    },
+    /// The budget was used up, so nothing was sent.
+    Refused {
+        /// The Python function called.
+        function: &'static str,
+        /// The message raised to the script.
+        reason: String,
     },
 }
 
@@ -182,7 +201,6 @@ pub trait JevObserver: Send + Sync {
 /// // ... later, save `budget.used()` with the conversation ...
 /// # }
 /// ```
-#[must_use]
 pub struct JevPack {
     client: JevClient,
     budget: Option<Arc<JevBudget>>,
@@ -192,6 +210,7 @@ pub struct JevPack {
 
 impl JevPack {
     /// A pack with no request cap, no concurrency limit and no observer.
+    #[must_use]
     pub fn new(client: JevClient) -> Self {
         Self {
             client,
@@ -202,24 +221,29 @@ impl JevPack {
     }
 
     /// Cap the requests. Keep the `Arc` to read [`JevBudget::used`] later.
+    #[must_use]
     pub fn with_budget(mut self, budget: Arc<JevBudget>) -> Self {
         self.budget = Some(budget);
         self
     }
 
-    /// Send at most `n` requests at once (at least 1); further calls in a `gather` wait.
+    /// Send at most `n` requests at once (at least 1); further calls in a `gather` wait. The
+    /// wait counts against the host-call timeout.
+    #[must_use]
     pub fn with_max_concurrency(mut self, n: usize) -> Self {
         self.max_concurrency = Some(n.max(1));
         self
     }
 
     /// Send every [`JevEvent`] to `observer`.
+    #[must_use]
     pub fn with_observer(mut self, observer: Arc<dyn JevObserver>) -> Self {
         self.observer = Some(observer);
         self
     }
 
     /// The pack.
+    #[must_use]
     pub fn build(self) -> Pack {
         let asker = Arc::new(Asker {
             client: self.client,
@@ -239,7 +263,7 @@ impl JevPack {
                     let asker = asker.clone();
                     async move {
                         let questions = Questions::from_tool(&args.questions);
-                        let response = asker.ask(args.state, &questions).await?;
+                        let response = asker.ask("ask", args.state, &questions).await?;
                         Ok(Value::Object(jev::answers(&response, &args.questions)))
                     }
                 },
@@ -252,7 +276,7 @@ impl JevPack {
                     let asker = yes_no_asker.clone();
                     async move {
                         let questions = Questions::new().noul(QUESTION, args.question);
-                        let response = asker.ask(args.state, &questions).await?;
+                        let response = asker.ask("yes_no", args.state, &questions).await?;
                         let (outcome, certainty) =
                             mapped(response.yes_no_certainty(QUESTION, args.min_certainty))?;
                         let (Outcome::Answered(best) | Outcome::Unsure { best, .. }) = outcome;
@@ -274,7 +298,7 @@ impl JevPack {
                             args.question,
                             args.options.into_iter().map(|o| (o, None::<String>)),
                         );
-                        let response = asker.ask(args.state, &questions).await?;
+                        let response = asker.ask("choose", args.state, &questions).await?;
                         value::to_json(choice(&response, args.min_confidence)?)
                     }
                 },
@@ -290,7 +314,7 @@ impl JevPack {
                     async move {
                         let questions =
                             Questions::new().score(QUESTION, args.question, &args.levels);
-                        let response = asker.ask(args.state, &questions).await?;
+                        let response = asker.ask("rate", args.state, &questions).await?;
                         value::to_json(score(&response, &args.levels, args.min_confidence)?)
                     }
                 },
@@ -344,34 +368,58 @@ struct Asker {
 impl Asker {
     async fn ask(
         &self,
+        function: &'static str,
         state: Value,
         questions: &Questions,
     ) -> std::result::Result<JevResponse, HostError> {
-        if let Some(budget) = &self.budget {
-            budget.take()?;
-        }
+        let request = match self.client.prepare(state, questions) {
+            Ok(request) => request,
+            Err(error) => return Err(self.failed(function, error)),
+        };
         // The semaphore is never closed, so `acquire` cannot fail.
         let _permit = match &self.permits {
             Some(permits) => permits.acquire().await.ok(),
             None => None,
         };
+        if let Some(budget) = &self.budget
+            && let Err(reason) = budget.take()
+        {
+            self.notify(JevEvent::Refused {
+                function,
+                reason: reason.clone(),
+            });
+            return Err(HostError::Raise {
+                kind: PyError::RuntimeError,
+                message: reason,
+            });
+        }
         self.notify(JevEvent::Asking {
+            function,
             questions: questions.len(),
         });
         let start = Instant::now();
-        let outcome = self.client.ask(state, questions).await;
-        match &outcome {
-            Ok(response) => self.notify(JevEvent::Answered {
-                usage: response.usage,
-                request_id: response.request_id.clone(),
-                latency: start.elapsed(),
-                attempts: response.attempts,
-            }),
-            Err(error) => self.notify(JevEvent::Failed {
-                error: error.clone(),
-            }),
+        match self.client.send(request).await {
+            Ok(response) => {
+                self.notify(JevEvent::Answered {
+                    function,
+                    usage: response.usage,
+                    request_id: response.request_id.clone(),
+                    latency: start.elapsed(),
+                    attempts: response.attempts,
+                });
+                Ok(response)
+            }
+            Err(error) => Err(self.failed(function, error)),
         }
-        mapped(outcome)
+    }
+
+    /// Reports a failure and maps it for the script.
+    fn failed(&self, function: &'static str, error: Error) -> HostError {
+        self.notify(JevEvent::Failed {
+            function,
+            error: error.clone(),
+        });
+        host_error(error)
     }
 
     fn notify(&self, event: JevEvent) {
@@ -432,7 +480,11 @@ fn score<'a>(
 /// Maps a Jev error as the `jev` tool does: fatal ends the run, a failed check raises
 /// `ValueError`, anything else `RuntimeError`.
 fn mapped<T>(outcome: Result<T>) -> std::result::Result<T, HostError> {
-    outcome.map_err(|error| match error {
+    outcome.map_err(host_error)
+}
+
+fn host_error(error: Error) -> HostError {
+    match error {
         error if jev::is_fatal(&error) => HostError::Fatal(error),
         error if matches!(error.kind(), ErrorKind::Validation { .. }) => HostError::Raise {
             kind: PyError::ValueError,
@@ -442,5 +494,5 @@ fn mapped<T>(outcome: Result<T>) -> std::result::Result<T, HostError> {
             kind: PyError::RuntimeError,
             message: format!("Jev failed: {error}"),
         },
-    })
+    }
 }

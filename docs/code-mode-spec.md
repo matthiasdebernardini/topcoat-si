@@ -401,8 +401,29 @@ they return `Err`.
 
 `JevClient::choose` and `rate` are generic over compile-time types, so `choose` and `rate` here go
 through `JevClient::ask` with one question and read `JevResponse::choice` / `score`. The `jev`
-tool's question parsing (`ToolQuestion`) and fatal-error check (`is_fatal`) become `pub(crate)`
-and are reused, so errors map as `JevTool` maps them.
+tool's question types (`ToolQuestion`, `ToolOption`), `Questions::from_tool` and `jev::answers`
+are public; its fatal-error check (`is_fatal`) is `pub(crate)` and reused, so errors map as
+`JevTool` maps them.
+
+### `JevPack::new(client: JevClient)`
+
+`packs::jev(client)` is `JevPack::new(client).build()`. The builder adds, per conversation:
+
+- `with_budget(Arc<JevBudget>)`: a cap on requests. A call counts once its request is sent,
+  whether or not it succeeds; client retries are not counted again. A call with invalid
+  questions or state is refused before sending and not counted. Past the cap the functions raise
+  `RuntimeError` and send nothing. `JevBudget::used()` returns a `JevUsed` snapshot and
+  `JevBudget::with_used` restores one.
+- `with_max_concurrency(n)`: a semaphore of `n` permits shared by the four functions. The wait
+  for a permit counts against the host-call timeout.
+- `with_observer(Arc<dyn JevObserver>)`: a `JevEvent` per step, each naming the Python
+  function: `Asking { questions }`, then `Answered { usage, request_id, latency, attempts }` or
+  `Failed { error }`; `Failed` alone for invalid questions or state; `Refused { reason }` when
+  the budget is used up. A call dropped by the host-call timeout mid-request may give `Asking`
+  with nothing after it.
+
+Each call checks its questions and state, waits for a permit, takes one request from the budget,
+then sends.
 
 ### `packs::research()`, requires `firecrawl`, `jev`
 

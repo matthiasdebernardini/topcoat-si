@@ -33,6 +33,9 @@ const MAX_ERROR_CHARS: usize = 200;
 // The question name the one-question shortcuts send. Jev never sees names.
 const SHORTCUT_QUESTION: &str = "answer";
 
+/// A request body that passed every check [`JevClient::ask`] makes before sending.
+pub(crate) struct Prepared(Bytes);
+
 /// Client for Jev's `POST /v1/systemone`.
 ///
 /// The API key is only kept as a sensitive header value and is redacted from `Debug`. There is
@@ -170,7 +173,13 @@ impl JevClient {
     /// `Retry-After`, whichever is longer; a `Retry-After` over 60 seconds, or a wait that would
     /// pass the retry budget, returns the error at once.
     pub async fn ask(&self, state: impl Into<Value>, questions: &Questions) -> Result<JevResponse> {
-        let state: Value = state.into();
+        let request = self.prepare(state.into(), questions)?;
+        self.send(request).await
+    }
+
+    /// Checks the state and questions and serializes the request body, as [`JevClient::ask`]
+    /// does before sending.
+    pub(crate) fn prepare(&self, state: Value, questions: &Questions) -> Result<Prepared> {
         questions.validate()?;
         validate_state(&state)?;
         let request_body = serialize_body(&WireRequest {
@@ -178,7 +187,12 @@ impl JevClient {
             state: &state,
             questions: WireQuestions(&questions.items),
         })?;
-        let request_body = Bytes::from(request_body);
+        Ok(Prepared(Bytes::from(request_body)))
+    }
+
+    /// Sends a checked request, retrying as [`JevClient::ask`] describes.
+    pub(crate) async fn send(&self, request: Prepared) -> Result<JevResponse> {
+        let Prepared(request_body) = request;
         let url = format!("{}{PATH}", self.base_url);
         let started = Instant::now();
         let policy = RetryPolicy {

@@ -628,10 +628,10 @@ Host functions and Python helpers come in packs. The built-in packs live in `cod
 | Builder | Adds |
 |---|---|
 | `with_budget(Arc<JevBudget>)` | a cap on requests for the conversation; once reached, the functions raise `RuntimeError` and send nothing |
-| `with_max_concurrency(n)` | at most `n` requests in flight; further calls in a `gather` wait |
-| `with_observer(Arc<dyn JevObserver>)` | a `JevEvent` per step: `Asking`, then `Answered` (usage, request id, latency, attempts) or `Failed` |
+| `with_max_concurrency(n)` | at most `n` requests in flight; further calls in a `gather` wait, and the wait counts against the host-call timeout |
+| `with_observer(Arc<dyn JevObserver>)` | a `JevEvent` per step, naming the function: `Asking`, then `Answered` (usage, request id, latency, attempts) or `Failed`; `Refused` when the budget is used up |
 
-Every call counts as one request, whether or not it succeeds. `JevBudget::used()` returns a `JevUsed` snapshot to save with the conversation, and `JevBudget::new(max).with_used(saved)` restores it.
+A request that was sent counts against the budget whether or not it succeeds. Calls with invalid questions or state are refused before sending and not counted. `JevBudget::used()` returns a `JevUsed` snapshot to save with the conversation, and `JevBudget::new(max).with_used(saved)` restores it.
 
 ```rust,no_run
 #[cfg(feature = "code-mode")]

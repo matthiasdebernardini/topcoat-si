@@ -856,9 +856,13 @@ async fn jev_observer_sees_usage_and_request_id() {
     assert_eq!(events.len(), 4, "{events:?}");
     assert!(matches!(
         events[0],
-        packs::JevEvent::Asking { questions: 1 }
+        packs::JevEvent::Asking {
+            function: "yes_no",
+            questions: 1
+        }
     ));
     let packs::JevEvent::Answered {
+        function: "yes_no",
         usage,
         request_id,
         attempts,
@@ -875,12 +879,119 @@ async fn jev_observer_sees_usage_and_request_id() {
     assert_eq!(*attempts, 1);
     assert!(matches!(
         events[2],
-        packs::JevEvent::Asking { questions: 1 }
+        packs::JevEvent::Asking {
+            function: "yes_no",
+            questions: 1
+        }
     ));
-    let packs::JevEvent::Failed { error } = &events[3] else {
+    let packs::JevEvent::Failed {
+        function: "yes_no",
+        error,
+    } = &events[3]
+    else {
         panic!("expected Failed, got {:?}", events[3]);
     };
     assert_eq!(error.status(), Some(400));
+}
+
+#[tokio::test]
+async fn jev_observer_sees_retried_attempts() {
+    let (url, _) = serve(vec![
+        Canned::json(500, json!({"detail": "busy"}).to_string()),
+        jev_yes(),
+    ])
+    .await;
+    let events = Arc::new(JevEvents::default());
+    let client = jev_client(&url).with_max_retries(1);
+    let pack = packs::JevPack::new(client)
+        .with_observer(events.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "(await yes_no(state='s', question='q'))['answer']";
+    assert_eq!(run(&code, snippet).await, ("=> True".to_string(), false));
+    let events = events.0.lock().unwrap();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(
+        matches!(events[1], packs::JevEvent::Answered { attempts: 2, .. }),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn jev_budget_holds_under_gather() {
+    let (url, recorded) = serve(vec![jev_yes(), jev_yes()]).await;
+    let budget = Arc::new(packs::JevBudget::new(2));
+    let events = Arc::new(JevEvents::default());
+    let pack = packs::JevPack::new(jev_client(&url))
+        .with_budget(budget.clone())
+        .with_observer(events.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+    let snippet = "async def one(i):\n    try:\n        return (await yes_no(state=str(i), \
+                   question='q'))['answer']\n    except RuntimeError as e:\n        return \
+                   str(e)\nresults = await asyncio.gather(*[one(i) for i in range(5)])\n\
+                   (len([r for r in results if r is True]), len([r for r in results if \
+                   isinstance(r, str) and 'budget of 2 used up' in r]))";
+    assert_eq!(run(&code, snippet).await, ("=> (2, 3)".to_string(), false));
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+    assert_eq!(budget.used(), packs::JevUsed::new(2));
+    let events = events.0.lock().unwrap();
+    let refused = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                packs::JevEvent::Refused { function: "yes_no", reason }
+                    if reason.contains("budget of 2 used up")
+            )
+        })
+        .count();
+    assert_eq!(refused, 3, "{events:?}");
+}
+
+#[tokio::test]
+async fn jev_budget_counts_only_sent_requests() {
+    let (url, recorded) = serve(vec![Canned::json(
+        500,
+        json!({"detail": "down"}).to_string(),
+    )])
+    .await;
+    let budget = Arc::new(packs::JevBudget::new(5));
+    let events = Arc::new(JevEvents::default());
+    let pack = packs::JevPack::new(jev_client(&url))
+        .with_budget(budget.clone())
+        .with_observer(events.clone())
+        .build();
+    let code = CodeMode::try_new(test_pool().await, vec![pack], Limits::default()).unwrap();
+
+    // Invalid questions send nothing and cost nothing.
+    let (text, is_error) = run(&code, "await choose(state='s', question='q', options=[])").await;
+    assert!(
+        is_error && text.contains("ValueError: Invalid jev call"),
+        "{text}"
+    );
+    assert_eq!(budget.used(), packs::JevUsed::new(0));
+    assert!(recorded.lock().unwrap().is_empty());
+    {
+        let events = events.0.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(
+            events[0],
+            packs::JevEvent::Failed {
+                function: "choose",
+                ..
+            }
+        ));
+    }
+
+    // A request that was sent counts even though it failed.
+    let (text, is_error) = run(&code, "await yes_no(state='s', question='q')").await;
+    assert!(
+        is_error && text.contains("RuntimeError: Jev failed"),
+        "{text}"
+    );
+    assert_eq!(budget.used(), packs::JevUsed::new(1));
+    assert_eq!(recorded.lock().unwrap().len(), 1);
 }
 
 // 8. Output.
