@@ -546,6 +546,8 @@ The crate never locates or downloads the binary. Your app passes its path to `co
 
 The pool caps the live sandboxes across all conversations. A `CodeMode` is one sandbox session. Never share one between conversations: one user's variables would reach another user's Claude.
 
+An app that builds a new `CodeMode` every turn calls `with_fresh_sessions()` on it, so the tool description tells Claude that variables do not carry over to later turns. The definition is the same for the same packs, so the prompt cache holds from turn to turn.
+
 ```rust,no_run
 #[cfg(feature = "code-mode")]
 use std::path::PathBuf;
@@ -708,8 +710,10 @@ To test a pack, call `check_pack` from `code_mode::testing` with the pool, a fun
 | `max_turn_duration` | 60 s | run time between two host round trips |
 | `max_host_calls` | 50 | host calls for the whole conversation |
 | `max_output_chars` | 20,000 | characters in one tool result; at least 5,000, reserved for the value or traceback |
+| `host_call_timeout` | 45 s | time one host function call may take; past it the call raises `RuntimeError` |
+| `python_call_timeout` | 120 s | time one `python` call may take, host calls included; past it the session restarts. At least the shorter of `max_feed_duration` and `max_turn_duration` plus 5 s |
 
-Two time limits are fixed: one host call times out after 45 seconds, and one `python` call after 120 seconds. When every worker is busy, a conversation waits up to 10 seconds, then gets a "no sandbox free" tool result.
+Raise both timeouts when your host functions are slow, such as scrapes with long server-side timeouts. When every worker is busy, a conversation waits up to 10 seconds, then gets a "no sandbox free" tool result.
 
 ### Advice for apps
 

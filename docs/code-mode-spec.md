@@ -66,11 +66,11 @@ pub mod code_mode {
 ```
 
 `pool` uses `PoolConfig::subprocess(monty)` with `min_processes = 1`,
-`max_processes = max_workers`, `checkout_timeout = 10s`, and `request_timeout` = the 120 s
-`python` call timeout, so a hung worker is always killed. The pool's own backstops already kill a
-worker shortly past `max_feed_duration` or `max_turn_duration`; `request_timeout` guards the
-requests those limits do not cover. `CodeMode::try_new` rejects limits where the shorter of
-`max_feed_duration` and `max_turn_duration`, plus 5 s, passes 120 s.
+`max_processes = max_workers`, `checkout_timeout = 10s`, and `request_timeout = 120s` for each
+feed or resume round trip, so a hung worker is always killed. The pool's own backstops already
+kill a worker shortly past `max_feed_duration` or `max_turn_duration`; `request_timeout` guards
+the requests those limits do not cover. `CodeMode::try_new` rejects limits where the shorter of
+`max_feed_duration` and `max_turn_duration`, plus 5 s, passes `python_call_timeout`.
 
 `PyError` has no `TimeoutError`: that exception is reserved for the sandbox's own time limit, which
 discards the session (Session lifecycle step 4), so a host function raising it would look the
@@ -144,6 +144,9 @@ impl Pack {
 impl CodeMode {
     /// Validates the packs; nothing is sent and no worker is checked out yet.
     pub fn try_new(pool: Arc<Pool>, packs: Vec<Pack>, limits: Limits) -> Result<Self>;
+    /// Tells Claude that variables do not carry over to later turns, for an app that builds a
+    /// new `CodeMode` every turn. Changes only the opening sentence of the tool description.
+    pub fn with_fresh_sessions(self) -> Self;
     /// Ends the session and returns its worker to the pool. Dropping a CodeMode without
     /// calling this kills the worker instead: safe, but the pool must spawn a replacement.
     pub async fn finish(self) -> Result<()>;
@@ -155,7 +158,8 @@ impl ClientTool for CodeMode { /* name "python" */ }
 across packs, a `requires` names a pack not given, an example names a function its pack does not
 define, a function is named `help` (reserved), or the limits pass the `python` call timeout (see
 `pool`). The tool definition is built
-once here and cloned by `definition()`.
+once here and cloned by `definition()`, so two `CodeMode`s with the same packs give
+byte-identical definitions and the prompt cache holds across them.
 
 ### Defaults for `Limits`
 
@@ -166,6 +170,8 @@ once here and cloned by `definition()`.
 | `max_turn_duration` | 60 s between host round trips | worker, pool backstop |
 | `max_host_calls` | 50 per conversation | this crate, before calling the function |
 | `max_output_chars` | 20 000 | this crate, when building the tool result |
+| `host_call_timeout` | 45 s per host function call | this crate, around the call |
+| `python_call_timeout` | 120 s per `python` call, host calls included | this crate, around the call |
 
 The host-call budget is per conversation (per `CodeMode`) because the pool's suspension count is
 per session and never resets. When it runs out, every further host call raises
@@ -178,9 +184,10 @@ limit, aborts the session for good. 1000 sits far above what 50 host calls produ
 own counter is always the limit Claude meets. If the pool's limit is ever hit anyway, the
 session is discarded (see Session lifecycle).
 
-Each host call runs under a 45 s timeout and each `python` call under a 120 s timeout, because
-`max_feed_duration` excludes time spent waiting on the host. A host timeout raises
-`RuntimeError: <name>() timed out after 45s`, deliberately not `TimeoutError`, which is reserved
+Each host call runs under `host_call_timeout` and each `python` call under `python_call_timeout`,
+because `max_feed_duration` excludes time spent waiting on the host. An app whose host functions
+are slow, such as scrapes with long server-side timeouts, sets both higher. A host timeout raises
+`RuntimeError: <name>() timed out after 45s` (at the default), deliberately not `TimeoutError`, which is reserved
 for the sandbox's own limit and discards the session. A `python` call timeout discards the
 session.
 
@@ -210,6 +217,10 @@ firecrawl: web search and page scraping
   scrape(*, url) -> dict: one page as markdown
 ...
 ```
+
+`with_fresh_sessions()` replaces the first sentence, through "before an error.", with "Each
+turn's python calls run in a fresh session; variables do not carry over to later turns." The rest
+is unchanged.
 
 One line per function: the signature with types removed and defaults kept, then the summary.
 Host functions are listed as `name(...)`, since the header already says they are async. A Python
@@ -252,7 +263,7 @@ contended within a run.
      an app timeout around `run_tools`, and the checkout is stuck waiting for an answer;
    - any `PoolError` other than `Runtime` (with type checking off, the only error that keeps the
      session, per `Checkout::feed`'s docs);
-   - the `python` call's 120 s timeout;
+   - the `python` call's timeout (`python_call_timeout`);
    - `Runtime` with `checkout.worker_id()` returning `None` (the memory-limit kill);
    - `Runtime` whose exception is a sandbox `TimeoutError` or `MemoryError`: Monty's README says
      the heap has no correctness guarantees after a soft limit;
@@ -286,8 +297,8 @@ loop:
 
 - Host calls run on `ResolveFutures`, so `asyncio.gather` over 10 Jev calls runs them
   concurrently. There is no cap on concurrency: the host-call budget already bounds a `gather`,
-  and running slow calls (up to 45 s each) in rounds could outlast the 120 s `python` call
-  timeout, which discards the session and every result already paid for. A single `await` resolves the same way with one pending id (Verified item 2).
+  and running slow calls (up to `host_call_timeout` each) in rounds could outlast the `python`
+  call timeout, which discards the session and every result already paid for. A single `await` resolves the same way with one pending id (Verified item 2).
 - The budget is charged when a call runs, not when the sandbox makes it, so an unawaited call
   costs nothing.
 - If any call returns `HostError::Fatal`, stop driving at once, dropping the calls still running in
@@ -496,7 +507,11 @@ when it is unset. CI installs `monty-runtime` 1.2.0 with `--locked` and sets it.
    timeout, and the pool's suspension limit (1 100 `help()` calls) each discard the session; a
    `BadArgs` inside a `gather` is refunded while the other calls run; the first `Fatal` in a
    `gather` returns without waiting for the rest; the cancelled-call notice survives a full pool;
-   limits past the `python` call timeout fail in `CodeMode::try_new`.
+   limits past the `python` call timeout fail in `CodeMode::try_new`, including a configured
+   `python_call_timeout`; a 50 s host call succeeds under a 60 s `host_call_timeout` and times
+   out under the 45 s default; 130 s of host calls in one `python` call succeed under a 200 s
+   `python_call_timeout` (both on a paused clock); two `CodeMode`s with the same packs give the
+   same definition, and `with_fresh_sessions` changes only its opening sentence.
 10. Value sizes: a list doubled 30 times through shared references raises `ValueError` as an
     argument and renders truncated as the final value, both quickly; 100 000 items pass and
     100 001 do not; nesting past 64 levels raises `ValueError`.

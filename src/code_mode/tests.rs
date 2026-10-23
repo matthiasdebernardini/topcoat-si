@@ -158,6 +158,32 @@ fn slow() -> impl HostFunction {
     })
 }
 
+/// Pauses the test runtime's clock until dropped, so a sleep ends at once when nothing else runs.
+struct PausedClock;
+
+impl PausedClock {
+    fn new() -> Self {
+        tokio::time::pause();
+        Self
+    }
+}
+
+impl Drop for PausedClock {
+    fn drop(&mut self) {
+        tokio::time::resume();
+    }
+}
+
+/// A `nap` host function sleeping `secs` on a paused clock: the call timeouts see the full
+/// sleep, the test does not wait for it.
+fn nap(secs: u64) -> impl HostFunction {
+    host_fn("nap", "nap() -> None", "sleeps", move |_: Value| async move {
+        let _clock = PausedClock::new();
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+        Ok(Value::Null)
+    })
+}
+
 fn firecrawl_pack(url: &str, search: FirecrawlWebSearch, max_credits: u32) -> Pack {
     packs::firecrawl(
         search,
@@ -888,6 +914,106 @@ async fn limits_past_the_python_call_timeout_are_rejected() {
     assert!(
         matches!(error.kind(), ErrorKind::Validation { .. }),
         "{error}"
+    );
+}
+
+#[tokio::test]
+async fn host_call_timeout_is_configurable() {
+    let pool = test_pool().await;
+    let pack = || Pack::new("fakes", "fakes").with_host(nap(50));
+    let limits = Limits {
+        host_call_timeout: Duration::from_secs(60),
+        ..Limits::default()
+    };
+    let code = CodeMode::try_new(pool.clone(), vec![pack()], limits).unwrap();
+    assert_eq!(run(&code, "await nap()").await, ("=> None".to_string(), false));
+
+    let code = CodeMode::try_new(pool, vec![pack()], Limits::default()).unwrap();
+    let (text, is_error) = run(&code, "await nap()").await;
+    assert!(is_error);
+    assert!(
+        text.contains("RuntimeError: nap() timed out after 45s"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn python_call_timeout_is_configurable() {
+    let pack = Pack::new("fakes", "fakes").with_host(nap(65));
+    let limits = Limits {
+        host_call_timeout: Duration::from_secs(70),
+        python_call_timeout: Duration::from_secs(200),
+        ..Limits::default()
+    };
+    let code = CodeMode::try_new(test_pool().await, vec![pack], limits).unwrap();
+    // Two 65 s host calls: 130 s in one python call, past the 120 s default.
+    assert_eq!(
+        run(&code, "await nap()\nawait nap()").await,
+        ("=> None".to_string(), false)
+    );
+}
+
+#[tokio::test]
+async fn limits_past_a_configured_python_call_timeout_are_rejected() {
+    let pool = test_pool().await;
+    let limits = |python_call_timeout| Limits {
+        max_feed_duration: Duration::from_secs(200),
+        max_turn_duration: Duration::from_secs(200),
+        python_call_timeout,
+        ..Limits::default()
+    };
+    let error = CodeMode::try_new(pool.clone(), vec![], limits(Duration::from_secs(120)))
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error.kind(), ErrorKind::Validation { .. }),
+        "{error}"
+    );
+    assert!(CodeMode::try_new(pool, vec![], limits(Duration::from_secs(205))).is_ok());
+}
+
+fn description(code: &CodeMode) -> String {
+    let ToolUnionParam::CustomTool(tool) = code.definition() else {
+        panic!("expected a custom tool");
+    };
+    tool.description.unwrap()
+}
+
+#[tokio::test]
+async fn definition_is_the_same_for_the_same_packs() {
+    let pool = test_pool().await;
+    let build = || {
+        CodeMode::try_new(
+            pool.clone(),
+            vec![packs::reports(), fake_firecrawl()],
+            Limits::default(),
+        )
+        .unwrap()
+    };
+    let first = serde_json::to_string(&build().definition()).unwrap();
+    assert_eq!(first, serde_json::to_string(&build().definition()).unwrap());
+    let fresh = serde_json::to_string(&build().with_fresh_sessions().definition()).unwrap();
+    assert_eq!(
+        fresh,
+        serde_json::to_string(&build().with_fresh_sessions().definition()).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn fresh_sessions_change_only_the_opening_sentence() {
+    let pool = test_pool().await;
+    let build = || CodeMode::try_new(pool.clone(), vec![packs::reports()], Limits::default());
+    let kept = description(&build().unwrap());
+    let fresh = description(&build().unwrap().with_fresh_sessions());
+    let opening = "Run Python (a sandboxed subset of Python 3.14) in a session that keeps \
+                   variables between calls,\nincluding ones assigned before an error.";
+    let rest = kept.strip_prefix(opening).unwrap();
+    assert_eq!(
+        fresh,
+        format!(
+            "Each turn's python calls run in a fresh session; variables do not carry over to \
+             later turns.{rest}"
+        )
     );
 }
 
