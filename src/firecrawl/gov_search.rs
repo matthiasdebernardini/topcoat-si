@@ -44,7 +44,7 @@ pub struct GovSearchRequest {
     /// Number of results, 1 to 100. Firecrawl defaults to 10.
     pub k: Option<u32>,
     /// `"us"` for federal, or `"us-"` and a two-letter state or territory code, such as
-    /// `"us-tn"`. There is no city or county filter.
+    /// `"us-tn"`. Sent in lowercase, so `"US-TN"` works too. There is no city or county filter.
     pub jurisdiction: Option<String>,
     /// CourtListener court id, such as `"scotus"` or `"ca9"`.
     pub court: Option<String>,
@@ -124,7 +124,7 @@ impl GovSearchRequest {
             return invalid("k must be between 1 and 100", "k");
         }
         if let Some(jurisdiction) = &self.jurisdiction
-            && !is_jurisdiction(jurisdiction)
+            && !is_jurisdiction(&jurisdiction.to_ascii_lowercase())
         {
             return invalid(
                 "jurisdiction must be \"us\" or \"us-\" and a two-letter state code",
@@ -147,7 +147,7 @@ impl GovSearchRequest {
         WireGovSearchRequest {
             query: &self.query,
             k: self.k,
-            jurisdiction: self.jurisdiction.as_deref(),
+            jurisdiction: self.jurisdiction.as_deref().map(str::to_ascii_lowercase),
             court: self.court.as_deref(),
             court_type: self.court_type,
             cites: self.cites.as_deref(),
@@ -175,7 +175,7 @@ pub(super) struct WireGovSearchRequest<'request> {
     #[serde(skip_serializing_if = "Option::is_none")]
     k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    jurisdiction: Option<&'request str>,
+    jurisdiction: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     court: Option<&'request str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -193,10 +193,6 @@ pub(super) struct WireGovSearchRequest<'request> {
 pub struct GovSearchResponse {
     /// Whether the search succeeded.
     pub success: bool,
-    /// Credits the search consumed, when Firecrawl reports them. The API reference does not
-    /// list this field.
-    #[serde(default)]
-    pub credits_used: Option<u64>,
     /// The results.
     #[serde(default)]
     pub data: GovSearchData,

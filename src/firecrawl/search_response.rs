@@ -50,16 +50,14 @@ pub struct WebResult {
     /// Page title.
     #[serde(default)]
     pub title: Option<String>,
-    /// Search engine snippet.
+    /// The passage from the page that best answers the query, or the site's own description
+    /// when the search was sent with
+    /// [`SearchRequest::with_highlights(false)`](super::SearchRequest::with_highlights).
     #[serde(default)]
     pub description: Option<String>,
     /// Rank within the results.
     #[serde(default)]
     pub position: Option<u32>,
-    /// Passages from the page that best answer the query. A single string is read as one
-    /// passage; anything else that is not a list of strings is `None`.
-    #[serde(default, deserialize_with = "passages")]
-    pub highlights: Option<Vec<String>>,
     /// Category the result matched.
     #[serde(default)]
     pub category: Option<String>,
@@ -81,7 +79,9 @@ pub struct NewsResult {
     /// Article title.
     #[serde(default)]
     pub title: Option<String>,
-    /// Article snippet.
+    /// The passage from the article that best answers the query, or the site's own snippet
+    /// when the search was sent with
+    /// [`SearchRequest::with_highlights(false)`](super::SearchRequest::with_highlights).
     #[serde(default)]
     pub snippet: Option<String>,
     /// Publication date as reported by the search engine.
@@ -143,19 +143,4 @@ fn grouped_or_flat<'de, D: Deserializer<'de>>(
             Wire::Grouped(data) => data,
         }),
     )
-}
-
-/// A list of strings, or one string as a list of one. Never fails.
-fn passages<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<String>>, D::Error> {
-    Ok(match serde_json::Value::deserialize(deserializer)? {
-        serde_json::Value::String(text) => Some(vec![text]),
-        serde_json::Value::Array(items) => items
-            .into_iter()
-            .map(|item| match item {
-                serde_json::Value::String(text) => Some(text),
-                _ => None,
-            })
-            .collect(),
-        _ => None,
-    })
 }

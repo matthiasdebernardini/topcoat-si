@@ -384,12 +384,12 @@ Both return each page's main content as markdown. Their other defaults:
 
 | Method | Endpoint | What it returns |
 |---|---|---|
-| `search` | `POST /v2/search` | results by source; each web result has `highlights`, the passages that best answer the query |
+| `search` | `POST /v2/search` | results by source; each web result's `description` (a news result's `snippet`) is the passage that best answers the query |
 | `gov_search` | `POST /v2/search/gov` | Government Index hits (statutes, regulations, codes, court opinions): url, title, matched passage, position |
 | `map` | `POST /v2/map` | a site's links with titles and descriptions, 1 credit per call |
 | `credit_usage` | `GET /v2/team/credit-usage` | remaining credits, plan credits and the billing period |
 
-`SearchRequest::with_country("US")` sets where the search runs from, and `with_highlights(false)` asks for plain snippets. A response whose `data` is one flat array is read as web results.
+`SearchRequest::with_country("US")` sets where the search runs from, and `with_highlights(false)` asks for the sites' own descriptions and snippets instead of query-relevant passages. A response whose `data` is one flat array is read as web results.
 
 `GovSearchRequest` filters by `k` (1 to 100), `jurisdiction` (`"us"` or a state such as `"us-tn"`; there is no city or county filter), `court`, `court_type`, `cites` and `domain`. The filters only match pages Firecrawl has labeled, so no results does not mean no law. `MapRequest` takes `search` to order links by relevance, `limit`, `sitemap` and `location`.
 

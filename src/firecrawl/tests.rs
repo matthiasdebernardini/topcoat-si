@@ -1619,12 +1619,9 @@ async fn a_cached_search_reports_zero_credits() {
 }
 
 #[tokio::test]
-async fn search_sends_highlights_and_reads_them_back() {
+async fn search_sends_country_and_highlights_off() {
     let (url, recorded) = serve(vec![ok(json!({"success": true, "data": {"web": [
-        {"url": "https://a.gov/1", "highlights": ["first passage", "second passage"]},
-        {"url": "https://a.gov/2", "highlights": "one passage"},
-        {"url": "https://a.gov/3", "highlights": [1, 2]},
-        {"url": "https://a.gov/4"}
+        {"url": "https://a.gov/1", "description": "the site's own description"}
     ]}}))])
     .await;
     let response = client(&url)
@@ -1639,25 +1636,11 @@ async fn search_sends_highlights_and_reads_them_back() {
         body_json(&recorded, 0),
         json!({"query": "zoning variance", "country": "US", "highlights": false})
     );
-    let highlights: Vec<Option<Vec<String>>> = response
-        .data
-        .unwrap()
-        .web
-        .unwrap()
-        .into_iter()
-        .map(|result| result.highlights)
-        .collect();
     assert_eq!(
-        highlights,
-        [
-            Some(vec![
-                "first passage".to_string(),
-                "second passage".to_string()
-            ]),
-            Some(vec!["one passage".to_string()]),
-            None,
-            None,
-        ]
+        response.data.unwrap().web.unwrap()[0]
+            .description
+            .as_deref(),
+        Some("the site's own description")
     );
 }
 
@@ -1732,7 +1715,6 @@ async fn gov_search_request_and_response() {
         })
     );
     assert!(response.success);
-    assert_eq!(response.credits_used, None);
     let web = &response.data.web;
     assert_eq!(web.len(), 2);
     assert_eq!(web[0].title.as_deref(), Some("Title 17 - Zoning"));
@@ -1790,13 +1772,13 @@ async fn gov_search_upstream_errors_are_retried() {
 }
 
 #[tokio::test]
-async fn gov_search_client_errors_are_not_retried() {
-    for (status, code) in [
-        (400, "BAD_REQUEST"),
-        (401, "UNAUTHORIZED"),
-        (429, "RATE_LIMIT"),
+async fn gov_search_errors_keep_their_status_and_retryability() {
+    for (status, code, retryable) in [
+        (400, "BAD_REQUEST", false),
+        (401, "UNAUTHORIZED", false),
+        (429, "RATE_LIMIT", true),
     ] {
-        let (url, recorded) = serve(vec![Canned::json(
+        let (url, _) = serve(vec![Canned::json(
             status,
             json!({"success": false, "error": "no", "code": code}).to_string(),
         )])
@@ -1807,12 +1789,25 @@ async fn gov_search_client_errors_are_not_retried() {
             .await
             .unwrap_err();
         assert_eq!(err.status(), Some(status));
+        assert_eq!(err.is_retryable(), retryable, "{status}");
         assert_eq!(
             err.to_string(),
             format!("Firecrawl API error: no (HTTP {status} {code})")
         );
-        assert_eq!(recorded.lock().unwrap().len(), 1, "{status}");
     }
+}
+
+#[tokio::test]
+async fn gov_search_jurisdiction_is_sent_in_lowercase() {
+    let (url, recorded) = serve(vec![ok(json!({"success": true}))]).await;
+    client(&url)
+        .gov_search(&GovSearchRequest::new("q").with_jurisdiction("US-TN"))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(&recorded, 0),
+        json!({"query": "q", "jurisdiction": "us-tn"})
+    );
 }
 
 #[tokio::test]
@@ -1823,7 +1818,6 @@ async fn gov_search_validation_errors_are_raised_before_sending() {
         GovSearchRequest::new("q").with_k(0),
         GovSearchRequest::new("q").with_k(101),
         GovSearchRequest::new("q").with_jurisdiction("us-nashville"),
-        GovSearchRequest::new("q").with_jurisdiction("US-TN"),
         GovSearchRequest::new("q").with_jurisdiction("ca"),
         GovSearchRequest::new("q").with_jurisdiction("us-"),
         GovSearchRequest::new("q").with_court(""),
@@ -1837,7 +1831,7 @@ async fn gov_search_validation_errors_are_raised_before_sending() {
             "{request:?}: {err:?}"
         );
     }
-    for jurisdiction in ["us", "us-tn", "us-pr"] {
+    for jurisdiction in ["us", "US", "us-tn", "US-TN", "us-pr"] {
         assert!(
             GovSearchRequest::new("q")
                 .with_jurisdiction(jurisdiction)
@@ -1983,8 +1977,8 @@ async fn credit_usage_is_a_get_and_reads_the_balance() {
             .any(|l| l.eq_ignore_ascii_case("authorization: Bearer fc-test-key"))
     );
     assert!(recorded_request.body.is_empty());
-    assert_eq!(usage.remaining_credits, 98123);
-    assert_eq!(usage.plan_credits, Some(100_000));
+    assert_eq!(usage.remaining_credits, 98123.0);
+    assert_eq!(usage.plan_credits, Some(100_000.0));
     assert_eq!(
         usage.billing_period_start.as_deref(),
         Some("2026-10-01T00:00:00Z")
@@ -2000,7 +1994,7 @@ async fn credit_usage_failures() {
     ])
     .await;
     let usage = client(&url).credit_usage().await.unwrap();
-    assert_eq!(usage.remaining_credits, 5);
+    assert_eq!(usage.remaining_credits, 5.0);
     assert_eq!(usage.plan_credits, None);
     assert_eq!(recorded.lock().unwrap().len(), 2);
 
@@ -2031,7 +2025,7 @@ async fn credit_usage_is_resent_after_a_cut_success_but_search_is_not() {
     let balance = || ok(json!({"success": true, "data": {"remainingCredits": 7}}));
     let (url, recorded) = serve(vec![cut(), balance()]).await;
     let usage = client(&url).credit_usage().await.unwrap();
-    assert_eq!(usage.remaining_credits, 7);
+    assert_eq!(usage.remaining_credits, 7.0);
     assert_eq!(recorded.lock().unwrap().len(), 2);
 
     let (url, recorded) = serve(vec![cut(), balance()]).await;
@@ -2046,8 +2040,7 @@ async fn credit_usage_is_resent_after_a_cut_success_but_search_is_not() {
 #[tokio::test]
 async fn gov_search_and_map_are_cached_but_credit_usage_is_not() {
     let (url, recorded) = serve(vec![
-        ok(json!({"success": true, "creditsUsed": 1,
-                  "data": {"web": [{"url": "https://a.gov", "position": 1}]}})),
+        ok(json!({"success": true, "data": {"web": [{"url": "https://a.gov", "position": 1}]}})),
         ok(json!({"success": true, "links": [{"url": "https://a.gov/agendas"}]})),
         ok(json!({"success": true, "data": {"remainingCredits": 9}})),
         ok(json!({"success": true, "data": {"remainingCredits": 8}})),
@@ -2056,17 +2049,14 @@ async fn gov_search_and_map_are_cached_but_credit_usage_is_not() {
     let (client, cache) = cached_client(&url);
     let gov = GovSearchRequest::new("setback").with_jurisdiction("us-tn");
     let first = client.gov_search(&gov).await.unwrap();
-    assert_eq!(first.credits_used, Some(1));
-    let second = client.gov_search(&gov).await.unwrap();
-    assert_eq!(second.credits_used, Some(0));
-    assert_eq!(second.data, first.data);
+    assert_eq!(client.gov_search(&gov).await.unwrap(), first);
 
     let map = MapRequest::new("https://a.gov").with_search("agenda");
     let first = client.map(&map).await.unwrap();
     assert_eq!(client.map(&map).await.unwrap(), first);
 
-    assert_eq!(client.credit_usage().await.unwrap().remaining_credits, 9);
-    assert_eq!(client.credit_usage().await.unwrap().remaining_credits, 8);
+    assert_eq!(client.credit_usage().await.unwrap().remaining_credits, 9.0);
+    assert_eq!(client.credit_usage().await.unwrap().remaining_credits, 8.0);
     assert_eq!(recorded.lock().unwrap().len(), 4);
 
     let mut keys: Vec<String> = cache.0.lock().unwrap().keys().cloned().collect();
@@ -2077,9 +2067,9 @@ async fn gov_search_and_map_are_cached_but_credit_usage_is_not() {
 }
 
 #[tokio::test]
-async fn cached_search_keeps_highlights_from_a_flat_array() {
+async fn a_flat_search_answer_comes_back_the_same_from_the_cache() {
     let (url, recorded) = serve(vec![ok(json!({"success": true, "data": [
-        {"url": "https://a.gov/1", "highlights": "one passage"}
+        {"url": "https://a.gov/1", "description": "a passage", "position": 1}
     ]}))])
     .await;
     let (client, _) = cached_client(&url);
@@ -2088,8 +2078,47 @@ async fn cached_search_keeps_highlights_from_a_flat_array() {
     let second = client.search(&request).await.unwrap();
     assert_eq!(second, first);
     assert_eq!(
-        second.data.unwrap().web.unwrap()[0].highlights,
-        Some(vec!["one passage".to_string()])
+        second.data.unwrap().web.unwrap()[0].description.as_deref(),
+        Some("a passage")
     );
     assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_different_gov_query_or_map_search_misses_the_cache() {
+    let gov_answer = || ok(json!({"success": true, "data": {"web": []}}));
+    let map_answer = || ok(json!({"success": true, "links": []}));
+    let (url, recorded) = serve(vec![
+        gov_answer(),
+        gov_answer(),
+        gov_answer(),
+        map_answer(),
+        map_answer(),
+    ])
+    .await;
+    let (client, cache) = cached_client(&url);
+    let gov = GovSearchRequest::new("setback").with_jurisdiction("us-tn");
+    client.gov_search(&gov).await.unwrap();
+    client.gov_search(&gov.clone().with_k(20)).await.unwrap();
+    client
+        .gov_search(&gov.with_jurisdiction("us-ga"))
+        .await
+        .unwrap();
+    let map = MapRequest::new("https://a.gov").with_search("agenda");
+    client.map(&map).await.unwrap();
+    client.map(&map.with_search("minutes")).await.unwrap();
+    assert_eq!(recorded.lock().unwrap().len(), 5);
+    assert_eq!(cache.0.lock().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn credit_usage_reads_fractional_balances() {
+    let (url, _) = serve(vec![ok(json!({
+        "success": true,
+        "data": {"remainingCredits": 1000.0, "planCredits": 99.5}
+    }))])
+    .await;
+    let usage = client(&url).credit_usage().await.unwrap();
+    assert_eq!(usage.remaining_credits, 1000.0);
+    assert_eq!(usage.plan_credits, Some(99.5));
 }

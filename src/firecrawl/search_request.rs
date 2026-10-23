@@ -112,8 +112,9 @@ pub struct SearchRequest {
     pub timeout: Option<Duration>,
     /// Drop invalid URLs from results instead of failing.
     pub ignore_invalid_urls: Option<bool>,
-    /// Return the passages that best answer the query in each result's description and
-    /// highlights. Firecrawl defaults to true; false returns plain snippets.
+    /// Put the passage that best answers the query in each web result's `description` and each
+    /// news result's `snippet`. Firecrawl defaults to true; false returns the sites' own
+    /// descriptions and snippets.
     pub highlights: Option<bool>,
     /// Scrape each result's page.
     pub scrape_options: Option<ScrapeOptions>,
@@ -218,7 +219,7 @@ impl SearchRequest {
         self
     }
 
-    /// Set whether results carry the passages that best answer the query.
+    /// Set whether descriptions and snippets are the passages that best answer the query.
     #[must_use]
     pub fn with_highlights(mut self, highlights: bool) -> Self {
         self.highlights = Some(highlights);

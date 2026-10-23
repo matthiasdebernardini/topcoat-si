@@ -187,11 +187,7 @@ impl FirecrawlClient {
     pub async fn gov_search(&self, request: &GovSearchRequest) -> Result<GovSearchResponse> {
         request.validate()?;
         let key = cache_key("gov_search:", &request.wire());
-        if let Some(mut hit) = self.cached::<GovSearchResponse>(key.as_deref()).await {
-            // As for search, a cached answer is not charged again.
-            if hit.credits_used.is_some() {
-                hit.credits_used = Some(0);
-            }
+        if let Some(hit) = self.cached(key.as_deref()).await {
             return Ok(hit);
         }
         let response = self.post("/v2/search/gov", &request.wire(), None).await?;
