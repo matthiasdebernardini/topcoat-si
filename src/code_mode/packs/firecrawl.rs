@@ -235,7 +235,8 @@ enum Call {
 /// any paid formats and is settled to [`ScrapeData::credits`]: Firecrawl's `creditsUsed`, 0 for
 /// a cache hit, else 1 per PDF page. A search reserves 2 per 10 results asked for, plus 1 per
 /// result when it scrapes, and is settled to the response's `creditsUsed` (0 for a cache hit),
-/// else 2 per 10 results returned plus 1 per scraped one. A map costs 1. A gov search is free,
+/// else 2 per 10 results returned (2 for none) plus 1 per scraped one. A map costs 1, and 0 for
+/// a cache hit. A gov search is free,
 /// so it only counts against its own cap and is never stopped by the credit cap. A sent call
 /// that fails keeps its reservation, since Firecrawl may have billed it. A call is let through
 /// while the credits charged are under the cap, so the last one can overshoot by its own cost,
@@ -418,7 +419,8 @@ pub struct FirecrawlPage {
     /// The page as markdown, cut to the pack's limit; `None` when it has no text.
     pub markdown: Option<String>,
     /// Each PDF page's markdown, as `{"page": n, "markdown": text}` in Python, when the scrape
-    /// defaults ask for pages. Cut to the same limit as `markdown`, all pages together.
+    /// defaults ask for pages. Cut to the same limit as `markdown`, all pages together, so with
+    /// pages on one result can carry up to twice the content limit.
     #[serde(serialize_with = "page_dicts")]
     pub pages: Option<Vec<PdfPage>>,
     /// Links on the page, when the script asked for them.
@@ -427,8 +429,10 @@ pub struct FirecrawlPage {
     pub num_pages: Option<u32>,
     /// For a PDF, its full page count, when Firecrawl knows it.
     pub total_pages: Option<u32>,
-    /// Characters of markdown before the cut.
+    /// Characters of `markdown` before the cut.
     pub chars: usize,
+    /// Characters of all `pages` together before the cut; `None` when there are no pages.
+    pub page_chars: Option<usize>,
     /// Whether `markdown` or `pages` was cut.
     pub truncated: bool,
     /// The PDF page limit used, when [`FirecrawlPack::with_max_pdf_pages`] lowered the
@@ -457,8 +461,10 @@ fn page_dicts<S: Serializer>(
 ///
 /// A sent call gives `Searching`, `Scraping` or `Mapping`, then its result event or `Failed`.
 /// A call that fails its checks gives only `Failed`, and one stopped by the budget only
-/// `Refused`. A call dropped by the host-call timeout while its request is in flight may give
-/// the first event with nothing after it. `function` is the Python function called:
+/// `Refused`. A call whose arguments do not fit the function raises `TypeError` before the pack
+/// runs and gives no event. A call dropped by the host-call timeout while its request is in
+/// flight may give the first event with nothing after it. `function` is the Python function
+/// called:
 /// `"search"`, `"scrape"`, `"gov_search"` or `"map_site"`.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -679,7 +685,7 @@ impl FirecrawlPack {
              \"US\", scrape: bool = False) -> list[dict]",
             "search the web, at most 10 results; results have url, title, description (the \
              passage that best answers the query) and position, and with scrape=True markdown \
-             and status; recency is hour, day, week, month, year or YYYY-MM-DD..YYYY-MM-DD; \
+             and status; country=None sends no country, or the search tool's own one; recency is hour, day, week, month, year or YYYY-MM-DD..YYYY-MM-DD; \
              categories from gov, pdf, research, developer",
             move |args: SearchArgs| {
                 let crawler = crawler.clone();
@@ -710,8 +716,10 @@ impl FirecrawlPack {
              bool = True, links: bool = False) -> dict",
             "one page or PDF as markdown; returns url (final), requested_url, status, title, \
              markdown, pages, links (with links=True), num_pages and total_pages (PDF pages \
-             read and in all), chars (before the cut), truncated, clamped_to (the page limit \
-             used, when lower than max_pages) and credits; page_markers puts <!-- page N --> \
+             read and in all), chars and page_chars (markdown and pages before the cut), \
+             truncated (either was cut), clamped_to (the page limit used, when lower than \
+             max_pages) and credits; markdown and pages are each cut to the content limit, so \
+             with pages on one result can carry twice that; page_markers puts <!-- page N --> \
              before each PDF page after the first; pdf_mode is fast, auto or ocr",
             move |args: ScrapeArgs| {
                 let crawler = scraper.clone();
@@ -810,8 +818,9 @@ impl FirecrawlPack {
 /// scrape options and content cut apply exactly as in the tool loop.
 ///
 /// `max_credits` is a per-conversation Firecrawl credit budget, charged as
-/// [`FirecrawlBudget`] charges it. Once reached, both functions raise `RuntimeError`. A 402 ends
-/// the run. Build a new pack for each conversation; [`FirecrawlPack`] adds `gov_search`,
+/// [`FirecrawlBudget`] charges it: what each call really cost ([`ScrapeData::credits`], a
+/// search's `creditsUsed` or the fallback), and the reservation of a sent call that failed. Once
+/// reached, both functions raise `RuntimeError`. A 402 ends the run. Build a new pack for each conversation; [`FirecrawlPack`] adds `gov_search`,
 /// `map_site`, more search and scrape options, call caps and an observer.
 #[must_use]
 pub fn firecrawl(search: FirecrawlWebSearch, fetch: FirecrawlFetchPage, max_credits: u32) -> Pack {
@@ -998,23 +1007,24 @@ impl Crawler {
     async fn map(&self, request: MapRequest) -> std::result::Result<Vec<MapLink>, HostError> {
         const FUNCTION: &str = "map_site";
         // Firecrawl bills a map 1 credit, however many links come back.
-        const CREDITS: u64 = 1;
+        const RESERVED: u64 = 1;
         let url = request.url.trim().to_string();
         let raised = |error: &Error| format!("Could not map {url}: {error}");
         let prepared = self.fetch.prepare_map(request);
         let request = self.mapped(FUNCTION, &url, prepared, raised)?;
-        self.take(FUNCTION, Call::Map, CREDITS)?;
+        self.take(FUNCTION, Call::Map, RESERVED)?;
         self.notify(FirecrawlEvent::Mapping {
             function: FUNCTION,
             url: url.clone(),
         });
         let mapped = self.fetch.send_map(&request).await;
-        let links = self.mapped(FUNCTION, &url, mapped, raised)?;
+        let (links, credits) = self.mapped(FUNCTION, &url, mapped, raised)?;
+        self.settle(RESERVED, credits);
         self.notify(FirecrawlEvent::Mapped {
             function: FUNCTION,
             url,
             links: links.clone(),
-            credits: CREDITS,
+            credits,
         });
         Ok(links)
     }
@@ -1103,6 +1113,10 @@ fn cut_page(
     let chars = markdown.as_ref().map_or(0, |m| m.chars().count());
     let mut truncated = chars > max_chars;
     let markdown = markdown.map(|m| http::truncate_chars(&m, max_chars, SUFFIX));
+    let page_chars = data
+        .pages
+        .as_ref()
+        .map(|pages| pages.iter().map(|page| page.markdown.chars().count()).sum());
     let pages = data.pages.map(|pages| {
         let mut left = max_chars;
         let mut kept = Vec::new();
@@ -1132,6 +1146,7 @@ fn cut_page(
         num_pages: metadata.num_pages,
         total_pages: metadata.total_pages,
         chars,
+        page_chars,
         truncated,
         clamped_to,
         credits,

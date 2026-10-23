@@ -280,8 +280,9 @@ impl FirecrawlWebSearch {
             .iter()
             .filter(|result| result.markdown.is_some())
             .count();
-        // Firecrawl bills 2 credits per 10 results and 1 for each scraped one.
-        let estimate = 2 * u64::try_from(web.len().div_ceil(10)).unwrap_or(u64::MAX)
+        // Firecrawl bills 2 credits per 10 results, at least 2 even for none, and 1 for each
+        // scraped one.
+        let estimate = 2 * u64::try_from(web.len().div_ceil(10).max(1)).unwrap_or(u64::MAX)
             + u64::try_from(scraped).unwrap_or(u64::MAX);
         let results = web
             .into_iter()
@@ -620,8 +621,8 @@ impl PreparedSearch {
 pub(crate) struct Searched {
     /// Web results the domain lists permit, each with a URL; markdown cut to the tool's limit.
     pub(crate) results: Vec<WebResult>,
-    /// Firecrawl's `creditsUsed` (0 for a cache hit), else 2 per 10 results returned plus 1 for
-    /// each scraped one.
+    /// Firecrawl's `creditsUsed` (0 for a cache hit), else 2 per 10 results returned (2 for
+    /// none) plus 1 for each scraped one.
     pub(crate) credits: u64,
 }
 

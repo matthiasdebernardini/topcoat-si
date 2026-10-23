@@ -173,20 +173,26 @@ impl FirecrawlFetchPage {
         Ok(Ok(request))
     }
 
-    /// Maps a site, keeping the links this tool may fetch. The inner `Err` is a message the
-    /// model can act on; `Err` is fatal (401, 402).
+    /// Maps a site, keeping the links this tool may fetch, and says what it cost: Firecrawl's
+    /// `creditsUsed` (0 for a cache hit), else 1. The inner `Err` is a message the model can act
+    /// on; `Err` is fatal (401, 402).
     #[cfg(feature = "code-mode")]
     pub(crate) async fn send_map(
         &self,
         request: &MapRequest,
-    ) -> Result<std::result::Result<Vec<MapLink>, String>> {
+    ) -> Result<std::result::Result<(Vec<MapLink>, u64), String>> {
+        // Firecrawl bills a map 1 credit, however many links come back.
+        const MAP_CREDITS: u64 = 1;
         let filter = self.checked_config()?;
         match self.client.map(request).await {
-            Ok(response) => Ok(Ok(response
-                .links
-                .into_iter()
-                .filter(|link| link.url.as_deref().is_some_and(|u| filter.permits(u)))
-                .collect())),
+            Ok(response) => Ok(Ok((
+                response
+                    .links
+                    .into_iter()
+                    .filter(|link| link.url.as_deref().is_some_and(|u| filter.permits(u)))
+                    .collect(),
+                response.credits_used.unwrap_or(MAP_CREDITS),
+            ))),
             Err(error) if matches!(error.status(), Some(401 | 402)) => Err(error),
             Err(error) => Ok(Err(format!(
                 "Could not map {}: {error}",

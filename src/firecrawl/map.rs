@@ -166,6 +166,11 @@ pub struct MapResponse {
     /// The links found, most relevant first when a search was given.
     #[serde(default)]
     pub links: Vec<MapLink>,
+    /// Credits the map cost, read from `creditsUsed` if Firecrawl sends it. A map served from
+    /// [`FirecrawlClient::with_cache`](super::FirecrawlClient::with_cache) always reports 0.
+    /// Never written back out, so a cached map does not keep it.
+    #[serde(default, rename = "creditsUsed", skip_serializing)]
+    pub credits_used: Option<u64>,
 }
 
 /// A link found by map.

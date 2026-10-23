@@ -658,18 +658,18 @@ Host functions and Python helpers come in packs. The built-in packs live in `cod
 | `reports` | `table`, `to_csv`, `count_by` | |
 | `surreal` | `query`, `tables`, `describe`, `rows`, `one`, `count` | the `surreal` feature |
 
-`packs::firecrawl` takes your two Firecrawl tools and a credit budget, and gives `search` and `scrape`. Their domain lists, result cap, scrape options and content cut apply exactly as in the tool loop. The budget, `max_credits`, covers the whole conversation; once it is used up, both functions raise `RuntimeError`.
+`packs::firecrawl` takes your two Firecrawl tools and a credit budget, and gives `search` and `scrape`. Their domain lists, result cap, scrape options and content cut apply as in the tool loop. The budget, `max_credits`, covers the whole conversation and charges real credits, as `FirecrawlBudget` below does: `ScrapeData::credits` for a scrape, a search's `creditsUsed` or the fallback, and a sent request that fails keeps its reservation. Once it is used up, both functions raise `RuntimeError`.
 
 `FirecrawlPack::new(client)`, or `FirecrawlPack::from_tools(search, fetch)` to keep your tools' domain lists, gives four functions:
 
 | Function | Returns |
 |---|---|
 | `search(*, query, limit=8, include_domains=None, exclude_domains=None, recency=None, sort_by_date=False, categories=None, country="US", scrape=False)` | at most 10 results with `url`, `title`, `description` (the passage that best answers the query) and `position`; `scrape=True` adds `markdown` and `status` |
-| `scrape(*, url, max_pages=30, pdf_mode="auto", page_markers=True, links=False)` | `url` (final), `requested_url`, `status`, `title`, `markdown`, `pages`, `links`, `num_pages`, `total_pages`, `chars`, `truncated`, `clamped_to`, `credits` |
+| `scrape(*, url, max_pages=30, pdf_mode="auto", page_markers=True, links=False)` | `url` (final), `requested_url`, `status`, `title`, `markdown`, `pages`, `links`, `num_pages`, `total_pages`, `chars`, `page_chars`, `truncated`, `clamped_to`, `credits` |
 | `gov_search(*, query, k=10, jurisdiction=None, domain=None)` | Government Index results with `url`, `title`, `description`, `position`; free |
 | `map_site(*, url, search=None, limit=100)` | a site's links with `url`, `title`, `description`; 1 credit |
 
-`recency` is `"hour"`, `"day"`, `"week"`, `"month"` or `"year"` (Firecrawl's `tbs` `qdr:h` to `qdr:y`), or a date range `"2025-01-01..2025-06-30"` (`cdr:1,cd_min:01/01/2025,cd_max:06/30/2025`); `sort_by_date=True` adds `sbd:1`. `categories` takes `"gov"`, `"pdf"`, `"research"` and `"developer"`. In `scrape`, `pdf_mode` is `"fast"`, `"auto"` or `"ocr"`, and `page_markers` puts `<!-- page N -->` before each PDF page after the first. Links and pages only come from `scrape`, never from `search(scrape=True)`. `chars` counts the markdown before the cut, and `pages` is filled only when the scrape defaults ask for `with_pdf_pages(true)`.
+`recency` is `"hour"`, `"day"`, `"week"`, `"month"` or `"year"` (Firecrawl's `tbs` `qdr:h` to `qdr:y`), or a date range `"2025-01-01..2025-06-30"` (`cdr:1,cd_min:01/01/2025,cd_max:06/30/2025`); `sort_by_date=True` adds `sbd:1`. `categories` takes `"gov"`, `"pdf"`, `"research"` and `"developer"`. `country=None` sends no country with `FirecrawlPack::new`; with `from_tools`, the search tool's own country applies. In `scrape`, `pdf_mode` is `"fast"`, `"auto"` or `"ocr"`, and `page_markers` puts `<!-- page N -->` before each PDF page after the first. Links and pages only come from `scrape`, never from `search(scrape=True)`. `pages` is filled only when the scrape defaults ask for `with_pdf_pages(true)`. `markdown` and `pages` are each cut to the content limit, so with pages on one result can carry up to twice that. `chars` counts the markdown before the cut, `page_chars` all pages before the cut (`None` without pages), and `truncated` says either was cut.
 
 | Builder | Adds |
 |---|---|
@@ -677,10 +677,10 @@ Host functions and Python helpers come in packs. The built-in packs live in `cod
 | `with_scrape_defaults(ScrapeOptions)` | how `scrape` scrapes, before the script's own options |
 | `with_max_pdf_pages(n)` | at most `n` PDF pages per scrape; `clamped_to` says when the script's `max_pages` was lowered |
 | `with_content_chars(n)` | characters of markdown kept per page |
-| `with_observer(Arc<dyn FirecrawlObserver>)` | a `FirecrawlEvent` per step, naming the function: `Searching`, `Scraping` or `Mapping`, then `Searched`, `GovSearched`, `Scraped` or `Mapped`, or `Failed`; `Failed` alone for a call that fails its checks; `Refused` when a cap is reached |
+| `with_observer(Arc<dyn FirecrawlObserver>)` | a `FirecrawlEvent` per step, naming the function: `Searching`, `Scraping` or `Mapping`, then `Searched`, `GovSearched`, `Scraped` or `Mapped`, or `Failed`; `Failed` alone for a call that fails its checks; `Refused` when a cap is reached; nothing for a call whose arguments raise `TypeError` |
 | `with_out_of_credits(OutOfCredits)` | what a 402 does: `Fatal` (the default) ends the run, `Raise` raises `RuntimeError` so the run goes on |
 
-Each call checks its arguments, takes its share of the budget, then sends. A sent call counts whether or not it succeeds; an invalid one costs nothing. Credits are reserved before sending and settled to what the call cost: a scrape is `ScrapeData::credits`, so 0 for a cache hit and 1 per PDF page read; a search is Firecrawl's `creditsUsed`, else 2 per 10 results; a map is 1; a gov search is free and only counts against its own cap. A failed request keeps its reservation. Calls in a `gather` cannot race past a cap, though the last call let through can overshoot the credit cap by its own cost. `FirecrawlBudget::used()` returns a `FirecrawlUsed` snapshot to save with the conversation, and `FirecrawlBudget::new().with_used(saved)` restores it.
+Each call checks its arguments, takes its share of the budget, then sends. A sent call counts whether or not it succeeds; an invalid one costs nothing. Credits are reserved before sending and settled to what the call cost: a scrape is `ScrapeData::credits`, so 0 for a cache hit and 1 per PDF page read; a search is Firecrawl's `creditsUsed`, else 2 per 10 results, and 2 for none; a map is 1, and 0 for a cache hit; a gov search is free and only counts against its own cap. A failed request keeps its reservation. Calls in a `gather` cannot race past a cap, though the last call let through can overshoot the credit cap by its own cost. `FirecrawlBudget::used()` returns a `FirecrawlUsed` snapshot to save with the conversation, and `FirecrawlBudget::new().with_used(saved)` restores it.
 
 The pack has no concurrency limit of its own: `FirecrawlClient::with_max_concurrency` covers every request. A call waiting there for a slot has already been counted.
 

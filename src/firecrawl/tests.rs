@@ -2057,7 +2057,12 @@ async fn gov_search_and_map_are_cached_but_credit_usage_is_not() {
 
     let map = MapRequest::new("https://a.gov").with_search("agenda");
     let first = client.map(&map).await.unwrap();
-    assert_eq!(client.map(&map).await.unwrap(), first);
+    assert_eq!(first.credits_used, None);
+    // The hit says it cost nothing; everything else is as cached.
+    let mut second = client.map(&map).await.unwrap();
+    assert_eq!(second.credits_used, Some(0));
+    second.credits_used = None;
+    assert_eq!(second, first);
 
     assert_eq!(client.credit_usage().await.unwrap().remaining_credits, 9.0);
     assert_eq!(client.credit_usage().await.unwrap().remaining_credits, 8.0);

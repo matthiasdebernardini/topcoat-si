@@ -226,14 +226,17 @@ impl FirecrawlClient {
     }
 
     /// List the URLs of a site, from its sitemap and links. One credit per call, however many
-    /// URLs come back.
+    /// URLs come back; an answer served from [`FirecrawlClient::with_cache`] costs none and says
+    /// so in [`MapResponse::credits_used`].
     ///
     /// The request is validated before anything is sent and retried like
     /// [`FirecrawlClient::search`]. Map is fast and may miss links.
     pub async fn map(&self, request: &MapRequest) -> Result<MapResponse> {
         request.validate()?;
         let key = cache_key("map:", &request.wire());
-        if let Some(hit) = self.cached(key.as_deref()).await {
+        if let Some(mut hit) = self.cached::<MapResponse>(key.as_deref()).await {
+            // A cached answer costs nothing, so a credit budget must not be charged again.
+            hit.credits_used = Some(0);
             return Ok(hit);
         }
         let response = self.post("/v2/map", &request.wire(), None).await?;
