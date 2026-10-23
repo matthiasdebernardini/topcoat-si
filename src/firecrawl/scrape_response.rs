@@ -2,7 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::ResultMetadata;
+use super::{ResultMetadata, ScrapeOptions};
+
+// Firecrawl's base charge for a scraped page.
+const BASE_CREDITS: u64 = 1;
+// Firecrawl's charge per page for each paid add-on format.
+const PAID_FORMAT_CREDITS: u64 = 4;
 
 /// A successful Firecrawl scrape.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
@@ -29,6 +34,54 @@ pub struct ScrapeData {
     /// `warning`.
     #[serde(default)]
     pub warning: Option<String>,
+    /// Links on the page, when [`ScrapeOptions::with_links`] asked for them.
+    #[serde(default)]
+    pub links: Option<Vec<String>>,
+    /// Each PDF page's markdown, when [`ScrapeOptions::with_pdf_pages`] asked for it.
+    #[serde(default)]
+    pub pages: Option<Vec<PdfPage>>,
+}
+
+/// One physical page of a scraped PDF.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct PdfPage {
+    /// The 1-based physical page number, read from `pageNumber`.
+    #[serde(rename = "pageNumber")]
+    pub page: u32,
+    /// The page's content as markdown.
+    #[serde(default)]
+    pub markdown: String,
+}
+
+impl ScrapeData {
+    /// The Firecrawl credits this scrape cost, given the `options` it was requested with.
+    ///
+    /// Firecrawl's own figure, [`ResultMetadata::credits_used`], wins when the response carries
+    /// one. A scrape served from [`FirecrawlClient::with_cache`](super::FirecrawlClient::with_cache)
+    /// reports 0 there, because a local cache hit bills nothing; a cached answer that carried no
+    /// figure is estimated like a fresh one.
+    ///
+    /// Otherwise the figure is estimated from Firecrawl's published billing: 1 credit for the
+    /// page, plus 1 per PDF page read ([`ResultMetadata::num_pages`]), plus 4 for each paid
+    /// add-on format (`json`, `question`, `query`, `highlights`, `audio`, `video`), none of which
+    /// [`ScrapeOptions`] requests. Links, per-page markdown, page markers and the PDF mode cost
+    /// nothing extra. The estimate leaves out what this crate does not request: zero data
+    /// retention (+1), PII redaction, lockdown and prompt-injection checks (+4 each), and
+    /// third-party provider pricing. It follows the billing page's "+1 credit per PDF page" on
+    /// top of the base credit, so a 40-page PDF is 41. A page Firecrawl serves from its own
+    /// cache (see [`ScrapeOptions::max_age`]) is still billed.
+    #[must_use]
+    pub fn credits(&self, options: &ScrapeOptions) -> u64 {
+        let metadata = self.metadata.as_ref();
+        if let Some(credits) = metadata.and_then(|metadata| metadata.credits_used) {
+            return credits;
+        }
+        let pdf_pages = metadata
+            .and_then(|metadata| metadata.num_pages)
+            .map_or(0, u64::from);
+        BASE_CREDITS + pdf_pages + PAID_FORMAT_CREDITS * options.paid_formats()
+    }
 }
 
 #[derive(Deserialize)]

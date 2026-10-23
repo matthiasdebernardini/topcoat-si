@@ -8,6 +8,7 @@ use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest::{Client as ReqwestClient, ClientBuilder, Method};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio::sync::Semaphore;
 
 use super::credit_usage::CreditUsageResponse;
 use super::{
@@ -38,6 +39,8 @@ pub struct FirecrawlClient {
     pub(super) base_url: String,
     max_retries: usize,
     cache: Option<(Arc<dyn FirecrawlCache>, Duration)>,
+    // Shared by clones, so they count against the same limit.
+    concurrency: Option<(Arc<Semaphore>, usize)>,
 }
 
 impl fmt::Debug for FirecrawlClient {
@@ -47,6 +50,10 @@ impl fmt::Debug for FirecrawlClient {
             .field("base_url", &self.base_url)
             .field("max_retries", &self.max_retries)
             .field("cache", &self.cache.is_some())
+            .field(
+                "max_concurrency",
+                &self.concurrency.as_ref().map(|(_, max)| *max),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -63,6 +70,7 @@ impl FirecrawlClient {
             base_url: DEFAULT_BASE_URL.to_string(),
             max_retries: 2,
             cache: None,
+            concurrency: None,
         })
     }
 
@@ -106,6 +114,24 @@ impl FirecrawlClient {
         self
     }
 
+    /// Keep at most `max` Firecrawl requests open at once, across this client and its clones.
+    /// Unlimited by default. A `max` of 0 is taken as 1.
+    ///
+    /// Every call that reaches Firecrawl (search, gov search, scrape, map and credit usage)
+    /// waits for a free slot before each attempt and gives it back when the attempt ends, so a
+    /// retry's backoff does not hold one. An answer served from
+    /// [`FirecrawlClient::with_cache`] never waits. There is no requests-per-minute pacing: set
+    /// `max` to your plan's concurrent browsers and let 429s be retried.
+    ///
+    /// The HTTP timeout starts once a slot is free, so time spent waiting for one counts
+    /// against any timeout you put around the call, not against the request's own timeout.
+    #[must_use]
+    pub fn with_max_concurrency(mut self, max: usize) -> Self {
+        let max = max.clamp(1, Semaphore::MAX_PERMITS);
+        self.concurrency = Some((Arc::new(Semaphore::new(max)), max));
+        self
+    }
+
     /// Run a search.
     ///
     /// The request is validated before anything is sent. Whatever [`Error::is_retryable`]
@@ -135,18 +161,24 @@ impl FirecrawlClient {
     /// [`FirecrawlClient::search`]. A page that loaded with an error status (such as 404) is
     /// still a successful scrape: check
     /// [`ResultMetadata::status_code`](super::ResultMetadata::status_code).
+    ///
+    /// When the scrape sets a timeout, the HTTP timeout is that plus 30 seconds, and at least
+    /// 120 seconds. [`ScrapeData::credits`](super::ScrapeData::credits) says what it cost.
     pub async fn scrape(&self, request: &ScrapeRequest) -> Result<ScrapeResponse> {
         request.validate()?;
-        // Firecrawl may work for the whole scrape timeout; give the response time to arrive.
-        let timeout = request
-            .options
-            .timeout
-            .map(|t| (t + SCRAPE_TIMEOUT_MARGIN).max(DEFAULT_TIMEOUT));
+        let timeout = scrape_http_timeout(request.options.timeout);
         let key = cache_key("scrape:", &request.wire());
         // `max_age` of zero asks for a fresh page, so the lookup is skipped.
         if request.options.max_age != Some(Duration::ZERO)
-            && let Some(hit) = self.cached(key.as_deref()).await
+            && let Some(mut hit) = self.cached::<ScrapeResponse>(key.as_deref()).await
         {
+            // As with search, a cached answer costs nothing; one that reported no credits stays
+            // as it was.
+            if let Some(metadata) = hit.data.metadata.as_mut()
+                && metadata.credits_used.is_some()
+            {
+                metadata.credits_used = Some(0);
+            }
             return Ok(hit);
         }
         let response: ScrapeResponse = self.post("/v2/scrape", &request.wire(), timeout).await?;
@@ -287,6 +319,11 @@ impl FirecrawlClient {
         B: Serialize + ?Sized,
         T: DeserializeOwned + Succeeded,
     {
+        // Held until the response is read; a closed semaphore (never closed here) limits nothing.
+        let _slot = match &self.concurrency {
+            Some((semaphore, _)) => semaphore.acquire().await.ok(),
+            None => None,
+        };
         let mut request = self
             .http
             .request(method, url)
@@ -343,6 +380,12 @@ impl FirecrawlClient {
         }
         Ok(parsed)
     }
+}
+
+/// The HTTP timeout for a scrape with server-side `timeout`: Firecrawl may work for all of it,
+/// so the response gets a margin to arrive.
+pub(super) fn scrape_http_timeout(timeout: Option<Duration>) -> Option<Duration> {
+    timeout.map(|t| (t + SCRAPE_TIMEOUT_MARGIN).max(DEFAULT_TIMEOUT))
 }
 
 /// The cache key for a request: `prefix` plus its wire body, or `None` when it will not serialize.

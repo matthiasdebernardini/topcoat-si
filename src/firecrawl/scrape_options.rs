@@ -11,10 +11,29 @@ const MIN_SCRAPE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SCRAPE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_PDF_PAGES: u32 = 10_000;
 
+// Formats Firecrawl bills 4 extra credits per page for. This crate requests none of them yet.
+const PAID_FORMATS: [&str; 6] = ["json", "question", "query", "highlights", "audio", "video"];
+
+/// How a PDF's text is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum PdfMode {
+    /// Read only the embedded text. Fastest, but fails on scanned or image-only pages.
+    Fast,
+    /// Read the embedded text and fall back to OCR for pages that need it. Firecrawl's default.
+    Auto,
+    /// OCR every page, for scanned documents.
+    Ocr,
+}
+
 /// How a page is scraped as markdown, for a search result or a single scrape.
 ///
 /// Every scraped search result costs one extra Firecrawl credit. A PDF costs one credit per
 /// page read, so cap long documents with [`ScrapeOptions::with_pdf_max_pages`].
+///
+/// Any PDF option (`pdf_max_pages`, `pdf_mode`, `pdf_pages`, `pdf_page_markers`) sends a parsers
+/// list holding only the PDF parser, which switches off the parsers it omits (image OCR).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ScrapeOptions {
@@ -29,6 +48,17 @@ pub struct ScrapeOptions {
     /// Firecrawl bills 1 credit per PDF page. Setting this sends a parsers list holding only
     /// the PDF parser, which switches off the parsers it omits (image OCR).
     pub pdf_max_pages: Option<u32>,
+    /// How PDF text is read. Firecrawl defaults to [`PdfMode::Auto`]. Costs nothing extra.
+    pub pdf_mode: Option<PdfMode>,
+    /// Also return each PDF page's markdown in [`ScrapeData::pages`](super::ScrapeData::pages).
+    /// Costs nothing extra.
+    pub pdf_pages: Option<bool>,
+    /// Join PDF pages in the markdown with `<!-- page N -->` markers, N being the 1-based page
+    /// that follows. There is no marker before page 1. Costs nothing extra.
+    pub pdf_page_markers: Option<bool>,
+    /// Also return the page's links in [`ScrapeData::links`](super::ScrapeData::links). Costs
+    /// nothing extra.
+    pub links: bool,
 }
 
 impl ScrapeOptions {
@@ -67,6 +97,53 @@ impl ScrapeOptions {
         self
     }
 
+    /// Set how PDF text is read. Also switches off image OCR, see [`ScrapeOptions`].
+    #[must_use]
+    pub fn with_pdf_mode(mut self, mode: PdfMode) -> Self {
+        self.pdf_mode = Some(mode);
+        self
+    }
+
+    /// Return each PDF page's markdown separately. Also switches off image OCR, see
+    /// [`ScrapeOptions`].
+    #[must_use]
+    pub fn with_pdf_pages(mut self, pages: bool) -> Self {
+        self.pdf_pages = Some(pages);
+        self
+    }
+
+    /// Mark PDF page breaks in the markdown. Also switches off image OCR, see [`ScrapeOptions`].
+    #[must_use]
+    pub fn with_pdf_page_markers(mut self, page_markers: bool) -> Self {
+        self.pdf_page_markers = Some(page_markers);
+        self
+    }
+
+    /// Also return the links on the page.
+    #[must_use]
+    pub fn with_links(mut self, links: bool) -> Self {
+        self.links = links;
+        self
+    }
+
+    /// How many of the requested formats Firecrawl bills 4 extra credits per page for.
+    pub(super) fn paid_formats(&self) -> u64 {
+        let paid = self
+            .formats()
+            .iter()
+            .filter(|format| PAID_FORMATS.contains(format))
+            .count();
+        u64::try_from(paid).unwrap_or(u64::MAX)
+    }
+
+    fn formats(&self) -> Vec<&'static str> {
+        let mut formats = vec!["markdown"];
+        if self.links {
+            formats.push("links");
+        }
+        formats
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
         let invalid =
             |message: &str, param: &str| Err(Error::validation(message, Some(param.to_string())));
@@ -90,17 +167,27 @@ impl ScrapeOptions {
 
     pub(super) fn wire(&self) -> WireScrapeOptions {
         WireScrapeOptions {
-            formats: vec!["markdown"],
+            formats: self.formats(),
             only_main_content: self.only_main_content,
             max_age: self.max_age.map(millis),
             timeout: self.timeout.map(millis),
-            parsers: self.pdf_max_pages.map(|max_pages| {
-                vec![WireParser {
-                    kind: PdfTag,
-                    max_pages,
-                }]
-            }),
+            parsers: self.pdf_parser().map(|parser| vec![parser]),
         }
+    }
+
+    /// The PDF parser entry, when any PDF option is set.
+    fn pdf_parser(&self) -> Option<WireParser> {
+        let set = self.pdf_max_pages.is_some()
+            || self.pdf_mode.is_some()
+            || self.pdf_pages.is_some()
+            || self.pdf_page_markers.is_some();
+        set.then_some(WireParser {
+            kind: PdfTag,
+            mode: self.pdf_mode,
+            max_pages: self.pdf_max_pages,
+            pages: self.pdf_pages,
+            page_markers: self.pdf_page_markers,
+        })
     }
 }
 
@@ -127,5 +214,12 @@ pub(super) struct WireScrapeOptions {
 pub(super) struct WireParser {
     #[serde(rename = "type")]
     kind: PdfTag,
-    max_pages: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<PdfMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_pages: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pages: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_markers: Option<bool>,
 }

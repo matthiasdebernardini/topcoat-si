@@ -27,6 +27,10 @@ pub struct ResultMetadata {
     pub num_pages: Option<u32>,
     /// For a PDF, the document's full page count, when Firecrawl knows it.
     pub total_pages: Option<u32>,
+    /// Credits Firecrawl billed for this page, read from `creditsUsed`. A scrape served from
+    /// [`FirecrawlClient::with_cache`](super::FirecrawlClient::with_cache) reports 0 in place of
+    /// the figure it was cached with.
+    pub credits_used: Option<u64>,
 }
 
 impl Serialize for ResultMetadata {
@@ -42,6 +46,7 @@ impl Serialize for ResultMetadata {
             "contentType": self.content_type,
             "numPages": self.num_pages,
             "totalPages": self.total_pages,
+            "creditsUsed": self.credits_used,
         })
         .serialize(serializer)
     }
@@ -62,6 +67,7 @@ impl<'de> Deserialize<'de> for ResultMetadata {
             content_type: text("contentType"),
             num_pages: number("numPages").and_then(|n| u32::try_from(n).ok()),
             total_pages: number("totalPages").and_then(|n| u32::try_from(n).ok()),
+            credits_used: number("creditsUsed"),
         })
     }
 }

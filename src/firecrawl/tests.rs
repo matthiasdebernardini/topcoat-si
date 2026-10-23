@@ -2122,3 +2122,275 @@ async fn credit_usage_reads_fractional_balances() {
     assert_eq!(usage.remaining_credits, 1000.0);
     assert_eq!(usage.plan_credits, Some(99.5));
 }
+
+#[test]
+fn pdf_options_and_links_go_into_the_wire_body() {
+    let wire = |options: ScrapeOptions| {
+        let request = ScrapeRequest::new("https://example.com/a.pdf").with_options(options);
+        serde_json::to_value(request.wire()).unwrap()
+    };
+    assert_eq!(
+        wire(
+            ScrapeOptions::new()
+                .with_pdf_mode(PdfMode::Ocr)
+                .with_pdf_max_pages(40)
+                .with_pdf_pages(true)
+                .with_pdf_page_markers(true)
+                .with_links(true)
+        ),
+        json!({
+            "url": "https://example.com/a.pdf",
+            "formats": ["markdown", "links"],
+            "parsers": [{
+                "type": "pdf",
+                "mode": "ocr",
+                "maxPages": 40,
+                "pages": true,
+                "pageMarkers": true
+            }]
+        })
+    );
+    for (mode, name) in [(PdfMode::Fast, "fast"), (PdfMode::Auto, "auto")] {
+        assert_eq!(
+            wire(ScrapeOptions::new().with_pdf_mode(mode))["parsers"],
+            json!([{"type": "pdf", "mode": name}])
+        );
+    }
+    assert_eq!(
+        wire(ScrapeOptions::new().with_pdf_page_markers(false))["parsers"],
+        json!([{"type": "pdf", "pageMarkers": false}])
+    );
+    let plain = wire(ScrapeOptions::new().with_links(false));
+    assert_eq!(plain["formats"], json!(["markdown"]));
+    assert!(plain.get("parsers").is_none(), "{plain}");
+}
+
+#[tokio::test]
+async fn scrape_reads_links_and_pdf_pages() {
+    let (url, _) = serve(vec![ok(json!({"success": true, "data": {
+        "markdown": "one\n\n---\n\n<!-- page 2 -->\n\ntwo",
+        "links": ["https://example.com/a", "https://example.com/b"],
+        "pages": [
+            {"pageNumber": 1, "markdown": "one"},
+            {"pageNumber": 2, "markdown": "two"}
+        ],
+        "metadata": {"contentType": "application/pdf", "numPages": 2, "creditsUsed": 3}
+    }}))])
+    .await;
+    let options = ScrapeOptions::new()
+        .with_pdf_pages(true)
+        .with_pdf_page_markers(true)
+        .with_links(true);
+    let request = ScrapeRequest::new("https://example.com/a.pdf").with_options(options.clone());
+    let data = client(&url).scrape(&request).await.unwrap().data;
+    assert_eq!(
+        data.links,
+        Some(vec![
+            "https://example.com/a".to_string(),
+            "https://example.com/b".to_string()
+        ])
+    );
+    let pages = data.pages.as_deref().unwrap();
+    assert_eq!(pages.len(), 2);
+    assert_eq!((pages[1].page, pages[1].markdown.as_str()), (2, "two"));
+    assert_eq!(data.metadata.as_ref().unwrap().credits_used, Some(3));
+    assert_eq!(data.credits(&options), 3);
+}
+
+#[test]
+fn credits_are_estimated_from_the_pages_read() {
+    let data = |metadata: Value| -> ScrapeData {
+        serde_json::from_value(json!({"markdown": "x", "metadata": metadata})).unwrap()
+    };
+    let options = ScrapeOptions::new();
+    assert_eq!(
+        data(json!({"contentType": "text/html"})).credits(&options),
+        1
+    );
+    assert_eq!(
+        data(json!({"contentType": "application/pdf", "numPages": 40, "totalPages": 300}))
+            .credits(&options),
+        41
+    );
+    assert_eq!(ScrapeData::default().credits(&options), 1);
+    assert_eq!(
+        data(json!({"numPages": 40})).credits(&ScrapeOptions::new().with_links(true)),
+        41
+    );
+    // Firecrawl's own figure wins over the estimate.
+    assert_eq!(
+        data(json!({"numPages": 40, "creditsUsed": 7})).credits(&options),
+        7
+    );
+}
+
+#[tokio::test]
+async fn a_cached_scrape_reports_zero_credits() {
+    let (url, recorded) = serve(vec![scraped(
+        "pdf",
+        json!({"contentType": "application/pdf", "numPages": 40, "creditsUsed": 41}),
+    )])
+    .await;
+    let (client, _) = cached_client(&url);
+    let request = ScrapeRequest::new("https://example.com/a.pdf");
+    let fresh = client.scrape(&request).await.unwrap();
+    assert_eq!(fresh.data.credits(&request.options), 41);
+    let cached = client.scrape(&request).await.unwrap();
+    assert_eq!(cached.data.credits(&request.options), 0);
+    assert_eq!(cached.data.markdown.as_deref(), Some("pdf"));
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn new_scrape_options_miss_the_cache() {
+    let (url, recorded) = serve(vec![
+        scraped("plain", json!({})),
+        ok(json!({"success": true, "data": {"markdown": "linked", "links": ["https://a.test"]}})),
+        scraped("ocr", json!({})),
+        scraped("marked", json!({})),
+    ])
+    .await;
+    let (client, cache) = cached_client(&url);
+    let page = "https://example.com/page";
+    let scrape = |options: ScrapeOptions| {
+        let request = ScrapeRequest::new(page).with_options(options);
+        let client = client.clone();
+        async move { client.scrape(&request).await.unwrap().data }
+    };
+    assert_eq!(scrape(ScrapeOptions::new()).await.links, None);
+    let linked = scrape(ScrapeOptions::new().with_links(true)).await;
+    assert_eq!(linked.links, Some(vec!["https://a.test".to_string()]));
+    scrape(ScrapeOptions::new().with_pdf_mode(PdfMode::Ocr)).await;
+    scrape(ScrapeOptions::new().with_pdf_page_markers(true)).await;
+    assert_eq!(recorded.lock().unwrap().len(), 4);
+    assert_eq!(cache.0.lock().unwrap().len(), 4);
+    // Each is now a hit under its own options.
+    let again = scrape(ScrapeOptions::new().with_links(true)).await;
+    assert_eq!(again.markdown.as_deref(), Some("linked"));
+    assert_eq!(recorded.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn scrape_http_timeout_is_the_scrape_timeout_plus_a_margin() {
+    use super::client::scrape_http_timeout;
+    let secs = Duration::from_secs;
+    assert_eq!(scrape_http_timeout(None), None);
+    assert_eq!(scrape_http_timeout(Some(secs(30))), Some(secs(120)));
+    assert_eq!(scrape_http_timeout(Some(secs(90))), Some(secs(120)));
+    assert_eq!(scrape_http_timeout(Some(secs(91))), Some(secs(121)));
+    assert_eq!(scrape_http_timeout(Some(secs(300))), Some(secs(330)));
+}
+
+/// Serves `count` scrapes on concurrent connections, each answered after `delay`, and returns
+/// the most requests that were open at once.
+async fn serve_concurrently(
+    count: usize,
+    delay: Duration,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let open = Arc::new(AtomicUsize::new(0));
+    let most = Arc::new(AtomicUsize::new(0));
+    let peak = most.clone();
+    tokio::spawn(async move {
+        for _ in 0..count {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (open, most) = (open.clone(), most.clone());
+            tokio::spawn(async move {
+                crate::test_support::read_request(&mut socket).await;
+                let now = open.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                // Counted as closed before the reply, so the next request cannot be counted early.
+                open.fetch_sub(1, Ordering::SeqCst);
+                let body = json!({"success": true, "data": {"markdown": "x"}}).to_string();
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+        }
+    });
+    (format!("http://{address}"), peak)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_concurrency_caps_the_open_requests() {
+    let (url, peak) = serve_concurrently(12, Duration::from_millis(100)).await;
+    let client = client(&url).with_max_concurrency(5);
+    let scrapes = (0..12).map(|i| {
+        let client = client.clone();
+        async move {
+            client
+                .scrape(&ScrapeRequest::new(format!("https://example.com/{i}")))
+                .await
+        }
+    });
+    for response in futures::future::join_all(scrapes).await {
+        assert_eq!(response.unwrap().data.markdown.as_deref(), Some("x"));
+    }
+    assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 5);
+}
+
+#[tokio::test]
+async fn a_cache_hit_does_not_wait_for_a_slot() {
+    let (url, recorded) = serve(vec![
+        scraped("cached", json!({})),
+        scraped("slow", json!({})).with_stall(Duration::from_secs(2)),
+    ])
+    .await;
+    let (client, _) = cached_client(&url);
+    let client = client.with_max_concurrency(1);
+    let cached = ScrapeRequest::new("https://example.com/cached");
+    client.scrape(&cached).await.unwrap();
+    let slow = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .scrape(&ScrapeRequest::new("https://example.com/slow"))
+                .await
+        })
+    };
+    while recorded.lock().unwrap().len() < 2 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let hit = tokio::time::timeout(Duration::from_millis(500), client.scrape(&cached))
+        .await
+        .expect("a cache hit waited for the only slot")
+        .unwrap();
+    assert_eq!(hit.data.markdown.as_deref(), Some("cached"));
+    assert!(!slow.is_finished());
+    assert_eq!(
+        slow.await.unwrap().unwrap().data.markdown.as_deref(),
+        Some("slow")
+    );
+}
+
+#[tokio::test]
+async fn every_firecrawl_call_waits_for_a_slot() {
+    let (url, recorded) = serve(vec![
+        scraped("slow", json!({})).with_stall(Duration::from_secs(1)),
+        ok(json!({"success": true, "data": {"remainingCredits": 5}})),
+    ])
+    .await;
+    let client = client(&url).with_max_concurrency(1);
+    let slow = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .scrape(&ScrapeRequest::new("https://example.com/slow"))
+                .await
+        })
+    };
+    while recorded.lock().unwrap().is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let waited = tokio::time::timeout(Duration::from_millis(300), client.credit_usage()).await;
+    assert!(waited.is_err(), "credit usage did not wait for the slot");
+    slow.await.unwrap().unwrap();
+    client.credit_usage().await.unwrap();
+}

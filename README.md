@@ -391,6 +391,10 @@ Both return each page's main content as markdown. Their other defaults:
 
 `SearchRequest::with_country("US")` sets where the search runs from, and `with_highlights(false)` asks for the sites' own descriptions and snippets instead of query-relevant passages. A response whose `data` is one flat array is read as web results.
 
+`ScrapeOptions` sets how a page is scraped. `with_pdf_max_pages` caps the PDF pages read, `with_pdf_mode(PdfMode::Fast)` reads only embedded text (`Auto`, Firecrawl's default, falls back to OCR; `Ocr` forces it), `with_pdf_pages(true)` returns each page's markdown in `ScrapeData::pages`, and `with_pdf_page_markers(true)` marks page breaks in the markdown with `<!-- page N -->`. Any PDF option sends only the PDF parser, which switches off image OCR. `with_links(true)` returns the page's links in `ScrapeData::links`. None of these cost extra. `ScrapeData::credits(&options)` is what the scrape cost: Firecrawl's `creditsUsed` when it sends one (0 for an answer served from `with_cache`), else 1 plus 1 per PDF page read, so a 40-page PDF is 41.
+
+`FirecrawlClient::with_max_concurrency(5)` keeps at most 5 Firecrawl requests open at once, across the client and its clones; set it to your plan's concurrent browsers. Cache hits never wait. The wait for a slot comes before the request's own timeout starts, so it counts against any timeout you put around the call. There is no requests-per-minute pacing.
+
 `GovSearchRequest` filters by `k` (1 to 100), `jurisdiction` (`"us"` or a state such as `"us-tn"`; there is no city or county filter), `court`, `court_type`, `cites` and `domain`. The filters only match pages Firecrawl has labeled, so no results does not mean no law. `MapRequest` takes `search` to order links by relevance, `limit`, `sitemap` and `location`.
 
 ```rust,no_run
