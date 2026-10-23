@@ -908,7 +908,7 @@ async fn ask(client: &Anthropic) -> topcoat_si::Result<()> {
 ```
 
 - `on_poll` runs after every poll that finds the batch still running, even after a cancel. Return `Control::Cancel` to cancel the batch; `await_one` then waits for it to end, which is usually `BatchOutcome::Canceled`. Later `Cancel`s are ignored. A cancel that fails is logged, and `on_poll` is asked again on the next poll.
-- Past `deadline`, `await_one` returns `BatchOutcome::DeadlinePassed` without calling `on_poll` and leaves the batch running. Cancel it yourself if you no longer want it. Once a cancel has been sent the deadline no longer applies, so `DeadlinePassed` always means the batch was not canceled.
+- Past `deadline`, `await_one` returns `BatchOutcome::DeadlinePassed` without calling `on_poll` and leaves the batch running. Cancel it yourself if you no longer want it. Once a cancel has been sent, or a poll finds the batch canceling, the deadline no longer applies, so `DeadlinePassed` always means the batch was not canceled.
 - `done.batch` is the ended batch, or for `DeadlinePassed` the last poll.
 - `BatchOutcome::Errored` holds an `Error` that keeps the API's error type, so `is_retryable` is true for an overloaded or other transient failure. Its HTTP status is `None`.
 - Failed polls are retried as in `wait_for_message_batch`.
