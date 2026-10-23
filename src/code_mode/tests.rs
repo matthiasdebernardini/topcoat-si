@@ -2222,3 +2222,85 @@ async fn firecrawl_empty_search_still_costs_credits_and_bad_ranges_send_nothing(
     assert_eq!(recorded.lock().unwrap().len(), 1);
     assert_eq!((budget.used().searches, budget.used().credits), (1, 2));
 }
+
+// 9. The turbopuffer pack.
+
+#[cfg(feature = "turbopuffer")]
+fn turbopuffer_pack(url: &str) -> Pack {
+    use crate::turbopuffer::{TurbopufferClient, TurbopufferSearch};
+
+    let namespace = TurbopufferClient::try_new("tpuf-test-key", "gcp-us-central1")
+        .unwrap()
+        .with_base_url(url)
+        .unwrap()
+        .with_max_retries(0)
+        .namespace("acme-help", "voyage/voyage-4-lite")
+        .unwrap();
+    let search = TurbopufferSearch::try_new(namespace, "search_help", "help articles").unwrap();
+    packs::turbopuffer([search])
+}
+
+#[cfg(feature = "turbopuffer")]
+#[tokio::test]
+async fn turbopuffer_pack_returns_hits_as_dicts() {
+    let (url, recorded) = serve(vec![
+        ok(json!({"rows": [
+            {"id": "refunds", "$dist": 2.5, "text": "Refunds take 5 days.", "title": "Refunds"}
+        ]})),
+        Canned::json(404, json!({"error": "namespace not found"}).to_string()),
+        Canned::json(409, json!({"error": "index is still building"}).to_string()),
+    ])
+    .await;
+    let code = CodeMode::try_new(
+        test_pool().await,
+        vec![turbopuffer_pack(&url)],
+        Limits::default(),
+    )
+    .unwrap();
+    let (text, is_error) = run(
+        &code,
+        "hits = await search_help(query='refund', limit=50, mode='keyword')\n\
+         [(h['id'], h['score'], h['text'], h['attributes']) for h in hits]",
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        text,
+        "=> [('refunds', 2.5, 'Refunds take 5 days.', {'title': 'Refunds'})]"
+    );
+    let body: Value = serde_json::from_str(&recorded.lock().unwrap()[0].body).unwrap();
+    assert_eq!(body["limit"], 10);
+    assert_eq!(body["rank_by"], json!(["text", "BM25", "refund"]));
+
+    assert_eq!(
+        run(&code, "await search_help(query='refund')").await,
+        ("=> []".to_string(), false)
+    );
+
+    let (text, is_error) = run(&code, "await search_help(query='refund')").await;
+    assert!(is_error);
+    assert!(text.contains("RuntimeError: Search failed"), "{text}");
+}
+
+#[cfg(feature = "turbopuffer")]
+#[tokio::test]
+async fn turbopuffer_pack_ends_the_run_on_a_rejected_key() {
+    let (url, _) = serve(vec![Canned::json(
+        401,
+        json!({"error": "bad key"}).to_string(),
+    )])
+    .await;
+    let code = CodeMode::try_new(
+        test_pool().await,
+        vec![turbopuffer_pack(&url)],
+        Limits::default(),
+    )
+    .unwrap();
+    let tool_use = ToolUseBlock::new(
+        "toolu_1",
+        TOOL_NAME,
+        json!({"code": "await search_help(query='x')"}),
+    );
+    let error = code.call(&tool_use).await.unwrap_err();
+    assert_eq!(error.status(), Some(401), "{error}");
+}

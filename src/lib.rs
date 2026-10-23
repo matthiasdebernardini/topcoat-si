@@ -12,7 +12,8 @@
 //! [`jev::JevTool`], or your own) until it answers. [`jev`] is a client for TypeSafe's Jev decision
 //! model, and [`Anthropic::send_parsed`] returns replies as your own Rust types. The `surreal`
 //! feature adds an embedded SurrealDB for memory, transcripts, a Firecrawl cache and a usage
-//! ledger.
+//! ledger. With the `turbopuffer` feature, the `turbopuffer` module adds semantic and keyword
+//! search over the app's own documents, as a client and as a client-side tool.
 
 mod accumulating_stream;
 mod anthropic;
@@ -34,6 +35,8 @@ pub mod surreal;
 #[cfg(test)]
 mod test_support;
 mod tool_loop;
+#[cfg(feature = "turbopuffer")]
+pub mod turbopuffer;
 mod types;
 
 pub use accumulating_stream::AccumulatingStream;

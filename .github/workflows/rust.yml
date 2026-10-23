@@ -19,6 +19,8 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+      - name: clippy with turbopuffer
+        run: cargo clippy --all-targets --features turbopuffer --locked -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -28,9 +30,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: lib and integration tests
-        run: cargo nextest run --lib --tests --locked
+        run: cargo nextest run --lib --tests --locked --features turbopuffer
       - name: doc tests
-        run: cargo test --doc --locked
+        run: cargo test --doc --locked --features turbopuffer
 
   code-mode:
     runs-on: ubuntu-latest
@@ -44,10 +46,10 @@ jobs:
       - name: install the monty worker
         run: cargo install monty-runtime --version 1.2.0 --locked
       - name: clippy with code-mode and surreal
-        run: cargo clippy --workspace --all-targets --features code-mode,surreal --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --features code-mode,surreal,turbopuffer --locked -- -D warnings
       - name: code-mode and surreal tests
         run: |
-          MONTY_BIN="$HOME/.cargo/bin/monty" cargo nextest run --workspace --lib --locked --features code-mode,surreal code_mode surreal db
+          MONTY_BIN="$HOME/.cargo/bin/monty" cargo nextest run --workspace --lib --locked --features code-mode,surreal,turbopuffer code_mode surreal db
           cargo nextest run -p topcoat-evals --locked
       - name: code-mode and surreal doc test
-        run: cargo test --doc --locked --features code-mode,surreal
+        run: cargo test --doc --locked --features code-mode,surreal,turbopuffer

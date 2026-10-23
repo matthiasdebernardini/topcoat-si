@@ -11,6 +11,8 @@ mod research;
 #[cfg(feature = "surreal")]
 mod surreal;
 mod triage;
+#[cfg(feature = "turbopuffer")]
+mod turbopuffer;
 
 pub use firecrawl::{
     FirecrawlBudget, FirecrawlEvent, FirecrawlHit, FirecrawlObserver, FirecrawlPack, FirecrawlPage,
@@ -22,3 +24,5 @@ pub use research::research;
 #[cfg(feature = "surreal")]
 pub use surreal::surreal;
 pub use triage::triage;
+#[cfg(feature = "turbopuffer")]
+pub use turbopuffer::turbopuffer;

@@ -45,6 +45,9 @@ pub enum Service {
     Firecrawl,
     /// TypeSafe's Jev API.
     Jev,
+    /// The turbopuffer API.
+    #[cfg(feature = "turbopuffer")]
+    Turbopuffer,
 }
 
 impl fmt::Display for Service {
@@ -53,6 +56,8 @@ impl fmt::Display for Service {
             Self::Anthropic => "Anthropic",
             Self::Firecrawl => "Firecrawl",
             Self::Jev => "Jev",
+            #[cfg(feature = "turbopuffer")]
+            Self::Turbopuffer => "turbopuffer",
         })
     }
 }
@@ -109,8 +114,8 @@ pub enum ErrorKind {
         retryable: Option<bool>,
     },
     /// The response started, then stopped: the connection dropped mid-body, or a stream ended
-    /// before `message_stop`. Only GET requests are resent automatically; the server has already
-    /// answered a POST or DELETE.
+    /// before `message_stop`. Only GET requests and turbopuffer queries are resent automatically;
+    /// the server has already answered any other request.
     Interrupted,
     /// A success response arrived but is not what was expected: bad JSON, bad SSE framing or
     /// UTF-8, or a bad batch result line.
