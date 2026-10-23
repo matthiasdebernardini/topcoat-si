@@ -2042,3 +2042,54 @@ async fn credit_usage_is_resent_after_a_cut_success_but_search_is_not() {
     assert!(matches!(err.kind(), ErrorKind::Interrupted), "{err:?}");
     assert_eq!(recorded.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn gov_search_and_map_are_cached_but_credit_usage_is_not() {
+    let (url, recorded) = serve(vec![
+        ok(json!({"success": true, "creditsUsed": 1,
+                  "data": {"web": [{"url": "https://a.gov", "position": 1}]}})),
+        ok(json!({"success": true, "links": [{"url": "https://a.gov/agendas"}]})),
+        ok(json!({"success": true, "data": {"remainingCredits": 9}})),
+        ok(json!({"success": true, "data": {"remainingCredits": 8}})),
+    ])
+    .await;
+    let (client, cache) = cached_client(&url);
+    let gov = GovSearchRequest::new("setback").with_jurisdiction("us-tn");
+    let first = client.gov_search(&gov).await.unwrap();
+    assert_eq!(first.credits_used, Some(1));
+    let second = client.gov_search(&gov).await.unwrap();
+    assert_eq!(second.credits_used, Some(0));
+    assert_eq!(second.data, first.data);
+
+    let map = MapRequest::new("https://a.gov").with_search("agenda");
+    let first = client.map(&map).await.unwrap();
+    assert_eq!(client.map(&map).await.unwrap(), first);
+
+    assert_eq!(client.credit_usage().await.unwrap().remaining_credits, 9);
+    assert_eq!(client.credit_usage().await.unwrap().remaining_credits, 8);
+    assert_eq!(recorded.lock().unwrap().len(), 4);
+
+    let mut keys: Vec<String> = cache.0.lock().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert!(keys[0].starts_with("gov_search:"), "{}", keys[0]);
+    assert!(keys[1].starts_with("map:"), "{}", keys[1]);
+}
+
+#[tokio::test]
+async fn cached_search_keeps_highlights_from_a_flat_array() {
+    let (url, recorded) = serve(vec![ok(json!({"success": true, "data": [
+        {"url": "https://a.gov/1", "highlights": "one passage"}
+    ]}))])
+    .await;
+    let (client, _) = cached_client(&url);
+    let request = SearchRequest::new("q");
+    let first = client.search(&request).await.unwrap();
+    let second = client.search(&request).await.unwrap();
+    assert_eq!(second, first);
+    assert_eq!(
+        second.data.unwrap().web.unwrap()[0].highlights,
+        Some(vec!["one passage".to_string()])
+    );
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}

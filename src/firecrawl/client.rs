@@ -95,7 +95,8 @@ impl FirecrawlClient {
         self
     }
 
-    /// Keep answers in `cache` for `ttl`, so an identical search or scrape is paid for once.
+    /// Keep answers in `cache` for `ttl`, so an identical search, gov search, scrape or map is
+    /// paid for once. Credit usage is never cached.
     ///
     /// The key is the request body as sent, so any difference in the request is a miss. Failures
     /// are never cached, and a cache that errors only costs a repeat call.
@@ -185,7 +186,17 @@ impl FirecrawlClient {
     /// mean no law: filters only match pages Firecrawl has labeled.
     pub async fn gov_search(&self, request: &GovSearchRequest) -> Result<GovSearchResponse> {
         request.validate()?;
-        self.post("/v2/search/gov", &request.wire(), None).await
+        let key = cache_key("gov_search:", &request.wire());
+        if let Some(mut hit) = self.cached::<GovSearchResponse>(key.as_deref()).await {
+            // As for search, a cached answer is not charged again.
+            if hit.credits_used.is_some() {
+                hit.credits_used = Some(0);
+            }
+            return Ok(hit);
+        }
+        let response = self.post("/v2/search/gov", &request.wire(), None).await?;
+        self.store(key.as_deref(), &response).await;
+        Ok(response)
     }
 
     /// List the URLs of a site, from its sitemap and links. One credit per call, however many
@@ -195,7 +206,13 @@ impl FirecrawlClient {
     /// [`FirecrawlClient::search`]. Map is fast and may miss links.
     pub async fn map(&self, request: &MapRequest) -> Result<MapResponse> {
         request.validate()?;
-        self.post("/v2/map", &request.wire(), None).await
+        let key = cache_key("map:", &request.wire());
+        if let Some(hit) = self.cached(key.as_deref()).await {
+            return Ok(hit);
+        }
+        let response = self.post("/v2/map", &request.wire(), None).await?;
+        self.store(key.as_deref(), &response).await;
+        Ok(response)
     }
 
     /// The team's remaining credits and current billing period. Costs no credits.
