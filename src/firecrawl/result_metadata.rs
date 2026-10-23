@@ -28,8 +28,7 @@ pub struct ResultMetadata {
     /// For a PDF, the document's full page count, when Firecrawl knows it.
     pub total_pages: Option<u32>,
     /// Credits Firecrawl billed for this page, read from `creditsUsed`. A scrape served from
-    /// [`FirecrawlClient::with_cache`](super::FirecrawlClient::with_cache) reports 0 in place of
-    /// the figure it was cached with.
+    /// [`FirecrawlClient::with_cache`](super::FirecrawlClient::with_cache) always reports 0.
     pub credits_used: Option<u64>,
 }
 

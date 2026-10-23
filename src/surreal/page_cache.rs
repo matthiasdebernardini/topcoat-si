@@ -345,4 +345,36 @@ mod tests {
         assert_eq!(cache.purge_expired().await.unwrap(), 1);
         assert_eq!(cache.purge_expired().await.unwrap(), 0);
     }
+
+    #[tokio::test]
+    async fn a_scrape_with_links_pages_and_credits_round_trips() {
+        use std::sync::Arc;
+
+        use crate::FirecrawlClient;
+        use crate::firecrawl::{ScrapeOptions, ScrapeRequest};
+        use crate::test_support::{Canned, serve};
+
+        let body = serde_json::json!({"success": true, "data": {
+            "markdown": "one",
+            "links": ["https://example.com/b"],
+            "pages": [{"pageNumber": 1, "markdown": "one"}],
+            "metadata": {"numPages": 1, "creditsUsed": 1}
+        }});
+        let (url, _) = serve(vec![Canned::json(200, body.to_string())]).await;
+        let cache = Arc::new(PageCache::try_new(temp_db().await).await.unwrap());
+        let client = FirecrawlClient::try_new("fc-test-key")
+            .unwrap()
+            .with_base_url(&url)
+            .unwrap()
+            .with_cache(cache, HOUR);
+        let options = ScrapeOptions::new().with_links(true).with_pdf_pages(true);
+        let request = ScrapeRequest::new("https://example.com/a.pdf").with_options(options);
+        let fresh = client.scrape(&request).await.unwrap();
+        let mut hit = client.scrape(&request).await.unwrap();
+        assert_eq!(hit.data.credits(&request.options), 0);
+        hit.data.metadata.as_mut().unwrap().credits_used = Some(1);
+        assert_eq!(hit, fresh);
+        assert_eq!(hit.data.links.as_ref().unwrap().len(), 1);
+        assert_eq!(hit.data.pages.as_ref().unwrap()[0].page, 1);
+    }
 }

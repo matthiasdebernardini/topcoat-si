@@ -172,13 +172,11 @@ impl FirecrawlClient {
         if request.options.max_age != Some(Duration::ZERO)
             && let Some(mut hit) = self.cached::<ScrapeResponse>(key.as_deref()).await
         {
-            // As with search, a cached answer costs nothing; one that reported no credits stays
-            // as it was.
-            if let Some(metadata) = hit.data.metadata.as_mut()
-                && metadata.credits_used.is_some()
-            {
-                metadata.credits_used = Some(0);
-            }
+            // A cached answer costs nothing, so it says so even when Firecrawl sent no figure.
+            hit.data
+                .metadata
+                .get_or_insert_with(Default::default)
+                .credits_used = Some(0);
             return Ok(hit);
         }
         let response: ScrapeResponse = self.post("/v2/scrape", &request.wire(), timeout).await?;

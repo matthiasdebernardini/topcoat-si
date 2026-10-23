@@ -46,8 +46,8 @@ pub struct ScrapeData {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct PdfPage {
-    /// The 1-based physical page number, read from `pageNumber`.
-    #[serde(rename = "pageNumber")]
+    /// The 1-based physical page number, read from `pageNumber`. 0 when Firecrawl sent none.
+    #[serde(rename = "pageNumber", default)]
     pub page: u32,
     /// The page's content as markdown.
     #[serde(default)]
@@ -59,18 +59,18 @@ impl ScrapeData {
     ///
     /// Firecrawl's own figure, [`ResultMetadata::credits_used`], wins when the response carries
     /// one. A scrape served from [`FirecrawlClient::with_cache`](super::FirecrawlClient::with_cache)
-    /// reports 0 there, because a local cache hit bills nothing; a cached answer that carried no
-    /// figure is estimated like a fresh one.
+    /// always reports 0 there, because a local cache hit bills nothing.
     ///
-    /// Otherwise the figure is estimated from Firecrawl's published billing: 1 credit for the
-    /// page, plus 1 per PDF page read ([`ResultMetadata::num_pages`]), plus 4 for each paid
+    /// Otherwise the figure is estimated from Firecrawl's billing: 1 credit for the page, plus 1
+    /// for each PDF page read ([`ResultMetadata::num_pages`]) after the first, plus 4 for each paid
     /// add-on format (`json`, `question`, `query`, `highlights`, `audio`, `video`), none of which
     /// [`ScrapeOptions`] requests. Links, per-page markdown, page markers and the PDF mode cost
     /// nothing extra. The estimate leaves out what this crate does not request: zero data
     /// retention (+1), PII redaction, lockdown and prompt-injection checks (+4 each), and
-    /// third-party provider pricing. It follows the billing page's "+1 credit per PDF page" on
-    /// top of the base credit, so a 40-page PDF is 41. A page Firecrawl serves from its own
-    /// cache (see [`ScrapeOptions::max_age`]) is still billed.
+    /// third-party provider pricing. Firecrawl's billing code charges `numPages - 1` extra PDF
+    /// pages on top of the base credit, so a PDF costs 1 credit per page: 40 for 40 pages, 1 for
+    /// one. A page Firecrawl serves from its own cache (see [`ScrapeOptions::max_age`]) is still
+    /// billed.
     #[must_use]
     pub fn credits(&self, options: &ScrapeOptions) -> u64 {
         let metadata = self.metadata.as_ref();
@@ -80,7 +80,7 @@ impl ScrapeData {
         let pdf_pages = metadata
             .and_then(|metadata| metadata.num_pages)
             .map_or(0, u64::from);
-        BASE_CREDITS + pdf_pages + PAID_FORMAT_CREDITS * options.paid_formats()
+        BASE_CREDITS + pdf_pages.saturating_sub(1) + PAID_FORMAT_CREDITS * options.paid_formats()
     }
 }
 

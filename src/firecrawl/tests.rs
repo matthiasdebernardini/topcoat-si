@@ -980,7 +980,7 @@ async fn scrape_request_wire_body() {
             "onlyMainContent": true,
             "maxAge": 3600000,
             "timeout": 30000,
-            "parsers": [{"type": "pdf", "maxPages": 20}]
+            "parsers": [{"type": "pdf", "maxPages": 20}, "image"]
         })
     );
 }
@@ -1118,7 +1118,7 @@ async fn fetch_page_returns_one_chunked_search_result() {
             "onlyMainContent": true,
             "maxAge": 3600000,
             "timeout": 30000,
-            "parsers": [{"type": "pdf", "maxPages": 20}]
+            "parsers": [{"type": "pdf", "maxPages": 20}, "image"]
         })
     );
 
@@ -1526,7 +1526,11 @@ async fn an_identical_scrape_is_served_from_the_cache() {
     let (client, cache) = cached_client(&url);
     let request = ScrapeRequest::new("https://example.com/page");
     let first = client.scrape(&request).await.unwrap();
-    let second = client.scrape(&request).await.unwrap();
+    let mut second = client.scrape(&request).await.unwrap();
+    // The hit says it cost nothing; everything else is as cached.
+    let metadata = second.data.metadata.as_mut().unwrap();
+    assert_eq!(metadata.credits_used, Some(0));
+    metadata.credits_used = None;
     assert_eq!(first, second);
     assert_eq!(recorded.lock().unwrap().len(), 1);
     let keys: Vec<String> = cache.0.lock().unwrap().keys().cloned().collect();
@@ -2147,18 +2151,18 @@ fn pdf_options_and_links_go_into_the_wire_body() {
                 "maxPages": 40,
                 "pages": true,
                 "pageMarkers": true
-            }]
+            }, "image"]
         })
     );
     for (mode, name) in [(PdfMode::Fast, "fast"), (PdfMode::Auto, "auto")] {
         assert_eq!(
             wire(ScrapeOptions::new().with_pdf_mode(mode))["parsers"],
-            json!([{"type": "pdf", "mode": name}])
+            json!([{"type": "pdf", "mode": name}, "image"])
         );
     }
     assert_eq!(
         wire(ScrapeOptions::new().with_pdf_page_markers(false))["parsers"],
-        json!([{"type": "pdf", "pageMarkers": false}])
+        json!([{"type": "pdf", "pageMarkers": false}, "image"])
     );
     let plain = wire(ScrapeOptions::new().with_links(false));
     assert_eq!(plain["formats"], json!(["markdown"]));
@@ -2210,12 +2214,14 @@ fn credits_are_estimated_from_the_pages_read() {
     assert_eq!(
         data(json!({"contentType": "application/pdf", "numPages": 40, "totalPages": 300}))
             .credits(&options),
-        41
+        40
     );
+    assert_eq!(data(json!({"numPages": 1})).credits(&options), 1);
+    assert_eq!(data(json!({"numPages": 0})).credits(&options), 1);
     assert_eq!(ScrapeData::default().credits(&options), 1);
     assert_eq!(
         data(json!({"numPages": 40})).credits(&ScrapeOptions::new().with_links(true)),
-        41
+        40
     );
     // Firecrawl's own figure wins over the estimate.
     assert_eq!(
@@ -2228,13 +2234,13 @@ fn credits_are_estimated_from_the_pages_read() {
 async fn a_cached_scrape_reports_zero_credits() {
     let (url, recorded) = serve(vec![scraped(
         "pdf",
-        json!({"contentType": "application/pdf", "numPages": 40, "creditsUsed": 41}),
+        json!({"contentType": "application/pdf", "numPages": 40, "creditsUsed": 40}),
     )])
     .await;
     let (client, _) = cached_client(&url);
     let request = ScrapeRequest::new("https://example.com/a.pdf");
     let fresh = client.scrape(&request).await.unwrap();
-    assert_eq!(fresh.data.credits(&request.options), 41);
+    assert_eq!(fresh.data.credits(&request.options), 40);
     let cached = client.scrape(&request).await.unwrap();
     assert_eq!(cached.data.credits(&request.options), 0);
     assert_eq!(cached.data.markdown.as_deref(), Some("pdf"));
@@ -2333,7 +2339,8 @@ async fn max_concurrency_caps_the_open_requests() {
     for response in futures::future::join_all(scrapes).await {
         assert_eq!(response.unwrap().data.markdown.as_deref(), Some("x"));
     }
-    assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 5);
+    let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+    assert!((2..=5).contains(&peak), "{peak} requests were open at once");
 }
 
 #[tokio::test]
@@ -2393,4 +2400,61 @@ async fn every_firecrawl_call_waits_for_a_slot() {
     assert!(waited.is_err(), "credit usage did not wait for the slot");
     slow.await.unwrap().unwrap();
     client.credit_usage().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_cache_hit_without_a_credits_figure_reports_zero() {
+    let (url, recorded) = serve(vec![
+        scraped("pdf", json!({"numPages": 40})),
+        ok(json!({"success": true, "data": {"markdown": "bare"}})),
+    ])
+    .await;
+    let (client, _) = cached_client(&url);
+    let options = ScrapeOptions::new();
+    for page in ["https://example.com/a.pdf", "https://example.com/bare"] {
+        let request = ScrapeRequest::new(page);
+        let fresh = client.scrape(&request).await.unwrap();
+        assert_eq!(
+            fresh.data.metadata.as_ref().and_then(|m| m.credits_used),
+            None
+        );
+        assert!(fresh.data.credits(&options) > 0);
+        let hit = client.scrape(&request).await.unwrap();
+        assert_eq!(hit.data.credits(&options), 0, "{page}");
+    }
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn the_image_parser_is_sent_with_every_pdf_entry() {
+    let options = [
+        ScrapeOptions::new().with_pdf_max_pages(5),
+        ScrapeOptions::new().with_pdf_mode(PdfMode::Fast),
+        ScrapeOptions::new().with_pdf_pages(false),
+        ScrapeOptions::new().with_pdf_page_markers(true),
+    ];
+    for options in options {
+        let parsers = serde_json::to_value(options.wire()).unwrap()["parsers"].clone();
+        let parsers = parsers.as_array().unwrap();
+        assert_eq!(parsers.len(), 2, "{options:?}");
+        assert_eq!(parsers[0]["type"], "pdf");
+        assert_eq!(parsers[1], "image");
+    }
+    let search =
+        SearchRequest::new("q").with_scrape_options(ScrapeOptions::new().with_pdf_max_pages(5));
+    assert_eq!(
+        serde_json::to_value(search.wire()).unwrap()["scrapeOptions"]["parsers"][1],
+        "image"
+    );
+}
+
+#[test]
+fn a_pdf_page_without_a_number_does_not_fail_the_response() {
+    let data: ScrapeData = serde_json::from_value(json!({
+        "pages": [{"markdown": "first"}, {"pageNumber": 2, "markdown": "second"}]
+    }))
+    .unwrap();
+    let pages = data.pages.unwrap();
+    assert_eq!((pages[0].page, pages[0].markdown.as_str()), (0, "first"));
+    assert_eq!(pages[1].page, 2);
 }

@@ -33,7 +33,8 @@ pub enum PdfMode {
 /// page read, so cap long documents with [`ScrapeOptions::with_pdf_max_pages`].
 ///
 /// Any PDF option (`pdf_max_pages`, `pdf_mode`, `pdf_pages`, `pdf_page_markers`) sends a parsers
-/// list holding only the PDF parser, which switches off the parsers it omits (image OCR).
+/// list holding the configured PDF parser and the image parser, so image OCR stays on as in
+/// Firecrawl's default.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ScrapeOptions {
@@ -45,19 +46,20 @@ pub struct ScrapeOptions {
     pub timeout: Option<Duration>,
     /// Read at most this many PDF pages, 1 to 10,000.
     ///
-    /// Firecrawl bills 1 credit per PDF page. Setting this sends a parsers list holding only
-    /// the PDF parser, which switches off the parsers it omits (image OCR).
+    /// Firecrawl bills 1 credit per PDF page.
     pub pdf_max_pages: Option<u32>,
     /// How PDF text is read. Firecrawl defaults to [`PdfMode::Auto`]. Costs nothing extra.
     pub pdf_mode: Option<PdfMode>,
     /// Also return each PDF page's markdown in [`ScrapeData::pages`](super::ScrapeData::pages).
-    /// Costs nothing extra.
+    /// Costs nothing extra. Only a [`FirecrawlClient::scrape`](super::FirecrawlClient::scrape)
+    /// answer carries the pages; a search result has no field for them.
     pub pdf_pages: Option<bool>,
     /// Join PDF pages in the markdown with `<!-- page N -->` markers, N being the 1-based page
     /// that follows. There is no marker before page 1. Costs nothing extra.
     pub pdf_page_markers: Option<bool>,
     /// Also return the page's links in [`ScrapeData::links`](super::ScrapeData::links). Costs
-    /// nothing extra.
+    /// nothing extra. Only a [`FirecrawlClient::scrape`](super::FirecrawlClient::scrape) answer
+    /// carries the links; a search result has no field for them.
     pub links: bool,
 }
 
@@ -89,37 +91,35 @@ impl ScrapeOptions {
         self
     }
 
-    /// Read at most this many PDF pages. Also switches off image OCR, see
-    /// [`ScrapeOptions::pdf_max_pages`].
+    /// Read at most this many PDF pages.
     #[must_use]
     pub fn with_pdf_max_pages(mut self, pages: u32) -> Self {
         self.pdf_max_pages = Some(pages);
         self
     }
 
-    /// Set how PDF text is read. Also switches off image OCR, see [`ScrapeOptions`].
+    /// Set how PDF text is read.
     #[must_use]
     pub fn with_pdf_mode(mut self, mode: PdfMode) -> Self {
         self.pdf_mode = Some(mode);
         self
     }
 
-    /// Return each PDF page's markdown separately. Also switches off image OCR, see
-    /// [`ScrapeOptions`].
+    /// Return each PDF page's markdown separately, on a scrape only.
     #[must_use]
     pub fn with_pdf_pages(mut self, pages: bool) -> Self {
         self.pdf_pages = Some(pages);
         self
     }
 
-    /// Mark PDF page breaks in the markdown. Also switches off image OCR, see [`ScrapeOptions`].
+    /// Mark PDF page breaks in the markdown.
     #[must_use]
     pub fn with_pdf_page_markers(mut self, page_markers: bool) -> Self {
         self.pdf_page_markers = Some(page_markers);
         self
     }
 
-    /// Also return the links on the page.
+    /// Also return the links on the page, on a scrape only.
     #[must_use]
     pub fn with_links(mut self, links: bool) -> Self {
         self.links = links;
@@ -171,7 +171,11 @@ impl ScrapeOptions {
             only_main_content: self.only_main_content,
             max_age: self.max_age.map(millis),
             timeout: self.timeout.map(millis),
-            parsers: self.pdf_parser().map(|parser| vec![parser]),
+            // A parsers list switches off every parser it omits, so the image parser is listed
+            // too.
+            parsers: self
+                .pdf_parser()
+                .map(|pdf| vec![WireParserEntry::Pdf(pdf), WireParserEntry::Named("image")]),
         }
     }
 
@@ -206,7 +210,15 @@ pub(super) struct WireScrapeOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    parsers: Option<Vec<WireParser>>,
+    parsers: Option<Vec<WireParserEntry>>,
+}
+
+/// One entry of the parsers list: a configured parser, or a parser's name for its defaults.
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(super) enum WireParserEntry {
+    Pdf(WireParser),
+    Named(&'static str),
 }
 
 #[derive(Serialize)]
