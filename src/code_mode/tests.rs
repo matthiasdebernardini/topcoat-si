@@ -179,11 +179,16 @@ impl Drop for PausedClock {
 /// A `nap` host function sleeping `secs` on a paused clock: the call timeouts see the full
 /// sleep, the test does not wait for it.
 fn nap(secs: u64) -> impl HostFunction {
-    host_fn("nap", "nap() -> None", "sleeps", move |_: Value| async move {
-        let _clock = PausedClock::new();
-        tokio::time::sleep(Duration::from_secs(secs)).await;
-        Ok(Value::Null)
-    })
+    host_fn(
+        "nap",
+        "nap() -> None",
+        "sleeps",
+        move |_: Value| async move {
+            let _clock = PausedClock::new();
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            Ok(Value::Null)
+        },
+    )
 }
 
 fn firecrawl_pack(url: &str, search: FirecrawlWebSearch, max_credits: u32) -> Pack {
@@ -1197,7 +1202,10 @@ async fn host_call_timeout_is_configurable() {
         ..Limits::default()
     };
     let code = CodeMode::try_new(pool.clone(), vec![pack()], limits).unwrap();
-    assert_eq!(run(&code, "await nap()").await, ("=> None".to_string(), false));
+    assert_eq!(
+        run(&code, "await nap()").await,
+        ("=> None".to_string(), false)
+    );
 
     let code = CodeMode::try_new(pool, vec![pack()], Limits::default()).unwrap();
     let (text, is_error) = run(&code, "await nap()").await;
