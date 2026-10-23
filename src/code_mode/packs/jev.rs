@@ -357,7 +357,7 @@ pub fn jev(client: JevClient) -> Pack {
     JevPack::new(client).build()
 }
 
-/// The shared path of every function: budget, concurrency, observer, then the request.
+/// The shared path of every function: checks, concurrency, budget, observer, then the request.
 struct Asker {
     client: JevClient,
     budget: Option<Arc<JevBudget>>,
