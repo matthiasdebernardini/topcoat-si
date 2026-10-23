@@ -1,10 +1,22 @@
 //! Live checks against the real Anthropic, Firecrawl and Jev APIs. They cost money, so they are
 //! ignored; run them with `cargo test --test live -- --ignored`. Add `--features code-mode` and
-//! set MONTY_BIN to the monty worker binary to include the code mode test.
+//! set MONTY_BIN to the monty worker binary to include the code mode tests.
 //!
 //! Needs ANTHROPIC_API_KEY, FIRECRAWL_API_KEY, TYPESAFE_API_KEY and TYPESAFE_DEFAULT_MODEL.
+//!
+//! Expected Firecrawl credits per call, from Firecrawl's billing:
+//! - `gov_search`: 0 (the Government Index is free);
+//! - `map`: 1;
+//! - PDF scrape: 1 credit per page read, so at most 3 here;
+//! - `credit_usage`: 0;
+//! - code mode `gov_search` and `map_site`: 0 and 1.
+//!
+//! `firecrawl_endpoints_answer` costs about 4 credits and no Claude. `code_mode_firecrawl_pack_answers`
+//! adds about 1 credit and a few cents of Haiku. The other tests also spend credits on search and
+//! fetch, so a whole run stays under about 20.
 
 use futures::StreamExt;
+use topcoat_si::firecrawl::{GovSearchRequest, MapRequest, ScrapeOptions, ScrapeRequest};
 use topcoat_si::jev::{JevClient, JevTool};
 use topcoat_si::{
     AccumulatingStream, Anthropic, ClientTool, ContentBlock, FirecrawlClient, FirecrawlFetchPage,
@@ -195,6 +207,142 @@ async fn client_tools_answer() {
             tool.name()
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "live: calls the real APIs and costs money"]
+async fn firecrawl_endpoints_answer() {
+    let firecrawl = FirecrawlClient::from_env().expect("FIRECRAWL_API_KEY");
+    let before = firecrawl.credit_usage().await.expect("credit_usage");
+    assert!(
+        before.remaining_credits >= 0.0,
+        "remaining credits: {before:?}"
+    );
+
+    let zoning = GovSearchRequest::new("zoning variance board of zoning appeals")
+        .with_jurisdiction("us-tn")
+        .with_k(3);
+    let hits = firecrawl
+        .gov_search(&zoning)
+        .await
+        .expect("gov_search")
+        .data
+        .web;
+    assert!(!hits.is_empty(), "gov_search found nothing");
+    assert!(hits.len() <= 3, "gov_search ignored k: {}", hits.len());
+    assert!(
+        hits.iter().all(|hit| hit.url.is_some()),
+        "a hit has no url: {hits:?}"
+    );
+
+    let map = MapRequest::new("https://www.tn.gov")
+        .with_search("zoning")
+        .with_limit(5);
+    let links = firecrawl.map(&map).await.expect("map").links;
+    assert!(!links.is_empty(), "map found no links");
+    assert!(links.len() <= 5, "map ignored limit: {}", links.len());
+    assert!(
+        links.iter().all(|link| link.url.is_some()),
+        "a link has no url: {links:?}"
+    );
+
+    // The IRS W-9 has 6 pages, so 3 are read and a marker precedes page 2 and 3.
+    let options = ScrapeOptions::new()
+        .with_pdf_max_pages(3)
+        .with_pdf_pages(true)
+        .with_pdf_page_markers(true);
+    let request =
+        ScrapeRequest::new("https://www.irs.gov/pub/irs-pdf/fw9.pdf").with_options(options.clone());
+    let scraped = firecrawl.scrape(&request).await.expect("scrape").data;
+    let markdown = scraped.markdown.as_deref().unwrap_or_default();
+    assert!(!markdown.trim().is_empty(), "the PDF had no markdown");
+    assert!(
+        markdown.contains("<!-- page 2 -->"),
+        "no page marker in: {markdown:.300}"
+    );
+    let pages = scraped.pages.as_deref().unwrap_or_default();
+    assert!(
+        (2..=3).contains(&pages.len()),
+        "expected 2 or 3 pages, got {}",
+        pages.len()
+    );
+    let credits = scraped.credits(&options);
+    assert!((1..=3).contains(&credits), "scrape credits: {credits}");
+    println!("PDF scrape: {} pages, {credits} credits", pages.len());
+
+    let after = firecrawl.credit_usage().await.expect("credit_usage");
+    println!(
+        "credits remaining: {} before, {} after",
+        before.remaining_credits, after.remaining_credits
+    );
+    assert!(after.remaining_credits.is_finite() && after.remaining_credits >= 0.0);
+}
+
+#[cfg(feature = "code-mode")]
+#[tokio::test]
+#[ignore = "live: calls the real APIs and costs money"]
+async fn code_mode_firecrawl_pack_answers() {
+    use std::sync::{Arc, Mutex};
+
+    use topcoat_si::code_mode::packs::{FirecrawlEvent, FirecrawlObserver, FirecrawlPack};
+    use topcoat_si::code_mode::{self, CodeMode, Limits};
+
+    struct Recorder(Mutex<Vec<FirecrawlEvent>>);
+    impl FirecrawlObserver for Recorder {
+        fn event(&self, event: FirecrawlEvent) {
+            self.0.lock().expect("recorder lock").push(event);
+        }
+    }
+
+    let client = Anthropic::try_new(None).expect("ANTHROPIC_API_KEY");
+    let monty = std::env::var_os("MONTY_BIN").expect("MONTY_BIN");
+    let pool = code_mode::pool(monty, 1).await.expect("sandbox pool");
+    let firecrawl = FirecrawlClient::from_env().expect("FIRECRAWL_API_KEY");
+    let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+    let pack = FirecrawlPack::new(firecrawl)
+        .with_observer(recorder.clone())
+        .build();
+    let code = CodeMode::try_new(pool, vec![pack], Limits::default()).expect("code mode tool");
+    let model = KnownModel::ClaudeHaiku55;
+
+    let system = "Use each function exactly once, in one snippet, then answer in one sentence.";
+    let params = MessageCreateParams::new(
+        2048,
+        vec![MessageParam::user(
+            "Call gov_search(query=\"zoning variance\", k=3, jurisdiction=\"us-tn\") and \
+             map_site(url=\"https://www.tn.gov\", search=\"zoning\", limit=5). Print the \
+             number of results from each.",
+        )],
+        Model::Known(model),
+    )
+    .with_system(system);
+
+    let tools: [&dyn ClientTool; 1] = [&code];
+    let run = client.run_tools(params, &tools, 6).await;
+    let finished = code.finish().await;
+    let run = match run {
+        Ok(run) => run,
+        Err(failed) => tool_run_failed(&failed),
+    };
+    print_cost(model, &run.responses);
+    if let Err(err) = finished {
+        panic!("finish failed: {err:?}");
+    }
+
+    let events = recorder.0.lock().expect("recorder lock");
+    let gov = events.iter().find_map(|event| match event {
+        FirecrawlEvent::GovSearched { hits, .. } => Some(hits.len()),
+        _ => None,
+    });
+    let map = events.iter().find_map(|event| match event {
+        FirecrawlEvent::Mapped { links, credits, .. } => Some((links.len(), *credits)),
+        _ => None,
+    });
+    assert!(gov.is_some_and(|hits| hits > 0), "gov_search: {events:?}");
+    assert!(
+        map.is_some_and(|(links, credits)| links > 0 && credits <= 1),
+        "map_site: {events:?}"
+    );
 }
 
 #[cfg(feature = "code-mode")]

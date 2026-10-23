@@ -5,7 +5,7 @@
 //! Everything here takes a [`Surreal`] handle and runs its own `DEFINE ... IF NOT EXISTS`
 //! statements when built, so an app opens one database with [`open`] and hands it to each piece.
 //! The engine is SurrealKV, pure Rust, one process per directory: it holds an exclusive lock, so
-//! two binaries need two paths. The crate is re-exported as [`surrealdb`](crate::surrealdb) for an
+//! two binaries need two paths. The crate is re-exported as [`surrealdb`] for an
 //! app's own tables; derive its records with
 //! `#[derive(SurrealValue)] #[surreal(crate = "topcoat_si::surrealdb::types")]`.
 

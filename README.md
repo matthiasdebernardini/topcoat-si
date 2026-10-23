@@ -1318,7 +1318,19 @@ The tool examples need more keys:
 
 The Jev variables are `TYPESAFE_API_KEY` and `TYPESAFE_DEFAULT_MODEL`.
 
-`cargo test --test live -- --ignored` checks every model and the three client tools (`web_search`, `fetch_page` and `jev`) against the real APIs. `MONTY_BIN=/path/to/monty cargo test --test live --features code-mode -- --ignored` runs those checks and code mode with all five built-in packs as well. Both need all four keys. The first costs a few cents; code mode adds a multi-turn Sonnet run, about ten cents more.
+The live tests call the real APIs and are ignored by default. They need `ANTHROPIC_API_KEY`, `FIRECRAWL_API_KEY`, `TYPESAFE_API_KEY` and `TYPESAFE_DEFAULT_MODEL`:
+
+```bash
+cargo test --test live -- --ignored
+```
+
+This checks every model, the three client tools (`web_search`, `fetch_page` and `jev`) and the Firecrawl endpoints `gov_search`, `map`, a three-page PDF scrape with page markers and `credit_usage`. It costs a few cents of Claude and under about 20 Firecrawl credits. Adding code mode also needs `MONTY_BIN`, the path of the `monty` worker:
+
+```bash
+MONTY_BIN=/path/to/monty cargo test --test live --features code-mode -- --ignored
+```
+
+That runs the same checks plus code mode with all five built-in packs, and `gov_search` and `map_site` through `FirecrawlPack`. It adds a multi-turn Sonnet run, about ten cents, and 1 more credit.
 
 ## License
 
