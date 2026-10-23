@@ -35,7 +35,8 @@ pub struct BatchWait<'a> {
     /// a progress display keeps updating. Returning [`Control::Cancel`] sends `/cancel`; once a
     /// cancel has been accepted, later `Cancel`s are ignored. A cancel that fails is logged and
     /// asked for again on the next poll.
-    pub on_poll: &'a mut dyn FnMut(&MessageBatch) -> Control,
+    /// It must be `Send` so the wait can run on a spawned task.
+    pub on_poll: &'a mut (dyn FnMut(&MessageBatch) -> Control + Send),
 }
 
 /// How a one-request batch ended.
@@ -505,7 +506,7 @@ mod tests {
     async fn await_one(
         client: &Anthropic,
         deadline: Option<OffsetDateTime>,
-        on_poll: &mut dyn FnMut(&MessageBatch) -> Control,
+        on_poll: &mut (dyn FnMut(&MessageBatch) -> Control + Send),
     ) -> Result<BatchOutcome> {
         await_done(client, Duration::from_millis(1), deadline, on_poll)
             .await
@@ -516,7 +517,7 @@ mod tests {
         client: &Anthropic,
         poll: Duration,
         deadline: Option<OffsetDateTime>,
-        on_poll: &mut dyn FnMut(&MessageBatch) -> Control,
+        on_poll: &mut (dyn FnMut(&MessageBatch) -> Control + Send),
     ) -> Result<BatchDone> {
         let wait = BatchWait {
             poll,
@@ -524,6 +525,17 @@ mod tests {
             on_poll,
         };
         client.await_one("msgbatch_1", "turn-1", wait).await
+    }
+
+    #[tokio::test]
+    async fn await_one_runs_on_a_spawned_task() {
+        // An app awaits this from a tokio::spawn'ed job, so the future must be Send.
+        let task = tokio::spawn(async {
+            let client = client("http://127.0.0.1:9".into()).with_max_retries(0);
+            let mut on_poll = |_: &MessageBatch| Control::Continue;
+            await_one(&client, None, &mut on_poll).await.is_err()
+        });
+        assert!(task.await.unwrap());
     }
 
     fn request_lines(recorded: &Mutex<Vec<crate::test_support::Recorded>>) -> Vec<String> {
