@@ -154,13 +154,13 @@ async fn run(args: &Args) -> topcoat_si::Result<()> {
             deadline: None,
             on_poll: &mut |_| Control::Continue,
         };
-        let outcome = client.await_one(&batch.id, &custom_id, wait).await?;
-        let ended = client.get_message_batch(&batch.id).await?;
-        let queue = ended
+        let done = client.await_one(&batch.id, &custom_id, wait).await?;
+        let queue = done
+            .batch
             .ended_at
-            .and_then(|ended_at| Duration::try_from(ended_at - ended.created_at).ok());
+            .and_then(|ended_at| Duration::try_from(ended_at - done.batch.created_at).ok());
 
-        let (usage, result) = match outcome {
+        let (usage, result) = match done.outcome {
             BatchOutcome::Succeeded(message) => {
                 let usage = message.usage.clone();
                 messages.push(MessageParam::from(message));
@@ -297,4 +297,10 @@ fn print_totals(rounds: &[Round]) {
         usages.len()
     );
     println!("  cost: ${:.4}", cost as f64 / MICRO_CENTS_PER_DOLLAR);
+    if batch_tier < usages.len() {
+        println!(
+            "  some results lack service_tier = batch: the cost column is at full price for \
+             those, and the real batch bill is half"
+        );
+    }
 }

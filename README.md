@@ -876,7 +876,7 @@ async fn run_batch(client: &Anthropic) -> topcoat_si::Result<()> {
 
 ### One request at a time
 
-`submit_one` sends one request as a batch of one. `await_one` waits for it and returns a `BatchOutcome`. They are separate calls, so you can save the batch id in between and resume the wait after a restart.
+`submit_one` sends one request as a batch of one. `await_one` waits for it and returns a `BatchDone`: the `BatchOutcome` and the batch as last polled. They are separate calls, so you can save the batch id in between and resume the wait after a restart.
 
 ```rust,no_run
 use std::time::Duration;
@@ -894,7 +894,11 @@ async fn ask(client: &Anthropic) -> topcoat_si::Result<()> {
         deadline: Some(OffsetDateTime::now_utc() + Duration::from_secs(12 * 60 * 60)),
         on_poll: &mut |_batch| Control::Continue,
     };
-    match client.await_one(&batch.id, "turn-1", wait).await? {
+    let done = client.await_one(&batch.id, "turn-1", wait).await?;
+    if let Some(ended_at) = done.batch.ended_at {
+        println!("took {}", ended_at - done.batch.created_at);
+    }
+    match done.outcome {
         BatchOutcome::Succeeded(message) => println!("{:?}", message.content),
         BatchOutcome::Errored(error) if error.is_retryable() => println!("submit again: {error}"),
         other => println!("{other:?}"),
@@ -903,8 +907,9 @@ async fn ask(client: &Anthropic) -> topcoat_si::Result<()> {
 }
 ```
 
-- `on_poll` runs after each poll that finds the batch still running. Return `Control::Cancel` to cancel the batch; `await_one` then waits for it to end, which is usually `BatchOutcome::Canceled`.
-- Past `deadline`, `await_one` returns `BatchOutcome::DeadlinePassed` and leaves the batch running. Cancel it yourself if you no longer want it.
+- `on_poll` runs after every poll that finds the batch still running, even after a cancel. Return `Control::Cancel` to cancel the batch; `await_one` then waits for it to end, which is usually `BatchOutcome::Canceled`. Later `Cancel`s are ignored. A cancel that fails is logged, and `on_poll` is asked again on the next poll.
+- Past `deadline`, `await_one` returns `BatchOutcome::DeadlinePassed` without calling `on_poll` and leaves the batch running. Cancel it yourself if you no longer want it. Once a cancel has been sent the deadline no longer applies, so `DeadlinePassed` always means the batch was not canceled.
+- `done.batch` is the ended batch, or for `DeadlinePassed` the last poll.
 - `BatchOutcome::Errored` holds an `Error` that keeps the API's error type, so `is_retryable` is true for an overloaded or other transient failure. Its HTTP status is `None`.
 - Failed polls are retried as in `wait_for_message_batch`.
 

@@ -95,8 +95,8 @@ pub enum ErrorKind {
     Api {
         /// The service that refused.
         service: Service,
-        /// The HTTP status; `None` for an `error` event inside a stream or a Firecrawl 2xx body
-        /// with `success: false`.
+        /// The HTTP status; `None` for an `error` event inside a stream, an errored message
+        /// batch result, or a Firecrawl 2xx body with `success: false`.
         status: Option<u16>,
         /// Anthropic's `error.type`, such as `overloaded_error`.
         error_type: Option<ErrorType>,
@@ -180,7 +180,7 @@ impl Error {
     }
 
     /// Builds a [`ErrorKind::Api`] error, for example to simulate a 429 in a test. A `status` of
-    /// `None` is an `error` event inside a stream.
+    /// `None` is an `error` event inside a stream or an errored message batch result.
     pub fn api(
         service: Service,
         status: Option<u16>,
@@ -290,8 +290,8 @@ impl Error {
         self.request_id.as_deref()
     }
 
-    /// The HTTP status of an [`ErrorKind::Api`] error; `None` for every other kind and for an
-    /// `error` event inside a stream.
+    /// The HTTP status of an [`ErrorKind::Api`] error; `None` for every other kind, for an
+    /// `error` event inside a stream and for an errored message batch result.
     #[must_use]
     pub fn status(&self) -> Option<u16> {
         match self.kind.as_ref() {
@@ -320,8 +320,9 @@ impl Error {
     ///
     /// True for [`ErrorKind::Connection`], [`ErrorKind::Timeout`] and
     /// [`ErrorKind::Interrupted`]; for HTTP 408, 409, 429 and 5xx, except a 429 for an
-    /// exhausted spend limit; and for stream `error` events that say they are retryable or, when
-    /// they don't say, have a transient type. False for everything else.
+    /// exhausted spend limit; for stream `error` events that say they are retryable or, when
+    /// they don't say, have a transient type; and for errored batch results of a transient
+    /// type. False for everything else.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self.kind.as_ref() {

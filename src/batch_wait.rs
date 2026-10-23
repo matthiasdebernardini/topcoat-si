@@ -31,8 +31,10 @@ pub struct BatchWait<'a> {
     /// When to stop waiting, as wall-clock time so it survives a restart. `None` waits until
     /// the batch ends, which the API bounds at 24 hours.
     pub deadline: Option<OffsetDateTime>,
-    /// Called after each poll that finds the batch still running. Returning
-    /// [`Control::Cancel`] cancels the batch once; it is not called again after that.
+    /// Called after each poll that finds the batch still running, including after a cancel, so
+    /// a progress display keeps updating. Returning [`Control::Cancel`] sends `/cancel`; once a
+    /// cancel has been accepted, later `Cancel`s are ignored. A cancel that fails is logged and
+    /// asked for again on the next poll.
     pub on_poll: &'a mut dyn FnMut(&MessageBatch) -> Control,
 }
 
@@ -53,6 +55,17 @@ pub enum BatchOutcome {
     Expired,
     /// The deadline passed while the batch was still running. The batch was not canceled.
     DeadlinePassed,
+}
+
+/// The end of [`Anthropic::await_one`]: the outcome and the batch as last polled.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct BatchDone {
+    /// The ended batch, or for [`BatchOutcome::DeadlinePassed`] the last poll. Its `ended_at`
+    /// minus `created_at` is the time the batch took.
+    pub batch: MessageBatch,
+    /// How the request ended.
+    pub outcome: BatchOutcome,
 }
 
 impl Anthropic {
@@ -112,51 +125,86 @@ impl Anthropic {
     ///
     /// Polls every `wait.poll`, retrying failed polls like [`Anthropic::wait_for_message_batch`].
     /// After each poll that finds the batch still running it calls `wait.on_poll`; on
-    /// [`Control::Cancel`] it sends `/cancel` and keeps waiting for the batch to end. Once
-    /// `wait.deadline` has passed and the batch is still running, it returns
-    /// [`BatchOutcome::DeadlinePassed`] without cancelling.
+    /// [`Control::Cancel`] it sends `/cancel` and keeps waiting for the batch to end. A failed
+    /// cancel is logged and does not end the wait.
+    ///
+    /// Once `wait.deadline` has passed and the batch is still running, it returns
+    /// [`BatchOutcome::DeadlinePassed`] without calling `wait.on_poll` and without cancelling.
+    /// After a cancel has been accepted the deadline no longer applies: a canceling batch ends
+    /// within seconds, and `DeadlinePassed` always means the batch was not canceled.
     ///
     /// # Errors
     ///
-    /// A validation error, before any request, when `wait.poll` is zero; the error from a poll,
-    /// the cancel or the results that ended the wait; and a decode error when the results hold
+    /// A validation error, before any request, when `wait.poll` is zero; the error from a poll
+    /// or the results that ended the wait; and a decode error when the results hold
     /// no result for `custom_id`, or one of a type this crate does not know.
     pub async fn await_one(
         &self,
         message_batch_id: &str,
         custom_id: &str,
         wait: BatchWait<'_>,
-    ) -> Result<BatchOutcome> {
+    ) -> Result<BatchDone> {
         check_poll_interval(wait.poll)?;
         let mut failures = 0;
         let mut canceled = false;
+        let mut last = None;
         loop {
-            if let Some(batch) = self
+            let deadline_passed = !canceled
+                && wait
+                    .deadline
+                    .is_some_and(|deadline| OffsetDateTime::now_utc() >= deadline);
+            match self
                 .poll_message_batch(message_batch_id, &mut failures)
                 .await?
             {
-                if batch.processing_status == MessageBatchProcessingStatus::Ended {
-                    return self.one_result(message_batch_id, custom_id).await;
+                Some(batch) if batch.processing_status == MessageBatchProcessingStatus::Ended => {
+                    return self.one_result(batch, custom_id).await;
                 }
-                if !canceled && (wait.on_poll)(&batch) == Control::Cancel {
-                    self.cancel_message_batch(message_batch_id).await?;
-                    canceled = true;
+                Some(batch) if deadline_passed => {
+                    return Ok(BatchDone {
+                        batch,
+                        outcome: BatchOutcome::DeadlinePassed,
+                    });
                 }
-            }
-            if wait
-                .deadline
-                .is_some_and(|deadline| OffsetDateTime::now_utc() >= deadline)
-            {
-                return Ok(BatchOutcome::DeadlinePassed);
+                Some(batch) => {
+                    let control = (wait.on_poll)(&batch);
+                    if !canceled && control == Control::Cancel {
+                        match self.cancel_message_batch(message_batch_id).await {
+                            Ok(batch)
+                                if batch.processing_status
+                                    == MessageBatchProcessingStatus::Ended =>
+                            {
+                                return self.one_result(batch, custom_id).await;
+                            }
+                            Ok(_) => canceled = true,
+                            Err(error) => tracing::warn!(
+                                target: "topcoat_si::client",
+                                error = &error as &dyn std::error::Error,
+                                batch_id = message_batch_id,
+                                "cancelling the message batch failed; polling again"
+                            ),
+                        }
+                    }
+                    last = Some(batch);
+                }
+                None => {
+                    if deadline_passed && let Some(batch) = last.take() {
+                        return Ok(BatchDone {
+                            batch,
+                            outcome: BatchOutcome::DeadlinePassed,
+                        });
+                    }
+                }
             }
             tokio::time::sleep(wait.poll).await;
         }
     }
 
-    /// Reads the result for `custom_id` from an ended batch.
-    async fn one_result(&self, message_batch_id: &str, custom_id: &str) -> Result<BatchOutcome> {
+    /// Reads the result for `custom_id` from `batch`, which has ended.
+    async fn one_result(&self, batch: MessageBatch, custom_id: &str) -> Result<BatchDone> {
+        let message_batch_id = batch.id.as_str();
         let mut results = self.message_batch_results_by_id(message_batch_id).await?;
-        match results.remove(custom_id) {
+        let outcome = match results.remove(custom_id) {
             Some(MessageBatchResultVariant::Succeeded { message }) => {
                 Ok(BatchOutcome::Succeeded(message))
             }
@@ -173,7 +221,8 @@ impl Anthropic {
                 ErrorKind::Decode,
                 format!("batch {message_batch_id} has no result for {custom_id}"),
             )),
-        }
+        }?;
+        Ok(BatchDone { batch, outcome })
     }
 
     /// Polls the batch once. A retryable failure gives `None` and counts toward the limit of
@@ -253,6 +302,8 @@ fn check_poll_interval(poll_interval: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::test_support::{Canned, serve};
 
@@ -450,13 +501,37 @@ mod tests {
         deadline: Option<OffsetDateTime>,
         on_poll: &mut dyn FnMut(&MessageBatch) -> Control,
     ) -> Result<BatchOutcome> {
+        await_done(client, Duration::from_millis(1), deadline, on_poll)
+            .await
+            .map(|done| done.outcome)
+    }
+
+    async fn await_done(
+        client: &Anthropic,
+        poll: Duration,
+        deadline: Option<OffsetDateTime>,
+        on_poll: &mut dyn FnMut(&MessageBatch) -> Control,
+    ) -> Result<BatchDone> {
         let wait = BatchWait {
-            poll: Duration::from_millis(1),
+            poll,
             deadline,
             on_poll,
         };
         client.await_one("msgbatch_1", "turn-1", wait).await
     }
+
+    fn request_lines(recorded: &Mutex<Vec<crate::test_support::Recorded>>) -> Vec<String> {
+        recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.headers.lines().next().unwrap().to_string())
+            .collect()
+    }
+
+    const POLL_LINE: &str = "GET /v1/messages/batches/msgbatch_1 HTTP/1.1";
+    const CANCEL_LINE: &str = "POST /v1/messages/batches/msgbatch_1/cancel HTTP/1.1";
+    const RESULTS_LINE: &str = "GET /v1/messages/batches/msgbatch_1/results HTTP/1.1";
 
     #[tokio::test]
     async fn submit_then_await_returns_the_message() {
@@ -471,7 +546,7 @@ mod tests {
 
         let submitted = client.submit_one("turn-1", params()).await.unwrap();
         let mut polls = 0;
-        let outcome = await_one(&client, None, &mut |batch| {
+        let done = await_done(&client, Duration::from_millis(1), None, &mut |batch| {
             assert_eq!(
                 batch.processing_status,
                 MessageBatchProcessingStatus::InProgress
@@ -483,7 +558,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(submitted.id, "msgbatch_1");
-        assert!(matches!(outcome, BatchOutcome::Succeeded(message) if message.id == "msg_1"));
+        assert!(matches!(done.outcome, BatchOutcome::Succeeded(message) if message.id == "msg_1"));
+        assert_eq!(
+            done.batch.processing_status,
+            MessageBatchProcessingStatus::Ended
+        );
         assert_eq!(polls, 1);
         let requests = recorded.lock().unwrap();
         let lines: Vec<_> = requests
@@ -560,9 +639,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_from_on_poll_sends_cancel_once() {
+    async fn cancel_from_on_poll_sends_cancel_once_and_keeps_reporting_polls() {
         let (base_url, recorded) = serve(vec![
             Canned::json(200, batch("in_progress")),
+            Canned::json(200, batch("canceling")),
             Canned::json(200, batch("canceling")),
             Canned::json(200, batch("canceling")),
             Canned::json(200, batch("ended")),
@@ -579,21 +659,105 @@ mod tests {
         .unwrap();
 
         assert!(matches!(outcome, BatchOutcome::Canceled));
-        assert_eq!(polls, 1);
-        let requests = recorded.lock().unwrap();
-        assert_eq!(requests.len(), 5);
-        assert!(
-            requests[1]
-                .headers
-                .starts_with("POST /v1/messages/batches/msgbatch_1/cancel "),
-            "{}",
-            requests[1].headers
+        assert_eq!(polls, 3);
+        assert_eq!(
+            request_lines(&recorded),
+            [
+                POLL_LINE,
+                CANCEL_LINE,
+                POLL_LINE,
+                POLL_LINE,
+                POLL_LINE,
+                RESULTS_LINE
+            ]
         );
-        let cancels = requests
-            .iter()
-            .filter(|request| request.headers.contains("/cancel "))
-            .count();
-        assert_eq!(cancels, 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_answers_ended_reads_the_result_at_once() {
+        let (base_url, recorded) = serve(vec![
+            Canned::json(200, batch("in_progress")),
+            Canned::json(200, batch("ended")),
+            results("turn-1", r#"{"type":"canceled"}"#),
+        ])
+        .await;
+
+        let done = await_done(
+            &client(base_url),
+            Duration::from_millis(1),
+            None,
+            &mut |_| Control::Cancel,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(done.outcome, BatchOutcome::Canceled));
+        assert_eq!(
+            done.batch.processing_status,
+            MessageBatchProcessingStatus::Ended
+        );
+        assert_eq!(
+            request_lines(&recorded),
+            [POLL_LINE, CANCEL_LINE, RESULTS_LINE]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_cancel_keeps_waiting_and_asks_again() {
+        let (base_url, recorded) = serve(vec![
+            Canned::json(200, batch("in_progress")),
+            unavailable(),
+            Canned::json(200, batch("in_progress")),
+            Canned::json(200, batch("canceling")),
+            Canned::json(200, batch("ended")),
+            results("turn-1", r#"{"type":"canceled"}"#),
+        ])
+        .await;
+
+        let mut polls = 0;
+        let outcome = await_one(&client(base_url).with_max_retries(0), None, &mut |_| {
+            polls += 1;
+            Control::Cancel
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, BatchOutcome::Canceled));
+        assert_eq!(polls, 2);
+        assert_eq!(
+            request_lines(&recorded),
+            [
+                POLL_LINE,
+                CANCEL_LINE,
+                POLL_LINE,
+                CANCEL_LINE,
+                POLL_LINE,
+                RESULTS_LINE
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_cancel_then_an_ended_poll_returns_the_result() {
+        let (base_url, recorded) = serve(vec![
+            Canned::json(200, batch("in_progress")),
+            unavailable(),
+            Canned::json(200, batch("ended")),
+            results("turn-1", &succeeded()),
+        ])
+        .await;
+
+        let outcome = await_one(&client(base_url).with_max_retries(0), None, &mut |_| {
+            Control::Cancel
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, BatchOutcome::Succeeded(_)));
+        assert_eq!(
+            request_lines(&recorded),
+            [POLL_LINE, CANCEL_LINE, POLL_LINE, RESULTS_LINE]
+        );
     }
 
     #[tokio::test]
@@ -605,16 +769,57 @@ mod tests {
         .await;
 
         let deadline = OffsetDateTime::now_utc() - time::Duration::seconds(1);
-        let outcome = await_one(&client(base_url), Some(deadline), &mut |_| {
-            Control::Continue
-        })
+        let mut polls = 0;
+        let done = await_done(
+            &client(base_url),
+            Duration::from_millis(1),
+            Some(deadline),
+            &mut |_| {
+                polls += 1;
+                Control::Cancel
+            },
+        )
         .await
         .unwrap();
 
-        assert!(matches!(outcome, BatchOutcome::DeadlinePassed));
-        let requests = recorded.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].headers.starts_with("GET "));
+        assert!(matches!(done.outcome, BatchOutcome::DeadlinePassed));
+        assert_eq!(
+            done.batch.processing_status,
+            MessageBatchProcessingStatus::InProgress
+        );
+        assert_eq!(polls, 0);
+        assert_eq!(request_lines(&recorded), [POLL_LINE]);
+    }
+
+    #[tokio::test]
+    async fn the_deadline_is_ignored_once_a_cancel_is_sent() {
+        let (base_url, recorded) = serve(vec![
+            Canned::json(200, batch("in_progress")),
+            Canned::json(200, batch("canceling")),
+            Canned::json(200, batch("canceling")),
+            Canned::json(200, batch("ended")),
+            results("turn-1", r#"{"type":"canceled"}"#),
+        ])
+        .await;
+
+        // The first poll comes well before the deadline; the second, after the cancel, well
+        // after it.
+        let deadline = OffsetDateTime::now_utc() + time::Duration::milliseconds(200);
+        let outcome = await_done(
+            &client(base_url),
+            Duration::from_millis(400),
+            Some(deadline),
+            &mut |_| Control::Cancel,
+        )
+        .await
+        .unwrap()
+        .outcome;
+
+        assert!(matches!(outcome, BatchOutcome::Canceled));
+        assert_eq!(
+            request_lines(&recorded),
+            [POLL_LINE, CANCEL_LINE, POLL_LINE, POLL_LINE, RESULTS_LINE]
+        );
     }
 
     #[tokio::test]
