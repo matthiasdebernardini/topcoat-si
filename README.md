@@ -1330,7 +1330,7 @@ This checks every model, the three client tools (`web_search`, `fetch_page` and 
 MONTY_BIN=/path/to/monty cargo test --test live --features code-mode -- --ignored
 ```
 
-That runs the same checks plus code mode with all five built-in packs, and `gov_search` and `map_site` through `FirecrawlPack`. It adds a multi-turn Sonnet run, about ten cents, and Firecrawl credits: 1 for the pack test and up to 20 for the code mode run, which its pack budget caps and which typically uses well under that. A full run uses at most about 28 credits.
+That runs the same checks plus code mode with all five built-in packs, and `gov_search` and `map_site` through `FirecrawlPack`. It adds a multi-turn Sonnet run, about ten cents, and Firecrawl credits: 1 for the pack test and about 20 for the code mode run, which its pack budgets at 20 (the last call can overshoot by its own cost) and which typically uses well under that. A full run uses at most about 28 credits.
 
 ## License
 

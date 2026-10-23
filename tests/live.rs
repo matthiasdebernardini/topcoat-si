@@ -15,7 +15,8 @@
 //! - `firecrawl_endpoints_answer`: about 4, and no Claude;
 //! - `code_mode_firecrawl_pack_answers`: about 1, and a few cents of Haiku;
 //! - `client_tools_answer`: about 3, one search and one page;
-//! - `code_mode_answers`: capped at 20 by its pack budget, typically well under that.
+//! - `code_mode_answers`: budgeted at 20 by its pack (the last call can overshoot by its own
+//!   cost), typically well under that.
 //!
 //! A full code mode run typically uses well under 20 credits, and at most about 28.
 
