@@ -1006,7 +1006,8 @@ impl Crawler {
 
     async fn map(&self, request: MapRequest) -> std::result::Result<Vec<MapLink>, HostError> {
         const FUNCTION: &str = "map_site";
-        // Firecrawl bills a map 1 credit, however many links come back.
+        // Reserve the 1 credit Firecrawl bills a map, however many links come back; a cache
+        // hit settles to 0.
         const RESERVED: u64 = 1;
         let url = request.url.trim().to_string();
         let raised = |error: &Error| format!("Could not map {url}: {error}");
