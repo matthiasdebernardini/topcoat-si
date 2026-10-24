@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
+use ::turbopuffer::types::Id;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::ClientTool;
 use crate::code_mode::{HostError, Pack, PyError, host_fn, value};
-use crate::turbopuffer::{DocumentId, SearchMode, TurbopufferSearch};
+use crate::turbopuffer::{SearchMode, TurbopufferSearch};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,7 +23,7 @@ struct SearchArgs {
 /// One hit as the sandbox's search functions return it.
 #[derive(Serialize)]
 struct PackHit {
-    id: DocumentId,
+    id: Id,
     score: f64,
     text: Option<String>,
     attributes: Map<String, Value>,

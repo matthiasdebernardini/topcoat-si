@@ -2227,15 +2227,15 @@ async fn firecrawl_empty_search_still_costs_credits_and_bad_ranges_send_nothing(
 
 #[cfg(feature = "turbopuffer")]
 fn turbopuffer_pack(url: &str) -> Pack {
-    use crate::turbopuffer::{TurbopufferClient, TurbopufferSearch};
+    use crate::turbopuffer::{Client, TurbopufferSearch};
 
-    let namespace = TurbopufferClient::try_new("tpuf-test-key", "gcp-us-central1")
+    let namespace = Client::builder()
+        .base_url(url)
+        .api_key("k")
+        .max_retries(0)
+        .build()
         .unwrap()
-        .with_base_url(url)
-        .unwrap()
-        .with_max_retries(0)
-        .namespace("acme-help", "voyage/voyage-4-lite")
-        .unwrap();
+        .namespace("acme-help");
     let search = TurbopufferSearch::try_new(namespace, "search_help", "help articles").unwrap();
     packs::turbopuffer([search])
 }
@@ -2244,9 +2244,20 @@ fn turbopuffer_pack(url: &str) -> Pack {
 #[tokio::test]
 async fn turbopuffer_pack_returns_hits_as_dicts() {
     let (url, recorded) = serve(vec![
-        ok(json!({"rows": [
-            {"id": "refunds", "$dist": 2.5, "text": "Refunds take 5 days.", "title": "Refunds"}
-        ]})),
+        ok(json!({
+            "rows": [
+                {"id": "refunds", "$dist": 2.5, "text": "Refunds take 5 days.", "title": "Refunds"}
+            ],
+            "billing": {"billable_logical_bytes_queried": 0, "billable_logical_bytes_returned": 0},
+            "performance": {
+                "approx_namespace_size": 1,
+                "cache_hit_ratio": 1.0,
+                "cache_temperature": "hot",
+                "exhaustive_search_count": 0,
+                "query_execution_ms": 1,
+                "server_total_ms": 1
+            }
+        })),
         Canned::json(404, json!({"error": "namespace not found"}).to_string()),
         Canned::json(409, json!({"error": "index is still building"}).to_string()),
     ])

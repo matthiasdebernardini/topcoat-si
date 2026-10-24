@@ -114,8 +114,8 @@ pub enum ErrorKind {
         retryable: Option<bool>,
     },
     /// The response started, then stopped: the connection dropped mid-body, or a stream ended
-    /// before `message_stop`. Only GET requests and turbopuffer queries are resent automatically;
-    /// the server has already answered any other request.
+    /// before `message_stop`. Only GET requests are resent automatically; the server has already
+    /// answered a POST or DELETE.
     Interrupted,
     /// A success response arrived but is not what was expected: bad JSON, bad SSE framing or
     /// UTF-8, or a bad batch result line.
@@ -488,6 +488,66 @@ pub(crate) fn map_reqwest_error(err: reqwest::Error, phase: RequestPhase) -> Err
         }
     };
     Error::new(kind, message).with_source(err)
+}
+
+// Server text can echo the caller's data, so only this much of it reaches an error.
+#[cfg(feature = "turbopuffer")]
+const MAX_TURBOPUFFER_ERROR_CHARS: usize = 200;
+
+/// Maps a turbopuffer SDK failure onto this crate's kinds, so callers and the search tool can
+/// tell a refusal, a timeout and a broken connection apart the same way as for other services.
+#[cfg(feature = "turbopuffer")]
+impl From<turbopuffer::Error> for Error {
+    fn from(error: turbopuffer::Error) -> Self {
+        match error {
+            turbopuffer::Error::Api(api) => Error::http_status(
+                Service::Turbopuffer,
+                api.status.as_u16(),
+                // Only the JSON `error` string: the SDK's `message` falls back to the raw body.
+                api.body
+                    .as_ref()
+                    .and_then(|body| body.get("error"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|detail| {
+                        crate::http::truncate_chars(detail, MAX_TURBOPUFFER_ERROR_CHARS, "")
+                    }),
+                None,
+                None,
+                api.request_id().map(String::from),
+                crate::types::retry_after_from_headers(&api.headers),
+            ),
+            turbopuffer::Error::Timeout | turbopuffer::Error::OperationTimeout { .. } => {
+                Error::new(ErrorKind::Timeout, "turbopuffer request timed out").with_source(error)
+            }
+            turbopuffer::Error::Connection(err) => {
+                // A failed body read means the response had started.
+                let phase = if err.is_body() || err.is_decode() {
+                    RequestPhase::Body
+                } else {
+                    RequestPhase::Headers
+                };
+                map_reqwest_error(err, phase)
+            }
+            // The serde error and the body quote response content, so only the position is kept.
+            turbopuffer::Error::Decode { source, body } => Error::new(
+                ErrorKind::Decode,
+                format!(
+                    "Failed to parse turbopuffer response ({} bytes): {}",
+                    body.len(),
+                    describe_json_error(&source)
+                ),
+            ),
+            turbopuffer::Error::InvalidPathParam { name, .. } => {
+                let message = error.to_string();
+                Error::validation(message, Some(name.to_string()))
+            }
+            error => Error::validation(
+                format!("turbopuffer request failed before sending: {error}"),
+                None,
+            )
+            .with_source(error),
+        }
+    }
 }
 
 #[cfg(test)]

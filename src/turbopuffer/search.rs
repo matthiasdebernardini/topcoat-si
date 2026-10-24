@@ -2,11 +2,10 @@
 
 use futures::future::BoxFuture;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use turbopuffer::Namespace;
+use turbopuffer::types::{Expr, Filter, Id, Query, RankBy, RerankBy, Row};
 
-use super::filter::Filter;
-use super::namespace::Namespace;
-use super::query::{Hit, Query, SearchMode};
 use crate::ClientTool;
 use crate::error::{Error, ErrorKind, Result};
 use crate::http;
@@ -20,6 +19,34 @@ const MAX_MODEL_LIMIT: u32 = 10;
 const DEFAULT_LIMIT: u32 = 5;
 const DEFAULT_MAX_TEXT_CHARS: usize = 4000;
 const MAX_NAME_CHARS: usize = 64;
+// Keeps the stored vectors out of every response.
+const EXCLUDED_ATTRIBUTES: [&str; 1] = ["embed_text"];
+
+/// How the tool ranks documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum SearchMode {
+    /// Vector and keyword results fused server-side with reciprocal rank fusion: matches both
+    /// meaning and exact words.
+    #[default]
+    Hybrid,
+    /// Nearest neighbors of the query's embedding: matches meaning and paraphrase.
+    Vector,
+    /// BM25 full-text ranking: matches exact words, names, codes and ids.
+    Keyword,
+}
+
+/// One matching document, as the tool and the code-mode pack use it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Hit {
+    pub(crate) id: Id,
+    pub(crate) text: Option<String>,
+    /// Higher is better in every mode; not comparable across modes. Hybrid: the RRF score.
+    /// Vector: cosine similarity, `1 - cosine distance`. Keyword: the BM25 score.
+    pub(crate) score: f64,
+    pub(crate) attributes: Map<String, Value>,
+}
 
 /// A turbopuffer namespace exposed to Claude as a client-side search tool.
 ///
@@ -83,10 +110,10 @@ impl TurbopufferSearch {
 
     /// Only ever return documents matching `filter`.
     ///
-    /// A filter with an empty `all` or `any` anywhere is rejected here, since every search would
-    /// fail on it.
+    /// A filter with an empty `And` or `Or` anywhere is rejected here, since it would match
+    /// everything or fail every search.
     pub fn with_filter(mut self, filter: Filter) -> Result<Self> {
-        filter.validate()?;
+        validate_filter(&filter)?;
         self.filter = Some(filter);
         Ok(self)
     }
@@ -117,37 +144,87 @@ impl TurbopufferSearch {
         limit: Option<u32>,
         mode: SearchMode,
     ) -> Result<std::result::Result<Vec<Hit>, String>> {
-        let limit = limit
-            .unwrap_or(self.default_limit)
-            .clamp(1, MAX_MODEL_LIMIT);
-        let mut request = Query::new(query).with_mode(mode).with_limit(limit);
-        if let Some(filter) = &self.filter {
-            request = request.with_filter(filter.clone());
+        if query.trim().is_empty() {
+            return Ok(Err(Error::validation(
+                "query text must not be empty",
+                Some("query".to_string()),
+            )
+            .to_string()));
         }
-        match self.namespace.query(&request).await {
-            Ok(response) => Ok(Ok(response
-                .hits
-                .into_iter()
-                .map(|mut hit| {
-                    hit.text = hit.text.map(|text| {
-                        http::truncate_chars(&text, self.max_text_chars, " [truncated]")
-                    });
-                    hit
-                })
-                .collect())),
+        let limit = u64::from(
+            limit
+                .unwrap_or(self.default_limit)
+                .clamp(1, MAX_MODEL_LIMIT),
+        );
+        let rows = match mode {
+            SearchMode::Hybrid => self.hybrid(&query, limit).await,
+            SearchMode::Vector => self.single(vector(&query), limit).await,
+            SearchMode::Keyword => self.single(keyword(&query), limit).await,
+        };
+        let hits = rows.and_then(|rows| {
+            rows.into_iter()
+                .map(|row| hit(row, mode, self.max_text_chars))
+                .collect::<Result<Vec<Hit>>>()
+        });
+        match hits {
+            Ok(hits) => Ok(Ok(hits)),
             Err(error) if error.status() == Some(404) => {
                 tracing::warn!(
-                    namespace = self.namespace.name(),
+                    namespace = self.namespace.id(),
                     "turbopuffer namespace not found; answering with no documents"
                 );
                 Ok(Ok(Vec::new()))
             }
             Err(error) if is_fatal(&error) => Err(error),
-            Err(error) if matches!(error.kind(), ErrorKind::Validation { .. }) => {
-                Ok(Err(error.to_string()))
-            }
             Err(error) => Ok(Err(format!("Search failed: {error}"))),
         }
+    }
+
+    /// A vector and a keyword subquery fused with RRF.
+    async fn hybrid(&self, query: &str, limit: u64) -> Result<Vec<Row>> {
+        let subquery = |rank_by: RankBy| {
+            let subquery = Query::new()
+                .rank_by(rank_by)
+                .limit(limit)
+                .exclude_attributes(EXCLUDED_ATTRIBUTES);
+            match &self.filter {
+                Some(filter) => subquery.filters(filter.clone()),
+                None => subquery,
+            }
+        };
+        let response = self
+            .namespace
+            .multi_query([subquery(vector(query)), subquery(keyword(query))])
+            .rerank_by(RerankBy::rrf())
+            .limit(limit)
+            .send()
+            .await?;
+        // With rerank_by the server answers with one fused result.
+        response
+            .results
+            .into_iter()
+            .next()
+            .map(|result| result.rows)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Decode,
+                    "turbopuffer hybrid response has no results",
+                )
+            })
+    }
+
+    async fn single(&self, rank_by: RankBy, limit: u64) -> Result<Vec<Row>> {
+        let request = self
+            .namespace
+            .query()
+            .rank_by(rank_by)
+            .limit(limit)
+            .exclude_attributes(EXCLUDED_ATTRIBUTES);
+        let request = match &self.filter {
+            Some(filter) => request.filters(filter.clone()),
+            None => request,
+        };
+        Ok(request.send().await?.rows)
     }
 
     async fn run(&self, tool_use: &ToolUseBlock) -> Result<ToolResultBlock> {
@@ -189,7 +266,7 @@ impl TurbopufferSearch {
         let mut attributes = hit.attributes;
         let source = match attributes.remove("url") {
             Some(Value::String(url)) if !url.trim().is_empty() => url,
-            _ => format!("turbopuffer://{}/{}", self.namespace.name(), hit.id),
+            _ => format!("turbopuffer://{}/{}", self.namespace.id(), hit.id),
         };
         let title = match attributes.remove("title") {
             Some(Value::String(title)) if !title.trim().is_empty() => title,
@@ -271,11 +348,68 @@ struct ToolInput {
     mode: Option<SearchMode>,
 }
 
-// Only these failures are the developer's to fix (401, 403 and other unexpected statuses);
-// everything else goes back to the model. 404 is handled before this is asked.
+// The query embeds through the model set on the `text` attribute when it was written.
+fn vector(query: &str) -> RankBy {
+    RankBy::ann("text", Expr::embed(query))
+}
+
+fn keyword(query: &str) -> RankBy {
+    RankBy::bm25("text", query).into()
+}
+
+/// One response row as a hit: `$dist` and `text` taken out, `embed_text` dropped and the text
+/// cut to `max_text_chars`.
+fn hit(row: Row, mode: SearchMode, max_text_chars: usize) -> Result<Hit> {
+    let dist = row
+        .dist()
+        .ok_or_else(|| Error::new(ErrorKind::Decode, "turbopuffer row has no $dist score"))?;
+    let mut attributes = row.extra;
+    attributes.remove("$dist");
+    attributes.remove("embed_text");
+    let text = match attributes.remove("text") {
+        Some(Value::String(text)) => {
+            Some(http::truncate_chars(&text, max_text_chars, " [truncated]"))
+        }
+        _ => None,
+    };
+    let score = match mode {
+        SearchMode::Vector => 1.0 - dist,
+        SearchMode::Hybrid | SearchMode::Keyword => dist,
+    };
+    Ok(Hit {
+        id: row.id,
+        text,
+        score,
+        attributes: attributes.into_iter().collect(),
+    })
+}
+
+/// Rejects an empty `And` or `Or` anywhere in `filter`.
+fn validate_filter(filter: &Filter) -> Result<()> {
+    match filter {
+        Filter::And { filters } | Filter::Or { filters } if filters.is_empty() => {
+            Err(Error::validation(
+                "a Filter::and or Filter::or must hold at least one filter",
+                Some("filter".to_string()),
+            ))
+        }
+        Filter::And { filters } | Filter::Or { filters } => {
+            filters.iter().try_for_each(validate_filter)
+        }
+        Filter::Not { filter } => validate_filter(filter),
+        _ => Ok(()),
+    }
+}
+
+// Only these failures are the developer's to fix (401, 403, other unexpected statuses, and a
+// request the SDK could not build); everything else goes back to the model. 404 is handled
+// before this is asked, and a blank query never reaches the SDK.
 fn is_fatal(error: &Error) -> bool {
+    if matches!(error.kind(), ErrorKind::Validation { .. }) {
+        return true;
+    }
     match error.status() {
-        // 409: the query depends on an index still being built. The client has already retried
+        // 409: the query depends on an index still being built. The SDK has already retried
         // it, and a later call can still work.
         Some(400 | 408 | 409 | 429 | 500..=599) => false,
         Some(_) => true,
