@@ -4,7 +4,7 @@ use std::io;
 
 use serde::Deserialize;
 use serde_json::json;
-use topcoat_si::{
+use carpa::{
     AccumulatingStream, Anthropic, ContentBlock, ContentBlockDelta, KnownModel, Message,
     MessageCreateParams, MessageParam, MessageRole, MessageStreamEvent, Model, StopReason,
     ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock,
@@ -50,7 +50,7 @@ fn run_tool(tool_use: &ToolUseBlock) -> ToolResultBlock {
 /// Whether sending a failed stream's request again is clean: the error is retryable and the
 /// stream had not yielded an event yet. The crate never resends a stream itself.
 fn clean_to_resend(err: &(dyn Error + 'static)) -> bool {
-    err.downcast_ref::<topcoat_si::Error>()
+    err.downcast_ref::<carpa::Error>()
         .is_some_and(|err| err.is_retryable() && err.events_delivered().unwrap_or(0) == 0)
 }
 

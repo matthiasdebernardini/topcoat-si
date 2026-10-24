@@ -1,7 +1,7 @@
 //! Helpers shared by the open (forward-compatible) tagged unions and string enums.
 //!
 //! A value the API sends that this crate does not know becomes the type's catch-all variant
-//! and is logged as a warning on the `topcoat_si::unknown` target the first time it appears in
+//! and is logged as a warning on the `carpa::unknown` target the first time it appears in
 //! the process, so a new API value shows up in the logs instead of failing the whole reply.
 
 use std::collections::{HashMap, HashSet};
@@ -67,10 +67,10 @@ pub(crate) fn warn_unknown(type_name: &'static str, tag: &str) {
         return;
     }
     tracing::warn!(
-        target: "topcoat_si::unknown",
+        target: "carpa::unknown",
         rust_type = type_name,
         tag = tag.as_str(),
-        "unknown API value; update topcoat-si to read it"
+        "unknown API value; update carpa to read it"
     );
 }
 

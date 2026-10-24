@@ -7,8 +7,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use topcoat_si::turbopuffer::{Client, Filter, Namespace, TurbopufferSearch};
-use topcoat_si::{
+use carpa::turbopuffer::{Client, Filter, Namespace, TurbopufferSearch};
+use carpa::{
     Anthropic, Citation, ClientTool, ContentBlock, KnownModel, MessageCreateParams, MessageParam,
     Model,
 };
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
-    let help = client.namespace(format!("topcoat-si-example-{seconds}"));
+    let help = client.namespace(format!("carpa-example-{seconds}"));
     println!("namespace {}", help.id());
 
     let outcome = run(&help).await;
@@ -45,7 +45,7 @@ fn article(id: &str, text: &str, title: &str, url: Option<&str>, kind: &str) -> 
 }
 
 /// Upserts `rows` with the schema that has turbopuffer embed `text` and index it for BM25.
-async fn write(help: &Namespace, rows: Vec<Row>) -> topcoat_si::Result<()> {
+async fn write(help: &Namespace, rows: Vec<Row>) -> carpa::Result<()> {
     let written = help
         .write()
         .upsert_rows(rows)
@@ -69,7 +69,7 @@ async fn write(help: &Namespace, rows: Vec<Row>) -> topcoat_si::Result<()> {
     Ok(())
 }
 
-async fn run(help: &Namespace) -> topcoat_si::Result<()> {
+async fn run(help: &Namespace) -> carpa::Result<()> {
     // turbopuffer does not document the status for a namespace that was never written.
     match help
         .query()
@@ -199,7 +199,7 @@ fn print_rows(label: &str, rows: &[Row]) {
     }
 }
 
-async fn ask_claude(help: &Namespace) -> topcoat_si::Result<()> {
+async fn ask_claude(help: &Namespace) -> carpa::Result<()> {
     let anthropic = Anthropic::try_new(None)?;
     let search = TurbopufferSearch::try_new(help.clone(), "search_help", "Acme's help center")?;
     let params = MessageCreateParams::new(

@@ -2,7 +2,7 @@
 //!
 //! Needs ANTHROPIC_API_KEY and FIRECRAWL_API_KEY.
 
-use topcoat_si::{
+use carpa::{
     Anthropic, ContentBlock, FirecrawlClient, FirecrawlWebSearch, KnownModel, MessageCreateParams,
     MessageParam, MessageRole, Model, StopReason, ToolResultBlock,
 };
@@ -11,7 +11,7 @@ use topcoat_si::{
 const MAX_TURNS: usize = 8;
 
 #[tokio::main]
-async fn main() -> topcoat_si::Result<()> {
+async fn main() -> carpa::Result<()> {
     let client = Anthropic::try_new(None)?;
     let search = FirecrawlWebSearch::new(FirecrawlClient::from_env()?);
     let model = KnownModel::ClaudeHaiku55;

@@ -107,7 +107,7 @@ impl ToolParam {
     ///
     /// ```
     /// use serde_json::json;
-    /// use topcoat_si::ToolParam;
+    /// use carpa::ToolParam;
     ///
     /// let tool = ToolParam::new(
     ///     "get_weather".to_string(),

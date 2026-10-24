@@ -1,11 +1,11 @@
 [package]
-name = "topcoat-si"
+name = "carpa"
 version = "0.1.0"
 authors = ["Matthias Debernardini <matthias@nashvilleautomation.io>"]
 edition = "2024"
 description = "Superintelligence for Topcoat apps: Claude, Jev and Firecrawl"
 license = "Apache-2.0"
-repository = "https://github.com/matthiasdebernardini/topcoat-si"
+repository = "https://github.com/matthiasdebernardini/carpa"
 
 [workspace]
 members = [".", "evals"]

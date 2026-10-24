@@ -1,6 +1,6 @@
 //! Server-Sent Events (SSE) framing and decoding for streaming responses.
 //!
-//! This module provides the raw SSE parser used by Topcoat SI and
+//! This module provides the raw SSE parser used by Carpa and
 //! protocol-specific decoding helpers for Anthropic message streams.
 
 use bytes::Bytes;
@@ -190,7 +190,7 @@ impl SseState {
     }
 }
 
-/// Decode a raw [`SseEvent`] into a Topcoat SI [`MessageStreamEvent`].
+/// Decode a raw [`SseEvent`] into a Carpa [`MessageStreamEvent`].
 pub fn parse_message_stream_event(event: &SseEvent) -> Result<MessageStreamEvent> {
     match event.event.as_str() {
         "" if event.data.is_empty() => Ok(MessageStreamEvent::Ping),
@@ -222,7 +222,7 @@ pub fn parse_message_stream_event(event: &SseEvent) -> Result<MessageStreamEvent
     }
 }
 
-/// Process a stream of bytes into decoded Topcoat SI [`MessageStreamEvent`] values.
+/// Process a stream of bytes into decoded Carpa [`MessageStreamEvent`] values.
 ///
 /// An error item carries [`Error::events_delivered`]: the number of events other than pings
 /// yielded before it. `Some(0)` means sending the request again is clean. A stream whose bytes
@@ -306,7 +306,7 @@ struct MessageStreamState<E> {
 /// Framing errors pass through uncounted: `process_sse` already counted them.
 fn decode(result: Result<SseEvent>) -> Result<MessageStreamEvent> {
     let event = result?;
-    tracing::trace!(target: "topcoat_si::wire", event = %event.event, data = %event.data);
+    tracing::trace!(target: "carpa::wire", event = %event.event, data = %event.data);
     let decoded = parse_message_stream_event(&event);
     if decoded.is_err() {
         observability::stream_error();

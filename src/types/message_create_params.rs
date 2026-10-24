@@ -294,7 +294,7 @@ impl MessageCreateParams {
     ///
     /// ```
     /// use serde_json::json;
-    /// use topcoat_si::{MessageCreateParams, OutputConfig, OutputFormat, KnownModel};
+    /// use carpa::{MessageCreateParams, OutputConfig, OutputFormat, KnownModel};
     ///
     /// let params = MessageCreateParams::simple("Extract info", KnownModel::ClaudeHaiku55)
     ///     .with_output_config(OutputConfig::new().with_format(OutputFormat::json_schema(json!({

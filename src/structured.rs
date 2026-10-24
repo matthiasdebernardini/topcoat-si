@@ -47,7 +47,7 @@ impl OutputFormat {
     /// Builds a structured output format from `T`'s schemars schema.
     ///
     /// Deriving `JsonSchema` needs your own `schemars = "1"` dependency, on the same major
-    /// version Topcoat SI uses; a different major version's derive does not implement this trait.
+    /// version Carpa uses; a different major version's derive does not implement this trait.
     ///
     /// The schema is rewritten to the subset structured outputs accept, following the rules in
     /// <https://platform.claude.com/docs/en/build-with-claude/structured-outputs> ("JSON Schema
@@ -402,7 +402,7 @@ impl Anthropic {
     /// Sends `params` with `T`'s schema as the output format and parses the reply into `T`.
     ///
     /// `T` needs `#[derive(JsonSchema)]`, which needs your own `schemars = "1"` dependency on the
-    /// same major version Topcoat SI uses.
+    /// same major version Carpa uses.
     ///
     /// Sets `output_config.format` and keeps the other `output_config` fields, such as effort.
     /// Structured outputs cannot be combined with citations: a request that enables citations on

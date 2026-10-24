@@ -1,4 +1,4 @@
-//! Evals for topcoat-si. `code-mode` compares code mode with the plain tool loop on the same
+//! Evals for carpa. `code-mode` compares code mode with the plain tool loop on the same
 //! cases and models; `summarize` rebuilds a finished run's summary from its results file. See
 //! README.md in this directory.
 
@@ -19,7 +19,7 @@ use std::str::FromStr;
 
 use time::OffsetDateTime;
 use time::macros::format_description;
-use topcoat_si::KnownModel;
+use carpa::KnownModel;
 
 use crate::cases::{Case, Split};
 use crate::db::EvalDb;
@@ -34,9 +34,9 @@ const DEFAULT_MODELS: &str = "sonnet-5-5";
 const DEFAULT_REPEAT: u32 = 3;
 
 const USAGE: &str = "\
-Usage: topcoat-evals code-mode --budget-cents N [options]
-       topcoat-evals summarize <results.jsonl> [--save-baseline]
-       topcoat-evals summarize --db PATH [--run STAMP] [--save-baseline]
+Usage: carpa-evals code-mode --budget-cents N [options]
+       carpa-evals summarize <results.jsonl> [--save-baseline]
+       carpa-evals summarize --db PATH [--run STAMP] [--save-baseline]
 
 Runs every selected case with the tool loop and with code mode, grades each answer, and writes
 evals/results/<UTC timestamp>-code-mode.{jsonl,md} and <timestamp>-spotcheck.md.

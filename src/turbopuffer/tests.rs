@@ -326,7 +326,7 @@ async fn tool_hits_become_citable_search_results() {
 #[tokio::test(flavor = "current_thread")]
 async fn missing_namespace_answers_with_no_documents_and_a_warning() {
     let (url, _) = serve(vec![error_response(404, "namespace not found")]).await;
-    let (_guard, events) = record_events("topcoat_si::turbopuffer::search");
+    let (_guard, events) = record_events("carpa::turbopuffer::search");
     let result = search(&url)
         .call(&tool_use(json!({"query": "refund"})))
         .await

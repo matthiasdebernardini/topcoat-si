@@ -2,7 +2,7 @@ use std::env;
 use std::time::Duration;
 
 use tokio::pin;
-use topcoat_si::{
+use carpa::{
     Anthropic, KnownModel, MessageBatch, MessageBatchCreateParams, MessageBatchCreateRequest,
     MessageBatchProcessingStatus, MessageBatchResult, MessageBatchResultVariant,
     MessageCreateParams, Result,

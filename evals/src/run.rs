@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use topcoat_si::code_mode::{self, CodeMode, Limits, Pool, packs};
-use topcoat_si::jev::{JevClient, JevTool, Outcome, Questions};
-use topcoat_si::{
+use carpa::code_mode::{self, CodeMode, Limits, Pool, packs};
+use carpa::jev::{JevClient, JevTool, Outcome, Questions};
+use carpa::{
     Anthropic, CacheControlEphemeral, ClientTool, ContentBlock, Error, ErrorKind, FirecrawlClient,
     FirecrawlFetchPage, FirecrawlWebSearch, KnownModel, Message, MessageCreateParams, MessageParam,
     Model, ToolRun, ToolRunError,
@@ -182,7 +182,7 @@ pub async fn run_case(
         }
     }
     let usage = outcome.responses.iter().map(|response| &response.usage);
-    let sum = |field: fn(&topcoat_si::Usage) -> i32| -> i64 {
+    let sum = |field: fn(&carpa::Usage) -> i32| -> i64 {
         usage.clone().map(|usage| i64::from(field(usage))).sum()
     };
 
@@ -279,7 +279,7 @@ async fn run_code_mode(services: &Services, case: &Case, model: KnownModel) -> A
 
 /// Asks Jev the case's judge question about `answer`: the probability of yes, and whether it is
 /// yes at the required certainty.
-async fn judge(jev: &JevClient, case: &Case, answer: &str) -> topcoat_si::Result<(f64, bool)> {
+async fn judge(jev: &JevClient, case: &Case, answer: &str) -> carpa::Result<(f64, bool)> {
     let questions = Questions::new().noul(JUDGE_QUESTION, case.judge.as_str());
     let response = jev.ask(answer, &questions).await?;
     let probability = response.noul(JUDGE_QUESTION)?;

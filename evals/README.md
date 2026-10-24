@@ -1,4 +1,4 @@
-# topcoat-si evals
+# carpa evals
 
 **Warning: running an eval costs real money.** Every run calls the Anthropic API, Firecrawl and Jev with your keys. `--budget-cents` caps only the Anthropic spend; see [Budget](#budget).
 
@@ -55,7 +55,7 @@ The loader rejects the whole file on an unknown field, `kind` or `split`, an emp
 ## Running it
 
 ```bash
-cargo run -p topcoat-evals -- code-mode --budget-cents 300 [options]
+cargo run -p carpa-evals -- code-mode --budget-cents 300 [options]
 ```
 
 | Option | Default | Meaning |
@@ -120,7 +120,7 @@ Every cost in the summary is the **Anthropic cost** only: what Claude's response
 `summarize` rebuilds the summary of a finished run from its `<timestamp>-code-mode.jsonl` without calling anything or needing keys. It prints the summary (with the change from the baseline, if there is one) and writes no results files; `--save-baseline` writes it to `evals/baselines/code-mode.json`. The selection comes from the file, as `code-mode` would have recorded it: the case ids in suite file order (an id not in the suite is an error), the models in first-seen order and the highest repeat plus one. The split is `dev` or `holdout` when every run is in that split, else `all`; a file of only dev cases cannot tell `--split all --cases` from `--split dev`, so `summarize` picks the narrower split. If any case, model, arm and repeat is missing or duplicated, `summarize` prints how many and the first few, marks the run partial, and `--save-baseline` refuses it. It cannot catch a run that stopped exactly between cases, or after the first model finished both arms of every repeat: the file then looks like a smaller complete run. Only save a baseline from a run whose `code-mode` output did not report a budget stop.
 
 ```bash
-cargo run -p topcoat-evals -- summarize evals/results/<timestamp>-code-mode.jsonl [--save-baseline]
+cargo run -p carpa-evals -- summarize evals/results/<timestamp>-code-mode.jsonl [--save-baseline]
 ```
 
 ## The results database
@@ -128,8 +128,8 @@ cargo run -p topcoat-evals -- summarize evals/results/<timestamp>-code-mode.json
 With `--db PATH`, `code-mode` also stores each run's record in a SurrealDB (embedded database) directory, in the `eval_run` table: the same fields as a line of the `.jsonl` file, plus `run` (the timestamp in the file names) and `at` (when it was stored). The database holds many runs, so it can be queried across them. SurrealKV locks the directory, so one process at a time can open it.
 
 ```bash
-cargo run -p topcoat-evals -- summarize --db PATH               # list the stored run stamps
-cargo run -p topcoat-evals -- summarize --db PATH --run <timestamp> [--save-baseline]
+cargo run -p carpa-evals -- summarize --db PATH               # list the stored run stamps
+cargo run -p carpa-evals -- summarize --db PATH --run <timestamp> [--save-baseline]
 ```
 
 `summarize` takes either a results file or `--db`, not both; `--run` needs `--db`.

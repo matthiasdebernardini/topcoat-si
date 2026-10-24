@@ -296,7 +296,7 @@ impl FirecrawlClient {
             |_, _| self.send_once(method.clone(), &url, body, timeout),
             |error, attempt, delay| {
                 tracing::warn!(
-                    target: "topcoat_si::firecrawl",
+                    target: "carpa::firecrawl",
                     error = error as &dyn std::error::Error,
                     path,
                     attempt = attempt + 1,

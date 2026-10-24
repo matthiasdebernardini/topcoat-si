@@ -493,6 +493,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "carpa"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "monty-pool",
+ "monty-types",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "surrealdb",
+ "time",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "turbopuffer",
+ "url",
+]
+
+[[package]]
+name = "carpa-evals"
+version = "0.1.0"
+dependencies = [
+ "carpa",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4701,39 +4734,6 @@ dependencies = [
  "bytes",
  "prost",
  "tonic",
-]
-
-[[package]]
-name = "topcoat-evals"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "time",
- "tokio",
- "topcoat-si",
-]
-
-[[package]]
-name = "topcoat-si"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "futures",
- "monty-pool",
- "monty-types",
- "reqwest",
- "schemars",
- "serde",
- "serde_json",
- "surrealdb",
- "time",
- "tokio",
- "tokio-test",
- "tracing",
- "turbopuffer",
- "url",
 ]
 
 [[package]]

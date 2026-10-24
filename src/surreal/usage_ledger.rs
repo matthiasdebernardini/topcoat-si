@@ -1,4 +1,4 @@
-//! A durable usage ledger: one row per response, the stored version of the `topcoat_si::usage`
+//! A durable usage ledger: one row per response, the stored version of the `carpa::usage`
 //! tracing event.
 
 use surrealdb::types::SurrealValue;
@@ -12,22 +12,22 @@ use crate::tool_loop::ToolRun;
 use crate::types::{Message, Model, Usage};
 
 const SCHEMA: &str = "
-DEFINE TABLE IF NOT EXISTS topcoat_usage TYPE NORMAL SCHEMAFULL;
-DEFINE FIELD IF NOT EXISTS message_id ON topcoat_usage TYPE string;
-DEFINE FIELD IF NOT EXISTS model ON topcoat_usage TYPE string;
-DEFINE FIELD IF NOT EXISTS label ON topcoat_usage TYPE option<string>;
-DEFINE FIELD IF NOT EXISTS input_tokens ON topcoat_usage TYPE int;
-DEFINE FIELD IF NOT EXISTS output_tokens ON topcoat_usage TYPE int;
-DEFINE FIELD IF NOT EXISTS cache_read_tokens ON topcoat_usage TYPE int;
-DEFINE FIELD IF NOT EXISTS cache_write_tokens ON topcoat_usage TYPE int;
-DEFINE FIELD IF NOT EXISTS cost_micro_cents ON topcoat_usage TYPE int;
-DEFINE FIELD IF NOT EXISTS at ON topcoat_usage TYPE datetime;
-DEFINE INDEX IF NOT EXISTS topcoat_usage_at ON topcoat_usage FIELDS at;
-DEFINE INDEX IF NOT EXISTS topcoat_usage_model ON topcoat_usage FIELDS model;
+DEFINE TABLE IF NOT EXISTS carpa_usage TYPE NORMAL SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS message_id ON carpa_usage TYPE string;
+DEFINE FIELD IF NOT EXISTS model ON carpa_usage TYPE string;
+DEFINE FIELD IF NOT EXISTS label ON carpa_usage TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS input_tokens ON carpa_usage TYPE int;
+DEFINE FIELD IF NOT EXISTS output_tokens ON carpa_usage TYPE int;
+DEFINE FIELD IF NOT EXISTS cache_read_tokens ON carpa_usage TYPE int;
+DEFINE FIELD IF NOT EXISTS cache_write_tokens ON carpa_usage TYPE int;
+DEFINE FIELD IF NOT EXISTS cost_micro_cents ON carpa_usage TYPE int;
+DEFINE FIELD IF NOT EXISTS at ON carpa_usage TYPE datetime;
+DEFINE INDEX IF NOT EXISTS carpa_usage_at ON carpa_usage FIELDS at;
+DEFINE INDEX IF NOT EXISTS carpa_usage_model ON carpa_usage FIELDS model;
 ";
 
 const RECORD: &str = "
-UPSERT type::record('topcoat_usage', $message_id) SET
+UPSERT type::record('carpa_usage', $message_id) SET
     message_id = $message_id,
     model = $model,
     label = $label,
@@ -48,7 +48,7 @@ SELECT
     math::sum(cache_read_tokens) AS cache_read_tokens,
     math::sum(cache_write_tokens) AS cache_write_tokens,
     math::sum(cost_micro_cents) AS cost_micro_cents
-FROM topcoat_usage
+FROM carpa_usage
 WHERE at >= $since
 GROUP BY model
 ORDER BY model;
@@ -119,7 +119,7 @@ pub struct UsageLedger<C: Connection> {
 }
 
 impl<C: Connection> UsageLedger<C> {
-    /// Defines the `topcoat_usage` table, if it is not there yet, on `db`.
+    /// Defines the `carpa_usage` table, if it is not there yet, on `db`.
     ///
     /// # Errors
     ///
@@ -251,7 +251,7 @@ mod tests {
         let sonnet = message("msg_1", "claude-sonnet-5-5", 100, 10);
         let read_at = || async {
             let at: Vec<surrealdb::types::Datetime> = db
-                .query("SELECT VALUE at FROM topcoat_usage")
+                .query("SELECT VALUE at FROM carpa_usage")
                 .await
                 .and_then(|mut response| response.take(0))
                 .expect("read at");

@@ -1,8 +1,8 @@
-# Topcoat SI
+# Carpa
 
-Topcoat SI is a typed Rust client for the Anthropic Messages API. It also ships client-side tools that let Claude search the web, read pages, ask for typed judgments and run Python. It is built for Topcoat apps and works in any async Rust program on Tokio.
+Carpa is a typed Rust client for the Anthropic Messages API. It also ships client-side tools that let Claude search the web, read pages, ask for typed judgments and run Python. It is built for Topcoat apps and works in any async Rust program on Tokio.
 
-[![Watch the topcoat-si video (87 seconds)](docs/video-poster.png)](https://github.com/matthiasdebernardini/topcoat-si/releases/download/v0.1.0/topcoat-si.mp4)
+[![Watch the carpa video (87 seconds)](docs/video-poster.png)](https://github.com/matthiasdebernardini/carpa/releases/download/v0.1.0/topcoat-si.mp4)
 
 What it covers:
 
@@ -14,7 +14,7 @@ What it covers:
 - prompt caching, Message Batches, files, per-response cost, rate limits and tracing;
 - an embedded SurrealDB, optional, for memory, transcripts, a Firecrawl cache, a usage ledger and read-only queries.
 
-Topcoat SI is a fork of Robert Escriva's [claudius](https://github.com/rescrv/claudius) crate (Apache-2.0), trimmed to the Messages API client.
+Carpa is a fork of Robert Escriva's [claudius](https://github.com/rescrv/claudius) crate (Apache-2.0), trimmed to the Messages API client.
 
 ## Contents
 
@@ -38,11 +38,9 @@ Topcoat SI is a fork of Robert Escriva's [claudius](https://github.com/rescrv/cl
 
 ## Install
 
-Topcoat SI is not on crates.io. Depend on it through git:
-
 ```toml
-[dependencies.topcoat-si]
-git = "https://github.com/matthiasdebernardini/topcoat-si"
+[dependencies]
+carpa = "0.1"
 ```
 
 TLS always goes through rustls.
@@ -60,10 +58,10 @@ TLS always goes through rustls.
 ```rust,no_run
 use std::time::Duration;
 
-use topcoat_si::{Anthropic, KnownModel, MessageCreateParams};
+use carpa::{Anthropic, KnownModel, MessageCreateParams};
 
 #[tokio::main]
-async fn main() -> topcoat_si::Result<()> {
+async fn main() -> carpa::Result<()> {
     // Defaults: 3 retries and a 10 minute timeout.
     let client = Anthropic::try_new(None)?
         .with_max_retries(5)
@@ -93,8 +91,8 @@ A reply cut off at `max_tokens` has a stop reason of `StopReason::MaxTokens`.
 
 | Setting | Read from | Notes |
 |---|---|---|
-| API key | `TOPCOAT_SI_API_KEY`, then `ANTHROPIC_API_KEY` | Or pass `Anthropic::try_new(Some(key))`. |
-| Base URL | `TOPCOAT_SI_BASE_URL`, then `ANTHROPIC_BASE_URL` | Optional; a trailing `/v1` is allowed. |
+| API key | `CARPA_API_KEY`, then `ANTHROPIC_API_KEY` | Or pass `Anthropic::try_new(Some(key))`. |
+| Base URL | `CARPA_BASE_URL`, then `ANTHROPIC_BASE_URL` | Optional; a trailing `/v1` is allowed. |
 
 A key value of the form `file:///path` is read from that file, which keeps the key itself out of the environment.
 
@@ -114,7 +112,7 @@ A base URL must use https. Plain http is accepted only for a loopback host (`loc
 Parsing a `Model` never fails. A known ID becomes `Model::Known`, and any other ID becomes `Model::Custom`:
 
 ```rust
-use topcoat_si::{KnownModel, Model};
+use carpa::{KnownModel, Model};
 
 let Ok(known) = "claude-opus-5-5".parse::<Model>();
 assert_eq!(known, Model::Known(KnownModel::ClaudeOpus55));
@@ -138,7 +136,7 @@ Streaming shows the reply while it is written. `client.stream` returns raw serve
 use std::io::Write;
 
 use futures::StreamExt;
-use topcoat_si::{
+use carpa::{
     AccumulatingStream, Anthropic, ContentBlockDelta, KnownModel, Message, MessageCreateParams,
     MessageParam, MessageStreamEvent, Model,
 };
@@ -183,14 +181,14 @@ serde = { version = "1", features = ["derive"] }
 ```rust,no_run
 use schemars::JsonSchema;
 use serde::Deserialize;
-use topcoat_si::{Anthropic, KnownModel, MessageCreateParams};
+use carpa::{Anthropic, KnownModel, MessageCreateParams};
 
 #[derive(Deserialize, JsonSchema)]
 struct Summary {
     summary: String,
 }
 
-async fn summarise(client: &Anthropic) -> topcoat_si::Result<String> {
+async fn summarise(client: &Anthropic) -> carpa::Result<String> {
     let prompt = "Summarise Rust in one line.";
     let params = MessageCreateParams::simple(prompt, KnownModel::ClaudeHaiku55);
     let parsed = client.send_parsed::<Summary>(&params).await?;
@@ -202,7 +200,7 @@ async fn summarise(client: &Anthropic) -> topcoat_si::Result<String> {
 
 ```rust
 use serde_json::json;
-use topcoat_si::{KnownModel, MessageCreateParams, OutputConfig, OutputFormat};
+use carpa::{KnownModel, MessageCreateParams, OutputConfig, OutputFormat};
 
 let schema = json!({
     "type": "object",
@@ -253,7 +251,7 @@ There is no Anthropic server-side web search here. Web search is a client tool b
 ```rust
 use futures::future::BoxFuture;
 use serde_json::json;
-use topcoat_si::{ClientTool, Result, ToolResultBlock, ToolUnionParam, ToolUseBlock};
+use carpa::{ClientTool, Result, ToolResultBlock, ToolUnionParam, ToolUseBlock};
 
 struct Clock;
 
@@ -289,12 +287,12 @@ Choose between `Ok` and `Err` by who can fix the problem:
 `Anthropic::run_tools` calls Claude, runs the client tools it asks for, sends the results back, and repeats until Claude answers. It takes the request, your tools and a maximum number of turns.
 
 ```rust,no_run
-use topcoat_si::{
+use carpa::{
     Anthropic, ClientTool, FirecrawlClient, FirecrawlFetchPage, FirecrawlWebSearch,
     KnownModel, MessageCreateParams, MessageParam, Model,
 };
 
-async fn research(client: &Anthropic) -> topcoat_si::Result<()> {
+async fn research(client: &Anthropic) -> carpa::Result<()> {
     let firecrawl = FirecrawlClient::from_env()?;
     let search = FirecrawlWebSearch::new(firecrawl.clone());
     let fetch = FirecrawlFetchPage::new(firecrawl);
@@ -400,10 +398,10 @@ Both return each page's main content as markdown. Their other defaults:
 `GovSearchRequest` filters by `k` (1 to 100), `jurisdiction` (`"us"` or a state such as `"us-tn"`; there is no city or county filter), `court`, `court_type`, `cites` and `domain`. The filters only match pages Firecrawl has labeled, so no results does not mean no law. `MapRequest` takes `search` to order links by relevance, `limit`, `sitemap` and `location`.
 
 ```rust,no_run
-use topcoat_si::firecrawl::{GovSearchRequest, MapRequest};
-use topcoat_si::FirecrawlClient;
+use carpa::firecrawl::{GovSearchRequest, MapRequest};
+use carpa::FirecrawlClient;
 
-async fn find(firecrawl: &FirecrawlClient) -> topcoat_si::Result<()> {
+async fn find(firecrawl: &FirecrawlClient) -> carpa::Result<()> {
     let code = GovSearchRequest::new("side setback variance").with_jurisdiction("us-tn");
     for hit in firecrawl.gov_search(&code).await?.data.web {
         println!("{:?}: {:?}", hit.url, hit.description);
@@ -441,7 +439,7 @@ Both tools work with `run_tools`. You can also drive web search by hand:
 - `execute` runs the search and returns the tool result.
 
 ```rust,no_run
-use topcoat_si::{
+use carpa::{
     Anthropic, ContentBlock, FirecrawlClient, FirecrawlWebSearch, KnownModel,
     MessageCreateParams, MessageParam, MessageRole, Model, StopReason,
 };
@@ -450,7 +448,7 @@ use topcoat_si::{
 const MAX_TURNS: usize = 8;
 
 #[tokio::main]
-async fn main() -> topcoat_si::Result<()> {
+async fn main() -> carpa::Result<()> {
     let client = Anthropic::try_new(None)?;
     let search = FirecrawlWebSearch::new(FirecrawlClient::from_env()?)
         .with_blocked_domains(vec!["pinterest.com".to_string()]);
@@ -491,9 +489,9 @@ Jev is TypeSafe's decision model. Use it when you need a classification rather t
 | score | rate on 2 to 10 ordered levels | a mean level, a confidence and each level's probability |
 
 ```rust,no_run
-use topcoat_si::jev::{JevClient, Outcome, Questions};
+use carpa::jev::{JevClient, Outcome, Questions};
 
-async fn triage(jev: &JevClient) -> topcoat_si::Result<()> {
+async fn triage(jev: &JevClient) -> carpa::Result<()> {
     let questions = Questions::new()
         .noul("refund", "Does the customer ask for a refund?")
         .choice(
@@ -566,15 +564,12 @@ Writing documents and querying go through turbopuffer's official Rust SDK (Softw
 Enable the feature, and depend on the SDK at the same version for its types:
 
 ```toml
-[dependencies.topcoat-si]
-git = "https://github.com/matthiasdebernardini/topcoat-si"
-features = ["turbopuffer"]
-
 [dependencies]
+carpa = { version = "0.1", features = ["turbopuffer"] }
 turbopuffer = { version = "0.1.0-beta.1", default-features = false, features = ["rustls"] }
 ```
 
-`topcoat_si::turbopuffer` re-exports the SDK's `Client`, `Namespace` and `Filter`. Create the client with `Client::builder().api_key(..).region(..).build()`, or with `Client::from_env()`:
+`carpa::turbopuffer` re-exports the SDK's `Client`, `Namespace` and `Filter`. Create the client with `Client::builder().api_key(..).region(..).build()`, or with `Client::from_env()`:
 
 | Variable | Required | Meaning |
 |---|---|---|
@@ -587,10 +582,10 @@ A namespace holds one collection of documents. The search tool searches its `tex
 ```rust,no_run
 #[cfg(feature = "turbopuffer")]
 async fn help_center(
-    anthropic: &topcoat_si::Anthropic,
-    params: topcoat_si::MessageCreateParams,
+    anthropic: &carpa::Anthropic,
+    params: carpa::MessageCreateParams,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use topcoat_si::turbopuffer::{Client, Filter, TurbopufferSearch};
+    use carpa::turbopuffer::{Client, Filter, TurbopufferSearch};
     use turbopuffer::types::{AttributeSchemaConfig, Expr, RankBy, Row};
 
     // TURBOPUFFER_API_KEY plus TURBOPUFFER_REGION or TURBOPUFFER_BASE_URL.
@@ -645,7 +640,7 @@ async fn help_center(
 }
 ```
 
-`topcoat_si::Error` converts from `turbopuffer::Error`, so `?` works on SDK calls in a function returning `topcoat_si::Result`. An HTTP error becomes `ErrorKind::Api { service: Service::Turbopuffer, .. }` with its status and `retry-after`; an SDK timeout becomes `Timeout`, a failed connection `Connection` (or `Interrupted` when the body read failed), and a bad response `Decode`.
+`carpa::Error` converts from `turbopuffer::Error`, so `?` works on SDK calls in a function returning `carpa::Result`. An HTTP error becomes `ErrorKind::Api { service: Service::Turbopuffer, .. }` with its status and `retry-after`; an SDK timeout becomes `Timeout`, a failed connection `Connection` (or `Interrupted` when the body read failed), and a bad response `Decode`.
 
 The SDK does its own retries; this crate adds none on top. Its rules differ from this crate's other clients, and from the hand-written turbopuffer client this crate used to have:
 
@@ -692,9 +687,8 @@ Scripts run in [Monty](https://github.com/pydantic/monty), pydantic's Python san
 Enable the feature:
 
 ```toml
-[dependencies.topcoat-si]
-git = "https://github.com/matthiasdebernardini/topcoat-si"
-features = ["code-mode"]
+[dependencies]
+carpa = { version = "0.1", features = ["code-mode"] }
 ```
 
 Install the `monty` worker binary from `monty-runtime` 1.2:
@@ -719,12 +713,12 @@ use std::path::PathBuf;
 
 #[cfg(feature = "code-mode")]
 async fn research(
-    client: &topcoat_si::Anthropic,
+    client: &carpa::Anthropic,
     monty_path: PathBuf,
-) -> topcoat_si::Result<()> {
-    use topcoat_si::code_mode::{self, CodeMode, Limits, packs};
-    use topcoat_si::jev::JevClient;
-    use topcoat_si::{
+) -> carpa::Result<()> {
+    use carpa::code_mode::{self, CodeMode, Limits, packs};
+    use carpa::jev::JevClient;
+    use carpa::{
         CacheControlEphemeral, ClientTool, FirecrawlClient, FirecrawlFetchPage,
         FirecrawlWebSearch, KnownModel, MessageCreateParams, MessageParam, Model,
     };
@@ -813,9 +807,9 @@ The pack has no concurrency limit of its own: `FirecrawlClient::with_max_concurr
 
 ```rust,no_run
 #[cfg(feature = "code-mode")]
-fn firecrawl_pack(client: topcoat_si::FirecrawlClient) -> topcoat_si::code_mode::Pack {
+fn firecrawl_pack(client: carpa::FirecrawlClient) -> carpa::code_mode::Pack {
     use std::sync::Arc;
-    use topcoat_si::code_mode::packs::{FirecrawlBudget, FirecrawlPack, OutOfCredits};
+    use carpa::code_mode::packs::{FirecrawlBudget, FirecrawlPack, OutOfCredits};
 
     let budget = FirecrawlBudget::new()
         .with_max_searches(30)
@@ -841,9 +835,9 @@ A request that was sent counts against the budget whether or not it succeeds. Ca
 
 ```rust,no_run
 #[cfg(feature = "code-mode")]
-fn jev_pack(client: topcoat_si::jev::JevClient) -> topcoat_si::code_mode::Pack {
+fn jev_pack(client: carpa::jev::JevClient) -> carpa::code_mode::Pack {
     use std::sync::Arc;
-    use topcoat_si::code_mode::packs::{JevBudget, JevPack};
+    use carpa::code_mode::packs::{JevBudget, JevPack};
 
     JevPack::new(client)
         .with_budget(Arc::new(JevBudget::new(120)))
@@ -885,10 +879,10 @@ Host functions must be read-only. The crate cannot enforce this, so it is up to 
 
 ```rust,no_run
 #[cfg(feature = "code-mode")]
-fn shop_pack() -> topcoat_si::code_mode::Pack {
+fn shop_pack() -> carpa::code_mode::Pack {
     use serde::Deserialize;
     use serde_json::json;
-    use topcoat_si::code_mode::{Example, HostError, Pack, PyError, host_fn};
+    use carpa::code_mode::{Example, HostError, Pack, PyError, host_fn};
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -978,7 +972,7 @@ Caching makes a repeated prompt prefix cheaper and faster. There are two ways to
 `CacheControlEphemeral::new()` lives five minutes; `CacheControlEphemeral::one_hour()` lives an hour.
 
 ```rust
-use topcoat_si::{
+use carpa::{
     CacheControlEphemeral, KnownModel, MessageCreateParams, SystemPrompt, TextBlock,
 };
 
@@ -1021,12 +1015,12 @@ Batches cost half as much and finish within 24 hours. `wait_for_message_batch` p
 ```rust,no_run
 use std::time::Duration;
 
-use topcoat_si::{
+use carpa::{
     Anthropic, KnownModel, MessageBatchCreateParams, MessageBatchCreateRequest,
     MessageCreateParams,
 };
 
-async fn run_batch(client: &Anthropic) -> topcoat_si::Result<()> {
+async fn run_batch(client: &Anthropic) -> carpa::Result<()> {
     let ask = |id: &str, question: &str| {
         let params = MessageCreateParams::simple(question, KnownModel::ClaudeHaiku55);
         MessageBatchCreateRequest::new(id, params)
@@ -1055,9 +1049,9 @@ async fn run_batch(client: &Anthropic) -> topcoat_si::Result<()> {
 use std::time::Duration;
 
 use time::OffsetDateTime;
-use topcoat_si::{Anthropic, BatchOutcome, BatchWait, Control, KnownModel, MessageCreateParams};
+use carpa::{Anthropic, BatchOutcome, BatchWait, Control, KnownModel, MessageCreateParams};
 
-async fn ask(client: &Anthropic) -> topcoat_si::Result<()> {
+async fn ask(client: &Anthropic) -> carpa::Result<()> {
     let params = MessageCreateParams::simple("2+2?", KnownModel::ClaudeHaiku55);
     let batch = client.submit_one("turn-1", params).await?;
     // Save batch.id here.
@@ -1093,7 +1087,7 @@ async fn ask(client: &Anthropic) -> topcoat_si::Result<()> {
 `KnownModel::cost_micro_cents` prices one response's `Usage`, including Haiku 5.5's long-prompt tier.
 
 ```rust
-use topcoat_si::{KnownModel, Usage};
+use carpa::{KnownModel, Usage};
 
 let usage = Usage::new(10_000, 2_000).with_cache_read_input_tokens(50_000);
 let micro_cents = KnownModel::ClaudeSonnet55.cost_micro_cents(&usage);
@@ -1136,7 +1130,7 @@ Each window holds `limit`, `remaining` and `reset`. The windows are:
 
 ### Tracing
 
-Every API call runs in a `topcoat_si.request` tracing span. On `send` and `stream` the span records:
+Every API call runs in a `carpa.request` tracing span. On `send` and `stream` the span records:
 
 - `request_id`
 - `http.status_code`
@@ -1148,26 +1142,26 @@ The crate also emits plain tracing events. Aggregate them with any subscriber. D
 
 | Target | Level | Message | Fields |
 |---|---|---|---|
-| `topcoat_si::usage` | `INFO` | `usage` | see below |
-| `topcoat_si::client` | `DEBUG` | `request_completed` | `duration_seconds`, `ok` |
-| `topcoat_si::client` | `WARN` | `retry` | `error`, `attempt`, `backoff_seconds` |
-| `topcoat_si::stream` | `TRACE` | `event` | |
-| `topcoat_si::stream` | `TRACE` | `bytes` | `bytes` |
-| `topcoat_si::stream` | `DEBUG` | `first_byte` | `ttfb_seconds` |
-| `topcoat_si::stream` | `DEBUG` | `completed` | `duration_seconds` |
-| `topcoat_si::stream` | `DEBUG` | `error` | |
-| `topcoat_si::wire` | `TRACE` | | `request`, `response`, `event`, `data` |
-| `topcoat_si::unknown` | `WARN` | see below | `rust_type`, `tag` |
-| `topcoat_si::jev` | `DEBUG` | "Jev answered" | `latency_seconds` |
-| `topcoat_si::jev` | `DEBUG` | "Jev request failed" | `latency_seconds` |
-| `topcoat_si::jev` | `DEBUG` | "Retrying Jev request" | `sleep_seconds` |
-| `topcoat_si::firecrawl` | `WARN` | "Retrying Firecrawl request" | `error`, `path`, `attempt`, `sleep_seconds` |
+| `carpa::usage` | `INFO` | `usage` | see below |
+| `carpa::client` | `DEBUG` | `request_completed` | `duration_seconds`, `ok` |
+| `carpa::client` | `WARN` | `retry` | `error`, `attempt`, `backoff_seconds` |
+| `carpa::stream` | `TRACE` | `event` | |
+| `carpa::stream` | `TRACE` | `bytes` | `bytes` |
+| `carpa::stream` | `DEBUG` | `first_byte` | `ttfb_seconds` |
+| `carpa::stream` | `DEBUG` | `completed` | `duration_seconds` |
+| `carpa::stream` | `DEBUG` | `error` | |
+| `carpa::wire` | `TRACE` | | `request`, `response`, `event`, `data` |
+| `carpa::unknown` | `WARN` | see below | `rust_type`, `tag` |
+| `carpa::jev` | `DEBUG` | "Jev answered" | `latency_seconds` |
+| `carpa::jev` | `DEBUG` | "Jev request failed" | `latency_seconds` |
+| `carpa::jev` | `DEBUG` | "Retrying Jev request" | `sleep_seconds` |
+| `carpa::firecrawl` | `WARN` | "Retrying Firecrawl request" | `error`, `path`, `attempt`, `sleep_seconds` |
 
-Each `topcoat_si::jev` event also carries `status`, `attempt`, `request_id` and `model`.
+Each `carpa::jev` event also carries `status`, `attempt`, `request_id` and `model`.
 
-An API value this crate does not know, such as a new stop reason or content block type, is kept as the type's `Unknown` variant. An unknown stream event is skipped. Either is logged as a warning on `topcoat_si::unknown` the first time each distinct value appears in the process, without its payload. The message reads "unknown API value; update topcoat-si to read it". A constant `type` tag, such as `message` on a `Message`, is checked the same way: another value is logged and the reply still parses.
+An API value this crate does not know, such as a new stop reason or content block type, is kept as the type's `Unknown` variant. An unknown stream event is skipped. Either is logged as a warning on `carpa::unknown` the first time each distinct value appears in the process, without its payload. The message reads "unknown API value; update carpa to read it". A constant `type` tag, such as `message` on a `Message`, is checked the same way: another value is logged and the reply still parses.
 
-**Warning:** `topcoat_si::wire` logs full request and response bodies, prompts included. Turning on `topcoat_si=trace` logs user content.
+**Warning:** `carpa::wire` logs full request and response bodies, prompts included. Turning on `carpa=trace` logs user content.
 
 The `usage` event fires once per completed `send` and once per stream that reaches `message_stop`. Its fields:
 
@@ -1182,11 +1176,11 @@ The Admin API reports usage and cost across your organization. It needs an Admin
 
 ```rust,no_run
 use time::{Duration, OffsetDateTime};
-use topcoat_si::{
+use carpa::{
     Anthropic, BucketWidth, CostGroupBy, CostReportParams, UsageGroupBy, UsageReportParams,
 };
 
-async fn report(admin_key: String) -> topcoat_si::Result<()> {
+async fn report(admin_key: String) -> carpa::Result<()> {
     let admin = Anthropic::try_new(Some(admin_key))?;
     let since = OffsetDateTime::now_utc() - Duration::days(7);
 
@@ -1223,12 +1217,12 @@ Upload a file once and refer to it in later requests instead of resending it.
 | `delete_file` | removes it |
 
 ```rust,no_run
-use topcoat_si::{
+use carpa::{
     Anthropic, ContentBlock, DocumentBlock, KnownModel, MessageCreateParams, MessageParam,
     MessageParamContent, MessageRole, Model, TextBlock,
 };
 
-async fn summarise(client: &Anthropic, text: &str) -> topcoat_si::Result<()> {
+async fn summarise(client: &Anthropic, text: &str) -> carpa::Result<()> {
     let file = client.upload_file("notes.txt", "text/plain", text.as_bytes(), None).await?;
     let content = MessageParamContent::Array(vec![
         ContentBlock::Document(DocumentBlock::from_file_id(&file.id)),
@@ -1248,19 +1242,18 @@ async fn summarise(client: &Anthropic, text: &str) -> topcoat_si::Result<()> {
 The `surreal` feature adds an embedded database for the things a stateless client cannot keep: Claude's memory, transcripts and batch ids that outlive a restart, a cache of Firecrawl answers, a usage ledger, and a read-only query tool over your own data. The engine is [SurrealDB](https://surrealdb.com) 3.2 on SurrealKV, pure Rust, one directory, no server.
 
 ```toml
-[dependencies.topcoat-si]
-git = "https://github.com/matthiasdebernardini/topcoat-si"
-features = ["surreal"]
+[dependencies]
+carpa = { version = "0.1", features = ["surreal"] }
 ```
 
-The crate is re-exported as `topcoat_si::surrealdb`, so your app needs no dependency of its own. For your own tables, derive records with `#[derive(SurrealValue)] #[surreal(crate = "topcoat_si::surrealdb::types")]`, or read rows as `serde_json::Value`.
+The crate is re-exported as `carpa::surrealdb`, so your app needs no dependency of its own. For your own tables, derive records with `#[derive(SurrealValue)] #[surreal(crate = "carpa::surrealdb::types")]`, or read rows as `serde_json::Value`.
 
-`surreal::open` opens or creates the database and selects a namespace and database. Every store below takes that handle and defines its own tables when built, with `IF NOT EXISTS`, so opening twice changes nothing. All of its tables start with `topcoat_`, so they never collide with yours.
+`surreal::open` opens or creates the database and selects a namespace and database. Every store below takes that handle and defines its own tables when built, with `IF NOT EXISTS`, so opening twice changes nothing. All of its tables start with `carpa_`, so they never collide with yours.
 
 ```rust,no_run
 #[cfg(feature = "surreal")]
-async fn stores() -> topcoat_si::Result<()> {
-    use topcoat_si::surreal::{self, Memory, Transcripts, UsageLedger};
+async fn stores() -> carpa::Result<()> {
+    use carpa::surreal::{self, Memory, Transcripts, UsageLedger};
 
     let db = surreal::open("data/app.surreal", "myapp", "app").await?;
     let memory = Memory::try_new(db.clone(), "user-42").await?;
@@ -1294,11 +1287,11 @@ Two rules come from SurrealKV:
 
 ```rust,no_run
 #[cfg(feature = "surreal")]
-async fn cached(db: topcoat_si::surrealdb::Surreal<topcoat_si::surrealdb::engine::local::Db>) -> topcoat_si::Result<()> {
+async fn cached(db: carpa::surrealdb::Surreal<carpa::surrealdb::engine::local::Db>) -> carpa::Result<()> {
     use std::sync::Arc;
     use std::time::Duration;
-    use topcoat_si::FirecrawlClient;
-    use topcoat_si::surreal::PageCache;
+    use carpa::FirecrawlClient;
+    use carpa::surreal::PageCache;
 
     let cache = Arc::new(PageCache::try_new(db).await?);
     let firecrawl = FirecrawlClient::from_env()?.with_cache(cache, Duration::from_secs(3600));
@@ -1309,11 +1302,11 @@ async fn cached(db: topcoat_si::surrealdb::Surreal<topcoat_si::surrealdb::engine
 
 ### Usage ledger
 
-`UsageLedger::record` stores one row per response: model, tokens, cache reads and writes, and the cost from `KnownModel::cost_micro_cents` (0 for a custom model). `record_run` stores every response of a `ToolRun`. `totals(since)` sums them per model. It is the durable form of the `topcoat_si::usage` tracing event in [Monitoring](#monitoring).
+`UsageLedger::record` stores one row per response: model, tokens, cache reads and writes, and the cost from `KnownModel::cost_micro_cents` (0 for a custom model). `record_run` stores every response of a `ToolRun`. `totals(since)` sums them per model. It is the durable form of the `carpa::usage` tracing event in [Monitoring](#monitoring).
 
 ### The `surreal` pack
 
-With both `code-mode` and `surreal` on, `let reader = Reader::try_new(db.clone(), "myapp", "app").await?;` and then `code_mode::packs::surreal(&reader, 200)` let Claude read your database from Python. `Reader` (from `topcoat_si::surreal`) takes the handle, its namespace and database; `200` is `max_rows`. One reader per app, like one pool: build it once and share it across conversations, since building it sets a new secret and concurrent builds would race. It holds a session that never expires.
+With both `code-mode` and `surreal` on, `let reader = Reader::try_new(db.clone(), "myapp", "app").await?;` and then `code_mode::packs::surreal(&reader, 200)` let Claude read your database from Python. `Reader` (from `carpa::surreal`) takes the handle, its namespace and database; `200` is `max_rows`. One reader per app, like one pool: build it once and share it across conversations, since building it sets a new secret and concurrent builds would race. It holds a session that never expires.
 
 | Function | Does |
 |---|---|
@@ -1330,7 +1323,7 @@ The evals binary can also keep its results in SurrealDB; see [evals/README.md](e
 
 ## Errors and retries
 
-Every call returns `topcoat_si::Result<T>`. An `Error` is `Clone + Send + Sync + 'static` and tells you three things:
+Every call returns `carpa::Result<T>`. An `Error` is `Clone + Send + Sync + 'static` and tells you three things:
 
 - **What failed:** `kind()` returns a `#[non_exhaustive]` `ErrorKind`. Always keep a wildcard arm.
 - **Which service:** `ErrorKind::Api { service, .. }` is `Anthropic`, `Firecrawl`, `Jev` or `Turbopuffer`.
@@ -1369,7 +1362,7 @@ The wait is a backoff that doubles from half a second up to 8 seconds, or the se
 **Streams.** The crate never resends a stream after it starts. Stream items carry the right kind and request ID. When one fails, check `is_retryable()` and send the request again yourself. `events_delivered() == Some(0)` means no event other than a ping had been yielded, so resending is clean; with a larger count you have already shown the caller part of a reply.
 
 ```rust,no_run
-use topcoat_si::{Anthropic, ErrorKind, MessageCreateParams, Service};
+use carpa::{Anthropic, ErrorKind, MessageCreateParams, Service};
 
 async fn send(client: &Anthropic, params: &MessageCreateParams) {
     match client.send(params).await {
@@ -1397,7 +1390,7 @@ Reply types are `#[non_exhaustive]`, so a test builds them by deserializing JSON
 
 ```rust
 use serde_json::json;
-use topcoat_si::{Anthropic, Message};
+use carpa::{Anthropic, Message};
 
 fn fakes(port: u16) -> Result<(Anthropic, Message), Box<dyn std::error::Error>> {
     let reply: Message = serde_json::from_value(json!({
@@ -1420,7 +1413,7 @@ From a clone of this repository, run an example by its name:
 cargo run --example basic_chat
 ```
 
-Every example needs an Anthropic API key in `ANTHROPIC_API_KEY` or `TOPCOAT_SI_API_KEY`. These need nothing else:
+Every example needs an Anthropic API key in `ANTHROPIC_API_KEY` or `CARPA_API_KEY`. These need nothing else:
 
 | Example | Shows |
 |---|---|

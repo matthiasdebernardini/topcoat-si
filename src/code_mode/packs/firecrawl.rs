@@ -569,10 +569,10 @@ pub trait FirecrawlObserver: Send + Sync {
 /// [`FirecrawlPack::with_out_of_credits`] says. Build a new pack for each conversation.
 ///
 /// ```no_run
-/// # fn build(client: topcoat_si::FirecrawlClient) {
+/// # fn build(client: carpa::FirecrawlClient) {
 /// use std::sync::Arc;
 ///
-/// use topcoat_si::code_mode::packs::{FirecrawlBudget, FirecrawlPack, OutOfCredits};
+/// use carpa::code_mode::packs::{FirecrawlBudget, FirecrawlPack, OutOfCredits};
 ///
 /// let budget = Arc::new(
 ///     FirecrawlBudget::new()

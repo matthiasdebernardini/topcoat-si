@@ -13,27 +13,27 @@ use crate::error::Result;
 use crate::firecrawl::{FirecrawlCache, ScrapeResponse, SearchResponse};
 
 const SCHEMA: &str = "
-    DEFINE TABLE IF NOT EXISTS topcoat_page_cache TYPE NORMAL SCHEMAFULL;
-    DEFINE FIELD IF NOT EXISTS key ON topcoat_page_cache TYPE string;
-    DEFINE FIELD IF NOT EXISTS body ON topcoat_page_cache TYPE string;
-    DEFINE FIELD IF NOT EXISTS url ON topcoat_page_cache TYPE option<string>;
-    DEFINE FIELD IF NOT EXISTS title ON topcoat_page_cache TYPE option<string>;
-    DEFINE FIELD IF NOT EXISTS text ON topcoat_page_cache TYPE string;
-    DEFINE FIELD IF NOT EXISTS expires_at ON topcoat_page_cache TYPE datetime;
-    DEFINE FIELD IF NOT EXISTS stored_at ON topcoat_page_cache TYPE datetime;
-    DEFINE ANALYZER IF NOT EXISTS topcoat_english
+    DEFINE TABLE IF NOT EXISTS carpa_page_cache TYPE NORMAL SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS key ON carpa_page_cache TYPE string;
+    DEFINE FIELD IF NOT EXISTS body ON carpa_page_cache TYPE string;
+    DEFINE FIELD IF NOT EXISTS url ON carpa_page_cache TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS title ON carpa_page_cache TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS text ON carpa_page_cache TYPE string;
+    DEFINE FIELD IF NOT EXISTS expires_at ON carpa_page_cache TYPE datetime;
+    DEFINE FIELD IF NOT EXISTS stored_at ON carpa_page_cache TYPE datetime;
+    DEFINE ANALYZER IF NOT EXISTS carpa_english
         TOKENIZERS blank, class FILTERS lowercase, ascii, snowball(english);
-    DEFINE INDEX IF NOT EXISTS topcoat_page_cache_text ON topcoat_page_cache
-        FIELDS text FULLTEXT ANALYZER topcoat_english BM25;
+    DEFINE INDEX IF NOT EXISTS carpa_page_cache_text ON carpa_page_cache
+        FIELDS text FULLTEXT ANALYZER carpa_english BM25;
 ";
 
 // The record id is the key itself, as a string id. SurrealDB escapes any string as an id, so a
 // long key made of JSON needs no hashing, and a repeat put replaces its own row.
 const GET: &str = "
-    SELECT VALUE body FROM type::record('topcoat_page_cache', $key) WHERE expires_at > time::now()
+    SELECT VALUE body FROM type::record('carpa_page_cache', $key) WHERE expires_at > time::now()
 ";
 const PUT: &str = "
-    UPSERT type::record('topcoat_page_cache', $key) CONTENT {
+    UPSERT type::record('carpa_page_cache', $key) CONTENT {
         key: $key,
         body: $body,
         url: $url,
@@ -44,7 +44,7 @@ const PUT: &str = "
     } RETURN NONE
 ";
 const SEARCH: &str = "
-    SELECT url, title, text, stored_at, search::score(1) AS score FROM topcoat_page_cache
+    SELECT url, title, text, stored_at, search::score(1) AS score FROM carpa_page_cache
     WHERE text @1@ $query AND expires_at > time::now()
     ORDER BY score DESC LIMIT $limit
 ";
@@ -52,9 +52,9 @@ const SEARCH: &str = "
 // cutoff, so the count is the number of rows the delete removes.
 const PURGE: &str = "
     SELECT VALUE count FROM (
-        SELECT count() FROM topcoat_page_cache WHERE expires_at <= $now GROUP ALL
+        SELECT count() FROM carpa_page_cache WHERE expires_at <= $now GROUP ALL
     );
-    DELETE topcoat_page_cache WHERE expires_at <= $now RETURN NONE;
+    DELETE carpa_page_cache WHERE expires_at <= $now RETURN NONE;
 ";
 
 /// A [`FirecrawlCache`] kept in SurrealDB.
@@ -197,7 +197,7 @@ impl<C: Connection> FirecrawlCache for PageCache<C> {
                 Ok(body) => body,
                 Err(error) => {
                     tracing::warn!(
-                        target: "topcoat_si::firecrawl",
+                        target: "carpa::firecrawl",
                         error = &error as &dyn std::error::Error,
                         "Page cache lookup failed; treating it as a miss"
                     );
@@ -211,7 +211,7 @@ impl<C: Connection> FirecrawlCache for PageCache<C> {
         Box::pin(async move {
             if let Err(error) = self.store(key, body, ttl).await {
                 tracing::warn!(
-                    target: "topcoat_si::firecrawl",
+                    target: "carpa::firecrawl",
                     error = &error as &dyn std::error::Error,
                     "Page cache store failed; dropping the answer"
                 );

@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use serde_json::Value;
-use topcoat_si::surrealdb::Surreal;
-use topcoat_si::surrealdb::engine::local::Db;
+use carpa::surrealdb::Surreal;
+use carpa::surrealdb::engine::local::Db;
 
 use crate::run::RunRecord;
 
@@ -23,7 +23,7 @@ impl EvalDb {
     /// Opens, or creates, the database in the directory `path`. SurrealKV locks the directory, so
     /// one process at a time can have it open.
     pub async fn open(path: &Path) -> Result<Self, String> {
-        let db = topcoat_si::surreal::open(path, "topcoat_evals", "results")
+        let db = carpa::surreal::open(path, "carpa_evals", "results")
             .await
             .map_err(|error| format!("{}: {error}", path.display()))?;
         db.query(SCHEMA)
@@ -112,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn stores_records_by_run_stamp() {
-        let dir = std::env::temp_dir().join(format!("topcoat-evals-db-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("carpa-evals-db-{}", std::process::id()));
         let db = EvalDb::open(&dir).await.expect("open");
         let mut failed = record("b", 1);
         failed.pass = false;

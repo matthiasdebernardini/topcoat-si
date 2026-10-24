@@ -12,8 +12,8 @@
 //! [`CodeMode`] per conversation.
 //!
 //! ```no_run
-//! # async fn run(monty_path: std::path::PathBuf) -> topcoat_si::Result<()> {
-//! use topcoat_si::code_mode::{self, CodeMode, Limits, packs};
+//! # async fn run(monty_path: std::path::PathBuf) -> carpa::Result<()> {
+//! use carpa::code_mode::{self, CodeMode, Limits, packs};
 //!
 //! // once per app
 //! let pool = code_mode::pool(monty_path, 4).await?;

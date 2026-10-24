@@ -3,14 +3,14 @@
 //!
 //! Needs ANTHROPIC_API_KEY, FIRECRAWL_API_KEY, TYPESAFE_API_KEY and TYPESAFE_DEFAULT_MODEL.
 
-use topcoat_si::jev::{JevClient, JevTool};
-use topcoat_si::{
+use carpa::jev::{JevClient, JevTool};
+use carpa::{
     Anthropic, ClientTool, FirecrawlClient, FirecrawlFetchPage, FirecrawlWebSearch, KnownModel,
     MessageCreateParams, MessageParam, Model,
 };
 
 #[tokio::main]
-async fn main() -> topcoat_si::Result<()> {
+async fn main() -> carpa::Result<()> {
     let client = Anthropic::try_new(None)?;
     let firecrawl = FirecrawlClient::from_env()?;
     let search = FirecrawlWebSearch::new(firecrawl.clone());

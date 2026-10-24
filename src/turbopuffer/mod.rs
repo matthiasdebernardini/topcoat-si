@@ -14,7 +14,7 @@
 //!
 //! ```no_run
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! use topcoat_si::turbopuffer::{Client, Filter, TurbopufferSearch};
+//! use carpa::turbopuffer::{Client, Filter, TurbopufferSearch};
 //! use turbopuffer::types::{AttributeSchemaConfig, Row};
 //!
 //! let client = Client::from_env()?;

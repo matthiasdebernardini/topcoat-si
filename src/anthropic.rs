@@ -46,7 +46,7 @@ fn final_failure(error: &Error) {
         span.record("http.status_code", status);
     }
     tracing::error!(
-        target: "topcoat_si::client",
+        target: "carpa::client",
         error = error as &dyn std::error::Error,
         "API request failed"
     );
@@ -69,7 +69,7 @@ fn record_usage(model: &Model, usage: &Usage) {
     }
 }
 
-/// Emit one `topcoat_si::usage` event for a completed request.
+/// Emit one `carpa::usage` event for a completed request.
 ///
 /// Fires once per completed `send` call and once per stream that reaches `message_stop`
 /// (from the merged usage).  `cost_micro_cents` is `None` for models that are not a
@@ -83,7 +83,7 @@ fn count_usage(model: &Model, usage: &Usage) {
         _ => None,
     };
     tracing::info!(
-        target: "topcoat_si::usage",
+        target: "carpa::usage",
         model = %model,
         input_tokens = tokens(Some(usage.input_tokens)),
         output_tokens = tokens(Some(usage.output_tokens)),
@@ -149,7 +149,7 @@ fn multipart_boundary() -> String {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("topcoat-si-boundary-{nanos:x}-{count:x}")
+    format!("carpa-boundary-{nanos:x}-{count:x}")
 }
 
 /// Builds the `multipart/form-data` body of a file upload.
@@ -548,11 +548,11 @@ impl Anthropic {
 
     /// Create a new Anthropic client.
     ///
-    /// The API key can be provided directly or read from the TOPCOAT_SI_API_KEY or ANTHROPIC_API_KEY
+    /// The API key can be provided directly or read from the CARPA_API_KEY or ANTHROPIC_API_KEY
     /// environment variables. If an environment variable value starts with "file://", it will be
     /// treated as a file path and the API key will be read from that file.
     ///
-    /// The base URL is resolved from the TOPCOAT_SI_BASE_URL or ANTHROPIC_BASE_URL environment
+    /// The base URL is resolved from the CARPA_BASE_URL or ANTHROPIC_BASE_URL environment
     /// variables, in that order. If neither is set, the default Anthropic API URL is used. A
     /// configured base URL follows the rule of [`Anthropic::with_base_url`]; a URL that breaks it
     /// is a validation error naming the variable.
@@ -568,11 +568,11 @@ impl Anthropic {
     ) -> Result<Self> {
         let key = match api_key {
             Some(key) => key,
-            None => configured_value(&get, &["TOPCOAT_SI_API_KEY", "ANTHROPIC_API_KEY"])?
+            None => configured_value(&get, &["CARPA_API_KEY", "ANTHROPIC_API_KEY"])?
                 .map(|(_, key)| key)
                 .ok_or_else(|| {
                     Error::validation(
-                        "No nonempty API key configured in TOPCOAT_SI_API_KEY or ANTHROPIC_API_KEY",
+                        "No nonempty API key configured in CARPA_API_KEY or ANTHROPIC_API_KEY",
                         Some("api_key".to_string()),
                     )
                 })?,
@@ -583,7 +583,7 @@ impl Anthropic {
         // This is resolved before building headers because some providers
         // (see `BASE_URLS_REQUIRING_AUTH_HEADER`) require an `Authorization`
         // header derived from the base URL.
-        let configured = configured_value(&get, &["TOPCOAT_SI_BASE_URL", "ANTHROPIC_BASE_URL"])?;
+        let configured = configured_value(&get, &["CARPA_BASE_URL", "ANTHROPIC_BASE_URL"])?;
         let base_url = match configured {
             Some((name, url)) => normalized_base_url(name, &url)?,
             None => DEFAULT_API_URL.to_string(),
@@ -621,7 +621,7 @@ impl Anthropic {
     /// # Examples
     ///
     /// ```
-    /// # use topcoat_si::Anthropic;
+    /// # use carpa::Anthropic;
     /// // For Anthropic's API (default)
     /// let client = Anthropic::try_new(Some("api-key".to_string()))?
     ///     .with_base_url("https://api.anthropic.com".to_string())?;
@@ -633,7 +633,7 @@ impl Anthropic {
     /// // For Minimax (China)
     /// let client = Anthropic::try_new(Some("api-key".to_string()))?
     ///     .with_base_url("https://api.minimaxi.com/anthropic".to_string())?;
-    /// # Ok::<(), topcoat_si::Error>(())
+    /// # Ok::<(), carpa::Error>(())
     /// ```
     pub fn with_base_url(mut self, base_url: String) -> Result<Self> {
         // The set of default headers is derived from the base URL: providers
@@ -806,7 +806,7 @@ impl Anthropic {
 
     /// Sends `call` under the shared retry loop and reads each successful response with `read`.
     ///
-    /// The call runs in its `topcoat_si.request` span, and its outcome, a failure found before
+    /// The call runs in its `carpa.request` span, and its outcome, a failure found before
     /// sending included, is reported once: the `request_completed` event and, on failure, the
     /// error log. Only GET requests resend an [`ErrorKind::Interrupted`] failure, since the server
     /// has already answered a POST or DELETE.
@@ -816,8 +816,8 @@ impl Anthropic {
         Fut: Future<Output = Result<T>>,
     {
         let span = tracing::info_span!(
-            target: "topcoat_si::client",
-            "topcoat_si.request",
+            target: "carpa::client",
+            "carpa.request",
             operation = call.operation,
             otel.kind = "client", gen_ai.request.model = call.model.map(field::display),
             stream = call.stream,
@@ -876,7 +876,7 @@ impl Anthropic {
             }
             None => {
                 if let Some(body) = &body {
-                    tracing::trace!(target: "topcoat_si::wire", request = %String::from_utf8_lossy(body));
+                    tracing::trace!(target: "carpa::wire", request = %String::from_utf8_lossy(body));
                 }
             }
         }
@@ -917,7 +917,7 @@ impl Anthropic {
             },
             |error, attempt, delay| {
                 tracing::warn!(
-                    target: "topcoat_si::client",
+                    target: "carpa::client",
                     error = %error,
                     attempt = attempt + 1,
                     backoff_seconds = delay.as_secs_f64(),
@@ -1032,7 +1032,7 @@ impl Anthropic {
     async fn decode_response<T: DeserializeOwned>(response: Response) -> Result<T> {
         let request_id = response_metadata(&response).request_id;
         let body = Self::body_bytes(response, request_id.clone()).await?;
-        tracing::trace!(target: "topcoat_si::wire", response = %String::from_utf8_lossy(&body));
+        tracing::trace!(target: "carpa::wire", response = %String::from_utf8_lossy(&body));
         // serde's message can quote the body, so neither it nor the error itself is kept.
         serde_json::from_slice(&body).map_err(|error| {
             Error::new(
@@ -1539,7 +1539,7 @@ mod tests {
 
     #[test]
     fn resolve_api_key_file_url_absolute() {
-        let test_dir = std::env::temp_dir().join(format!("topcoat_si_test_{}", std::process::id()));
+        let test_dir = std::env::temp_dir().join(format!("carpa_test_{}", std::process::id()));
         std::fs::create_dir_all(&test_dir).unwrap();
         let test_file = test_dir.join("test_api_key.txt");
         std::fs::write(&test_file, "sk-test-from-file-123\n").unwrap();
@@ -2548,7 +2548,7 @@ Connection: close\r\n\r\n",
             targets
                 .lock()
                 .unwrap()
-                .contains(&"event topcoat_si::client".to_string()),
+                .contains(&"event carpa::client".to_string()),
             "a validation failure is reported like any other: {targets:?}"
         );
         let too_long = client
@@ -2611,7 +2611,7 @@ Connection: close\r\n\r\n",
     async fn dot_and_empty_ids_fail_before_sending() {
         let (base_url, recorded) = serve(Vec::new()).await;
         let client = files_client(base_url);
-        let (guard, events) = record_events("topcoat_si::client");
+        let (guard, events) = record_events("carpa::client");
 
         for id in ["", ".", ".."] {
             let errors = [
@@ -2806,7 +2806,7 @@ Connection: close\r\n\r\n",
         let client = Anthropic::try_new_with(
             key(),
             env(&[
-                ("TOPCOAT_SI_BASE_URL", "http://localhost:9000"),
+                ("CARPA_BASE_URL", "http://localhost:9000"),
                 ("ANTHROPIC_BASE_URL", "http://api.anthropic.com"),
             ]),
         )
@@ -2822,10 +2822,10 @@ Connection: close\r\n\r\n",
             matches!(error.kind(), ErrorKind::Validation { param, .. } if param.as_deref() == Some("ANTHROPIC_BASE_URL")),
             "{error}"
         );
-        let error = Anthropic::try_new_with(key(), env(&[("TOPCOAT_SI_BASE_URL", "http://v1")]))
+        let error = Anthropic::try_new_with(key(), env(&[("CARPA_BASE_URL", "http://v1")]))
             .unwrap_err();
         assert!(
-            matches!(error.kind(), ErrorKind::Validation { param, .. } if param.as_deref() == Some("TOPCOAT_SI_BASE_URL")),
+            matches!(error.kind(), ErrorKind::Validation { param, .. } if param.as_deref() == Some("CARPA_BASE_URL")),
             "{error}"
         );
     }
@@ -2856,7 +2856,7 @@ Connection: close\r\n\r\n",
             .unwrap();
         assert!(both_use_proxies(&client));
 
-        for name in ["TOPCOAT_SI_BASE_URL", "ANTHROPIC_BASE_URL"] {
+        for name in ["CARPA_BASE_URL", "ANTHROPIC_BASE_URL"] {
             let get = |var: &str| Ok((var == name).then(|| "http://127.0.0.1:1".to_string()));
             let client = Anthropic::try_new_with(key(), get).unwrap();
             assert!(!both_use_proxies(&client), "{name}");
@@ -2920,11 +2920,11 @@ Connection: close\r\n\r\n",
         assert_eq!(error.status(), Some(400));
         let targets = targets.lock().unwrap();
         assert!(
-            targets.contains(&"span topcoat_si.request topcoat_si::client".to_string()),
+            targets.contains(&"span carpa.request carpa::client".to_string()),
             "{targets:?}"
         );
         assert!(
-            targets.contains(&"event topcoat_si::client".to_string()),
+            targets.contains(&"event carpa::client".to_string()),
             "{targets:?}"
         );
     }
@@ -3312,7 +3312,7 @@ data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"a
         ])
         .await;
         let client = untimed_client(base_url);
-        let (guard, events) = record_events("topcoat_si::client");
+        let (guard, events) = record_events("carpa::client");
         client.send(&send_params()).await.unwrap();
         drop(guard);
 

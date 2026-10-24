@@ -1,4 +1,4 @@
-use topcoat_si::{
+use carpa::{
     Anthropic, ContentBlock, DocumentBlock, KnownModel, MessageCreateParams, MessageParam,
     MessageParamContent, MessageRole, TextBlock,
 };
@@ -7,9 +7,9 @@ use topcoat_si::{
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Anthropic::try_new(None)?;
 
-    let text = "Topcoat SI is a Rust SDK for the Anthropic Messages API.\n";
+    let text = "Carpa is a Rust SDK for the Anthropic Messages API.\n";
     let file = client
-        .upload_file("topcoat-si.txt", "text/plain", text.as_bytes(), None)
+        .upload_file("carpa.txt", "text/plain", text.as_bytes(), None)
         .await?;
     println!("uploaded {} ({} bytes)", file.id, file.size_bytes);
 

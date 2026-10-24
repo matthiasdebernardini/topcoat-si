@@ -11,8 +11,8 @@ use crate::surreal::time::{from_datetime, to_datetime};
 use crate::tool_loop::{ToolRun, ToolRunError};
 use crate::types::{Message, MessageBatch, MessageBatchProcessingStatus, MessageParam};
 
-const TRANSCRIPT_TABLE: &str = "topcoat_transcript";
-const BATCH_TABLE: &str = "topcoat_batch";
+const TRANSCRIPT_TABLE: &str = "carpa_transcript";
+const BATCH_TABLE: &str = "carpa_batch";
 
 /// A saved tool run: the conversation and every response, plus the error if the run failed.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,12 +76,12 @@ impl<C: Connection> Transcripts<C> {
     /// [`ErrorKind::Store`](crate::ErrorKind::Store) when the schema cannot be defined.
     pub async fn try_new(db: Surreal<C>) -> Result<Self> {
         db.query(
-            "DEFINE TABLE IF NOT EXISTS topcoat_transcript TYPE NORMAL SCHEMAFULL;
-             DEFINE FIELD IF NOT EXISTS messages ON topcoat_transcript TYPE string;
-             DEFINE FIELD IF NOT EXISTS responses ON topcoat_transcript TYPE string;
-             DEFINE FIELD IF NOT EXISTS error ON topcoat_transcript TYPE option<string>;
-             DEFINE FIELD IF NOT EXISTS response_count ON topcoat_transcript TYPE int;
-             DEFINE FIELD IF NOT EXISTS updated_at ON topcoat_transcript TYPE datetime;",
+            "DEFINE TABLE IF NOT EXISTS carpa_transcript TYPE NORMAL SCHEMAFULL;
+             DEFINE FIELD IF NOT EXISTS messages ON carpa_transcript TYPE string;
+             DEFINE FIELD IF NOT EXISTS responses ON carpa_transcript TYPE string;
+             DEFINE FIELD IF NOT EXISTS error ON carpa_transcript TYPE option<string>;
+             DEFINE FIELD IF NOT EXISTS response_count ON carpa_transcript TYPE int;
+             DEFINE FIELD IF NOT EXISTS updated_at ON carpa_transcript TYPE datetime;",
         )
         .await
         .and_then(|response| response.check())
@@ -273,12 +273,12 @@ impl<C: Connection> Batches<C> {
     /// [`ErrorKind::Store`](crate::ErrorKind::Store) when the schema cannot be defined.
     pub async fn try_new(db: Surreal<C>) -> Result<Self> {
         db.query(
-            "DEFINE TABLE IF NOT EXISTS topcoat_batch TYPE NORMAL SCHEMAFULL;
-             DEFINE FIELD IF NOT EXISTS label ON topcoat_batch TYPE string;
-             DEFINE FIELD IF NOT EXISTS status ON topcoat_batch TYPE string;
-             DEFINE FIELD IF NOT EXISTS created_at ON topcoat_batch TYPE datetime;
-             DEFINE FIELD IF NOT EXISTS ended_at ON topcoat_batch TYPE option<datetime>;
-             DEFINE FIELD IF NOT EXISTS updated_at ON topcoat_batch TYPE datetime;",
+            "DEFINE TABLE IF NOT EXISTS carpa_batch TYPE NORMAL SCHEMAFULL;
+             DEFINE FIELD IF NOT EXISTS label ON carpa_batch TYPE string;
+             DEFINE FIELD IF NOT EXISTS status ON carpa_batch TYPE string;
+             DEFINE FIELD IF NOT EXISTS created_at ON carpa_batch TYPE datetime;
+             DEFINE FIELD IF NOT EXISTS ended_at ON carpa_batch TYPE option<datetime>;
+             DEFINE FIELD IF NOT EXISTS updated_at ON carpa_batch TYPE datetime;",
         )
         .await
         .and_then(|response| response.check())
@@ -322,7 +322,7 @@ impl<C: Connection> Batches<C> {
             .db
             .query(
                 "SELECT record::id(id) AS batch_id, label, status, created_at, ended_at \
-                 FROM topcoat_batch WHERE status != 'ended' ORDER BY created_at",
+                 FROM carpa_batch WHERE status != 'ended' ORDER BY created_at",
             )
             .await
             .map_err(|error| store_error("listing pending batches", error))?;

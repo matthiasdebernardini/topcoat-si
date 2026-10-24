@@ -4,7 +4,7 @@
 //! - List available models with pagination
 //! - Retrieve information about a specific model
 
-use topcoat_si::{Anthropic, ModelListParams};
+use carpa::{Anthropic, ModelListParams};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

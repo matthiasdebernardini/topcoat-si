@@ -364,7 +364,7 @@ impl ContentBlockBuilder {
                         Ok(input) => input,
                         Err(_) if stop_reason == Some(StopReason::MaxTokens) => {
                             tracing::warn!(
-                                target: "topcoat_si::client",
+                                target: "carpa::client",
                                 tool = %name,
                                 id = %id,
                                 bytes = input_json.len(),
@@ -975,7 +975,7 @@ mod tests {
             targets
                 .lock()
                 .unwrap()
-                .contains(&"event topcoat_si::client".to_string()),
+                .contains(&"event carpa::client".to_string()),
             "{:?}",
             targets.lock().unwrap()
         );

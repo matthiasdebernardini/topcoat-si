@@ -7,7 +7,7 @@
 //! The engine is SurrealKV, pure Rust, one process per directory: it holds an exclusive lock, so
 //! two binaries need two paths. The crate is re-exported as [`surrealdb`] for an
 //! app's own tables; derive its records with
-//! `#[derive(SurrealValue)] #[surreal(crate = "topcoat_si::surrealdb::types")]`.
+//! `#[derive(SurrealValue)] #[surreal(crate = "carpa::surrealdb::types")]`.
 
 mod memory;
 mod page_cache;
@@ -68,7 +68,7 @@ pub(crate) mod test_db {
     pub(crate) async fn temp_db() -> Surreal<Db> {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("topcoat-si-surreal-{}-{n}", std::process::id()));
+            std::env::temp_dir().join(format!("carpa-surreal-{}-{n}", std::process::id()));
         super::open(&dir, "test", "test")
             .await
             .expect("open temp db")

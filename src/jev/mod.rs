@@ -10,8 +10,8 @@
 //! Confidence measures how concentrated an answer is, not whether it is correct.
 //!
 //! ```no_run
-//! # async fn run() -> topcoat_si::Result<()> {
-//! use topcoat_si::jev::{JevClient, Outcome, Questions};
+//! # async fn run() -> carpa::Result<()> {
+//! use carpa::jev::{JevClient, Outcome, Questions};
 //!
 //! let jev = JevClient::try_new("ts-key", "jev-1.13.0")?;
 //! let questions = Questions::new()

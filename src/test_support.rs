@@ -214,7 +214,7 @@ impl tracing::Subscriber for Events {
 /// Runs `f` and returns its result with every unknown-value warning it logged on this thread,
 /// each as `rust_type=... tag=...`.
 pub(crate) fn unknown_warnings<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
-    warnings_on("topcoat_si::unknown", f)
+    warnings_on("carpa::unknown", f)
 }
 
 /// Runs `f` and returns its result with every warning it logged on `target` on this thread,

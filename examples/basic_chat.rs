@@ -1,13 +1,13 @@
 use futures::StreamExt;
 use tokio::pin;
-use topcoat_si::{
+use carpa::{
     Anthropic, ContentBlock, KnownModel, MessageCreateParams, MessageParam, MessageRole, Model,
     Result, TextBlock,
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create a client using the API key from TOPCOAT_SI_API_KEY or ANTHROPIC_API_KEY
+    // Create a client using the API key from CARPA_API_KEY or ANTHROPIC_API_KEY
     let client = Anthropic::try_new(None)?;
 
     // Example 1: Non-streaming request built from MessageParam and MessageCreateParams::new

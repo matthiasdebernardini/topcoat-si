@@ -185,7 +185,7 @@ impl Anthropic {
                             }
                             Ok(_) => canceled = true,
                             Err(error) => tracing::warn!(
-                                target: "topcoat_si::client",
+                                target: "carpa::client",
                                 error = &error as &dyn std::error::Error,
                                 batch_id = message_batch_id,
                                 "cancelling the message batch failed; polling again"
@@ -258,7 +258,7 @@ impl Anthropic {
                     return Err(error);
                 }
                 tracing::warn!(
-                    target: "topcoat_si::client",
+                    target: "carpa::client",
                     error = &error as &dyn std::error::Error,
                     failures = *failures,
                     "polling the message batch failed; polling again"

@@ -3,7 +3,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use topcoat_si::KnownModel;
+use carpa::KnownModel;
 
 /// One micro-cent is a millionth of a cent.
 pub const MICRO_CENTS_PER_CENT: u64 = 1_000_000;

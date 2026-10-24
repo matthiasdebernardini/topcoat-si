@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use topcoat_si::{
+use carpa::{
     AccumulatingStream, Anthropic, ContentBlock, Error, ErrorKind, ErrorType, FirecrawlClient,
     FirecrawlWebSearch, KnownModel, Message, MessageCreateParams, MessageParam, Model, Service,
     StopReason, ToolRunError,
@@ -12,12 +12,12 @@ use topcoat_si::{
 async fn call(
     client: &Anthropic,
     params: MessageCreateParams,
-) -> Result<Message, topcoat_si::Error> {
+) -> Result<Message, carpa::Error> {
     let events = client.stream(&params).await?;
     let (mut acc, done) = AccumulatingStream::new(events);
     drop(done);
     let _ = &mut acc;
-    Err(topcoat_si::Error::tool(
+    Err(carpa::Error::tool(
         "stream ended without a final message",
         None,
     ))
@@ -69,7 +69,7 @@ fn topcoat_surface_compiles_and_builds_without_network() {
 
 #[test]
 fn api_error_exposes_its_status() {
-    let err = topcoat_si::Error::api(Service::Anthropic, Some(500), None, "internal error", None);
+    let err = carpa::Error::api(Service::Anthropic, Some(500), None, "internal error", None);
     assert!(matches!(err.kind(), ErrorKind::Api { .. }));
     assert_eq!(err.status(), Some(500));
     assert!(err.is_retryable());

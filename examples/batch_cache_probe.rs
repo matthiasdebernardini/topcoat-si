@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use time::OffsetDateTime;
-use topcoat_si::{
+use carpa::{
     Anthropic, BatchOutcome, BatchWait, CacheControlEphemeral, Control, KnownModel,
     MessageCreateParams, MessageParam, Model, SystemPrompt, TextBlock, Usage,
 };
@@ -127,7 +127,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(args: &Args) -> topcoat_si::Result<()> {
+async fn run(args: &Args) -> carpa::Result<()> {
     let client = Anthropic::try_new(None)?;
     let run_started = OffsetDateTime::now_utc();
     let system = system_prompt(run_started);
@@ -272,7 +272,7 @@ fn print_totals(rounds: &[Round]) {
     let max_queue = queues.iter().max().copied();
     let batch_tier = usages
         .iter()
-        .filter(|usage| usage.service_tier == Some(topcoat_si::ServiceTier::Batch))
+        .filter(|usage| usage.service_tier == Some(carpa::ServiceTier::Batch))
         .count();
 
     println!();

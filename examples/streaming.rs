@@ -1,10 +1,10 @@
 use futures::StreamExt;
 use tokio::pin;
-use topcoat_si::{Anthropic, KnownModel, MessageCreateParams, Result};
+use carpa::{Anthropic, KnownModel, MessageCreateParams, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create a client using the API key from TOPCOAT_SI_API_KEY or ANTHROPIC_API_KEY
+    // Create a client using the API key from CARPA_API_KEY or ANTHROPIC_API_KEY
     let client = Anthropic::try_new(None)?;
 
     // Create a streaming request from a prompt string

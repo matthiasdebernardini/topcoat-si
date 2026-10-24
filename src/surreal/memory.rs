@@ -1,6 +1,6 @@
 //! Claude's memory tool on SurrealDB, plus ranked full-text search over what it stored.
 //!
-//! Files live as rows in `topcoat_memory`, one per path and scope. Directories are implicit: a
+//! Files live as rows in `carpa_memory`, one per path and scope. Directories are implicit: a
 //! directory exists while some file path has it as a prefix.
 
 use std::collections::BTreeSet;
@@ -25,16 +25,16 @@ const MAX_TOOL_LIMIT: u64 = 20;
 const DEFAULT_TOOL_LIMIT: usize = 5;
 
 const SCHEMA: &str = "
-DEFINE TABLE IF NOT EXISTS topcoat_memory TYPE NORMAL SCHEMAFULL;
-DEFINE FIELD IF NOT EXISTS scope ON topcoat_memory TYPE string;
-DEFINE FIELD IF NOT EXISTS path ON topcoat_memory TYPE string;
-DEFINE FIELD IF NOT EXISTS text ON topcoat_memory TYPE string;
-DEFINE FIELD IF NOT EXISTS updated_at ON topcoat_memory TYPE datetime;
-DEFINE INDEX IF NOT EXISTS topcoat_memory_scope_path ON topcoat_memory FIELDS scope, path UNIQUE;
-DEFINE ANALYZER IF NOT EXISTS topcoat_english TOKENIZERS blank, class
+DEFINE TABLE IF NOT EXISTS carpa_memory TYPE NORMAL SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS scope ON carpa_memory TYPE string;
+DEFINE FIELD IF NOT EXISTS path ON carpa_memory TYPE string;
+DEFINE FIELD IF NOT EXISTS text ON carpa_memory TYPE string;
+DEFINE FIELD IF NOT EXISTS updated_at ON carpa_memory TYPE datetime;
+DEFINE INDEX IF NOT EXISTS carpa_memory_scope_path ON carpa_memory FIELDS scope, path UNIQUE;
+DEFINE ANALYZER IF NOT EXISTS carpa_english TOKENIZERS blank, class
     FILTERS lowercase, ascii, snowball(english);
-DEFINE INDEX IF NOT EXISTS topcoat_memory_text ON topcoat_memory FIELDS text
-    FULLTEXT ANALYZER topcoat_english BM25;
+DEFINE INDEX IF NOT EXISTS carpa_memory_text ON carpa_memory FIELDS text
+    FULLTEXT ANALYZER carpa_english BM25;
 ";
 
 /// Claude's `memory` tool, kept in SurrealDB.
@@ -301,7 +301,7 @@ impl<C: Connection> Memory<C> {
     async fn file(&self, path: &str) -> Result<Option<String>> {
         let mut response = self
             .db
-            .query("SELECT VALUE text FROM topcoat_memory WHERE scope = $scope AND path = $path")
+            .query("SELECT VALUE text FROM carpa_memory WHERE scope = $scope AND path = $path")
             .bind(("scope", self.scope.clone()))
             .bind(("path", path.to_string()))
             .await
@@ -317,7 +317,7 @@ impl<C: Connection> Memory<C> {
         let mut response = self
             .db
             .query(
-                "SELECT VALUE path FROM topcoat_memory \
+                "SELECT VALUE path FROM carpa_memory \
                  WHERE scope = $scope AND string::starts_with(path, $prefix) ORDER BY path",
             )
             .bind(("scope", self.scope.clone()))
@@ -332,7 +332,7 @@ impl<C: Connection> Memory<C> {
     async fn put(&self, path: &str, text: &str) -> Result<()> {
         self.db
             .query(
-                "UPSERT topcoat_memory SET scope = $scope, path = $path, text = $text, \
+                "UPSERT carpa_memory SET scope = $scope, path = $path, text = $text, \
                  updated_at = $at WHERE scope = $scope AND path = $path",
             )
             .bind(("scope", self.scope.clone()))
@@ -352,7 +352,7 @@ impl<C: Connection> Memory<C> {
             path == ROOT || self.file(path).await?.is_some() || self.is_directory(path).await?;
         self.db
             .query(
-                "DELETE topcoat_memory WHERE scope = $scope \
+                "DELETE carpa_memory WHERE scope = $scope \
                  AND (path = $path OR string::starts_with(path, $prefix))",
             )
             .bind(("scope", self.scope.clone()))
@@ -392,7 +392,7 @@ impl<C: Connection> Memory<C> {
         // One statement, so a crash cannot leave half of a directory moved.
         self.db
             .query(
-                "UPDATE topcoat_memory SET \
+                "UPDATE carpa_memory SET \
                  path = string::concat($new, string::slice(path, $old_len)), updated_at = $at \
                  WHERE scope = $scope \
                  AND (path = $old OR string::starts_with(path, $old_prefix))",
@@ -516,7 +516,7 @@ async fn search<C: Connection>(
     let limit = limit.clamp(1, MAX_SEARCH_LIMIT) as i64;
     let mut response = db
         .query(
-            "SELECT path, text, search::score(1) AS score FROM topcoat_memory \
+            "SELECT path, text, search::score(1) AS score FROM carpa_memory \
              WHERE scope = $scope AND text @1@ $query ORDER BY score DESC LIMIT $limit",
         )
         .bind(("scope", scope.to_string()))

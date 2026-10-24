@@ -50,6 +50,6 @@ jobs:
       - name: code-mode and surreal tests
         run: |
           MONTY_BIN="$HOME/.cargo/bin/monty" cargo nextest run --workspace --lib --locked --features code-mode,surreal,turbopuffer code_mode surreal db
-          cargo nextest run -p topcoat-evals --locked
+          cargo nextest run -p carpa-evals --locked
       - name: code-mode and surreal doc test
         run: cargo test --doc --locked --features code-mode,surreal,turbopuffer

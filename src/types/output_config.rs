@@ -94,7 +94,7 @@ pub enum Effort {
 /// # Example
 ///
 /// ```
-/// use topcoat_si::{OutputConfig, Effort};
+/// use carpa::{OutputConfig, Effort};
 ///
 /// // Control thinking effort
 /// let config = OutputConfig::new().with_effort(Effort::High);

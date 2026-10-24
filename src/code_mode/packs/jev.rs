@@ -188,10 +188,10 @@ pub trait JevObserver: Send + Sync {
 /// everything else raises. Build a new pack for each conversation.
 ///
 /// ```no_run
-/// # fn build(client: topcoat_si::jev::JevClient) {
+/// # fn build(client: carpa::jev::JevClient) {
 /// use std::sync::Arc;
 ///
-/// use topcoat_si::code_mode::packs::{JevBudget, JevPack};
+/// use carpa::code_mode::packs::{JevBudget, JevPack};
 ///
 /// let budget = Arc::new(JevBudget::new(120));
 /// let pack = JevPack::new(client)

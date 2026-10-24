@@ -21,7 +21,7 @@ const PATH: &str = "/v1/systemone";
 const API_KEY_ENV: &str = "TYPESAFE_API_KEY";
 const MODEL_ENV: &str = "TYPESAFE_DEFAULT_MODEL";
 const BASE_URL_ENV: &str = "TYPESAFE_BASE_URL";
-const USER_AGENT: &str = concat!("topcoat-si/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("carpa/", env!("CARGO_PKG_VERSION"));
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_RETRIES: usize = 2;
 const DEFAULT_RETRY_BUDGET: Duration = Duration::from_secs(30);
@@ -210,7 +210,7 @@ impl JevClient {
             },
             |error, attempt, delay| {
                 tracing::debug!(
-                    target: "topcoat_si::jev",
+                    target: "carpa::jev",
                     status = error.status(),
                     attempt = attempt + 1,
                     request_id = error.request_id(),
@@ -224,7 +224,7 @@ impl JevClient {
         match retried.result {
             Ok((status, request_id, response_body)) => {
                 tracing::debug!(
-                    target: "topcoat_si::jev",
+                    target: "carpa::jev",
                     status,
                     attempt = retried.attempts,
                     request_id = request_id.as_deref(),
@@ -236,7 +236,7 @@ impl JevClient {
             }
             Err(error) => {
                 tracing::debug!(
-                    target: "topcoat_si::jev",
+                    target: "carpa::jev",
                     status = error.status(),
                     attempt = retried.attempts,
                     request_id = error.request_id(),

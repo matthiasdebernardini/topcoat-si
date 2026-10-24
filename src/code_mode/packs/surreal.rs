@@ -18,7 +18,7 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 // The crate's own tables (memory, transcripts and the like) hold every user's data, so the pack
 // neither lists nor describes them. They grant record users nothing either, so a query cannot
 // read them.
-const OWN_TABLE_PREFIX: &str = "topcoat_";
+const OWN_TABLE_PREFIX: &str = "carpa_";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,7 +44,7 @@ struct NoArgs {}
 /// Queries run on the [`Reader`]'s session, a record user, so SurrealDB's permissions, not this
 /// crate, decide what a query can read: a table is visible only if its definition grants `select`
 /// to record users, and the pack cannot define, remove or alter anything. The crate's own
-/// `topcoat_` tables grant nothing. As a second line of defence every query runs in a
+/// `carpa_` tables grant nothing. As a second line of defence every query runs in a
 /// transaction that is always cancelled, so nothing a table's permissions let it write stays.
 ///
 /// The call returns after 20 s with a timeout error, but the local engine has no way to cancel
@@ -403,11 +403,11 @@ mod tests {
         assert_eq!(ns(&reader, "SELECT * FROM partial_t").await, [2, 3]);
         assert!(ns(&reader, "SELECT * FROM closed_t").await.is_empty());
         for surql in [
-            "SELECT * FROM topcoat_memory",
-            "SELECT * FROM <table>'topcoat_memory'",
-            "SELECT * FROM type::table('topcoat_memory')",
-            "SELECT * FROM topcoat_pack_user",
-            "RETURN [/'/, (SELECT * FROM topcoat_memory), /'/][1]",
+            "SELECT * FROM carpa_memory",
+            "SELECT * FROM <table>'carpa_memory'",
+            "SELECT * FROM type::table('carpa_memory')",
+            "SELECT * FROM carpa_pack_user",
+            "RETURN [/'/, (SELECT * FROM carpa_memory), /'/][1]",
         ] {
             let rows = query(&reader, args(surql), 100).await.unwrap();
             // No record comes back. A bare table name selects as the name itself, a string.
@@ -420,7 +420,7 @@ mod tests {
         let mut bound = args("SELECT * FROM type::table($t)");
         bound
             .params
-            .insert("t".to_string(), json!("topcoat_memory"));
+            .insert("t".to_string(), json!("carpa_memory"));
         let rows = query(&reader, bound, 100).await.unwrap();
         assert_eq!(rows, json!([]));
     }
@@ -530,7 +530,7 @@ mod tests {
         let described = describe(&db, "open_t").await.unwrap();
         assert!(described["fields"].is_object());
         assert!(described["indexes"].is_object());
-        for hidden in ["closed_t", "topcoat_memory", "nope"] {
+        for hidden in ["closed_t", "carpa_memory", "nope"] {
             let error = describe(&db, hidden).await.unwrap_err();
             message(&error, PyError::ValueError);
         }

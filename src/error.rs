@@ -424,7 +424,7 @@ impl error::Error for Error {
     }
 }
 
-/// A specialized Result type for Topcoat SI operations.
+/// A specialized Result type for Carpa operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Says where serde_json gave up, as the error category, line and column. It never quotes the

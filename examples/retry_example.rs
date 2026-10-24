@@ -1,5 +1,5 @@
 use std::time::Duration;
-use topcoat_si::{
+use carpa::{
     Anthropic, Error, ErrorKind, ErrorType, KnownModel, MessageCreateParams, MessageParam, Model,
     Service,
 };

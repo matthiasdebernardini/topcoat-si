@@ -21,9 +21,9 @@
 //! A full code mode run typically uses well under 20 credits, and at most about 28.
 
 use futures::StreamExt;
-use topcoat_si::firecrawl::{GovSearchRequest, MapRequest, ScrapeOptions, ScrapeRequest};
-use topcoat_si::jev::{JevClient, JevTool};
-use topcoat_si::{
+use carpa::firecrawl::{GovSearchRequest, MapRequest, ScrapeOptions, ScrapeRequest};
+use carpa::jev::{JevClient, JevTool};
+use carpa::{
     AccumulatingStream, Anthropic, ClientTool, ContentBlock, FirecrawlClient, FirecrawlFetchPage,
     FirecrawlWebSearch, KnownModel, Message, MessageCreateParams, MessageParam, Model, StopReason,
     ToolRunError,
@@ -294,8 +294,8 @@ async fn firecrawl_endpoints_answer() {
 async fn code_mode_firecrawl_pack_answers() {
     use std::sync::{Arc, Mutex};
 
-    use topcoat_si::code_mode::packs::{FirecrawlEvent, FirecrawlObserver, FirecrawlPack};
-    use topcoat_si::code_mode::{self, CodeMode, Limits};
+    use carpa::code_mode::packs::{FirecrawlEvent, FirecrawlObserver, FirecrawlPack};
+    use carpa::code_mode::{self, CodeMode, Limits};
 
     struct Recorder(Mutex<Vec<FirecrawlEvent>>);
     impl FirecrawlObserver for Recorder {
@@ -365,8 +365,8 @@ async fn code_mode_firecrawl_pack_answers() {
 #[tokio::test]
 #[ignore = "live: calls the real APIs and costs money"]
 async fn code_mode_answers() {
-    use topcoat_si::code_mode::{self, CodeMode, Limits, packs};
-    use topcoat_si::{CacheControlEphemeral, MessageParamContent};
+    use carpa::code_mode::{self, CodeMode, Limits, packs};
+    use carpa::{CacheControlEphemeral, MessageParamContent};
 
     let client = Anthropic::try_new(None).expect("ANTHROPIC_API_KEY");
     let monty = std::env::var_os("MONTY_BIN").expect("MONTY_BIN");

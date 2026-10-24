@@ -20,7 +20,7 @@ pub enum Answer {
     /// A rating on an ordered scale.
     Score(ScoreAnswer),
     /// An answer type this client does not know, as Jev sent it. It is kept so the response is
-    /// never lost, and logged as a warning on `topcoat_si::unknown`; the typed accessors report
+    /// never lost, and logged as a warning on `carpa::unknown`; the typed accessors report
     /// it as an error.
     Unknown(Value),
     /// A noul, choice or score answer whose fields could not be decoded. It is kept so the
@@ -173,7 +173,7 @@ pub(super) fn parse_answer(value: Value) -> Answer {
         None => {
             // Only the shape is logged: the values may echo the caller's data.
             tracing::warn!(
-                target: "topcoat_si::jev",
+                target: "carpa::jev",
                 %kind,
                 raw_bytes = value.to_string().len(),
                 shape = describe_shape(&value),

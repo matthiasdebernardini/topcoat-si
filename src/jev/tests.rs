@@ -195,7 +195,7 @@ async fn golden_request_bytes_and_headers() {
     assert_eq!(header(request, "accept"), Some("application/json"));
     assert_eq!(
         header(request, "user-agent"),
-        Some(concat!("topcoat-si/", env!("CARGO_PKG_VERSION")))
+        Some(concat!("carpa/", env!("CARGO_PKG_VERSION")))
     );
     assert_eq!(header(request, "x-typesafe-retry-count"), None);
 
@@ -1691,7 +1691,7 @@ fn unparseable_success_keeps_category_line_and_column() {
 
 #[test]
 fn malformed_answer_logs_its_shape_not_its_values() {
-    let (response, warnings) = warnings_on("topcoat_si::jev", || {
+    let (response, warnings) = warnings_on("carpa::jev", || {
         parsed(json!({
             "model": "jev-1.13.0",
             "answers": {"bad": {"type": "noul", "noul": SECRET, "extra": 1}}
@@ -1716,7 +1716,7 @@ fn malformed_answer_logs_its_shape_not_its_values() {
         .map(|i| (format!("{i}{}", "k".repeat(100)), json!(1)))
         .chain([("type".to_string(), json!("noul"))])
         .collect();
-    let (_, warnings) = warnings_on("topcoat_si::jev", || {
+    let (_, warnings) = warnings_on("carpa::jev", || {
         parsed(json!({"model": "m", "answers": {"bad": Value::Object(wide)}}))
     });
     assert!(warnings[0].len() < 400, "{}", warnings[0]);
